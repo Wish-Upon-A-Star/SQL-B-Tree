@@ -4,64 +4,79 @@
 
 ![SQL Processor Architecture](docs/sql-processor-architecture.svg)
 
-## 프로젝트 요약
+## 한눈에 보기
 
 | 항목 | 내용 |
 | --- | --- |
-| 주제 | SQL Processor 구현 |
-| 목표 | `입력(SQL)` -> `파싱` -> `실행` -> `파일 저장` 흐름 완성 |
-| 구현 언어 | C |
-| 저장 방식 | CSV 기반 파일 DB |
-| 필수 요구사항 | `INSERT`, `SELECT`, CLI 입력, 파일 저장 |
-| 추가 구현 | `UPDATE`, `DELETE`, `PK/UK/NN` 제약, quoted CSV 처리, 테이블 캐시 |
-
-## 발표 한 줄 메시지
-
-이 프로젝트는 "DB가 SQL을 받아 실제 데이터를 바꾸는 흐름"을 가장 작게 직접 구현한 결과물입니다.  
-핵심은 AI로 빠르게 만들었더라도, `왜 이렇게 동작하는지`를 코드 단위로 설명할 수 있게 만드는 데 있습니다.
+| 목표 | `입력(SQL)` -> `파싱` -> `실행` -> `파일 저장` 흐름 구현 |
+| 언어 | C |
+| 저장소 | CSV 파일 기반 |
+| 필수 구현 | `INSERT`, `SELECT`, CLI 입력 |
+| 추가 구현 | `UPDATE`, `DELETE`, `PK/UK/NN` 제약 |
 
 ## 처리 흐름
 
 ```mermaid
 flowchart LR
-    A["SQL File"] --> B["CLI Input"]
-    B --> C["main.c<br/>statement split"]
-    C --> D["lexer.c<br/>tokenize"]
-    D --> E["parser.c<br/>Statement 생성"]
-    E --> F["executor.c<br/>SELECT / INSERT / UPDATE / DELETE"]
-    F --> G["CSV Table File"]
-    F --> H["Console Result / Error Message"]
+    A["SQL File"] --> B["main.c"]
+    B --> C["lexer.c"]
+    C --> D["parser.c"]
+    D --> E["executor.c"]
+    E --> F["CSV File"]
+    E --> G["Console Output"]
 ```
 
-## 핵심 설계
+`main.c`는 SQL 파일을 문자 단위로 읽으면서 주석, 따옴표, 세미콜론을 구분해 문장을 분리합니다.  
+이후 `lexer.c`와 `parser.c`가 SQL을 `Statement` 구조체로 바꾸고, `executor.c`가 실제 조회/삽입/수정/삭제를 수행합니다.
 
-| 구성 요소 | 역할 | 포인트 |
-| --- | --- | --- |
-| `main.c` | SQL 파일을 읽고 `;` 기준으로 문장을 분리 | 작은 DB 엔진의 진입점 |
-| `lexer.c` | 문자열을 토큰으로 분해 | SQL을 구조적으로 읽기 위한 첫 단계 |
-| `parser.c` | 토큰을 `Statement` 구조체로 변환 | 문법 해석과 실행 데이터 준비 |
-| `executor.c` | SELECT/INSERT/UPDATE/DELETE 실행 | 실제 데이터 변경과 검증 담당 |
-| `*.csv` | 테이블 저장소 | 별도 DB 없이도 동작 흐름 재현 |
+## 구현 핵심
 
-## 요구사항 대비 구현 결과
-
-| 요구사항 | 구현 결과 |
+| 구성 요소 | 역할 |
 | --- | --- |
-| SQL 파일을 CLI로 입력 | `./sqlproc_demo <sql-file>` 형태로 실행 |
-| SQL 파싱 | `Statement` 구조체로 파싱 |
-| 최소 지원: INSERT | 구현 완료 |
-| 최소 지원: SELECT | 구현 완료 |
-| 파일 기반 저장 | `<table>.csv` 파일에 저장 |
-| schema / table은 이미 존재한다고 가정 | CSV 헤더를 schema처럼 사용 |
-| 품질 검증 | 기능 테스트 케이스 다수 구성 |
+| `main.c` | 파일 경로 입력, SQL 문장 분리, 실행 분기 |
+| `lexer.c` | SQL 문자열을 토큰으로 분해 |
+| `parser.c` | `Statement` 구조체 생성 |
+| `executor.c` | SELECT / INSERT / UPDATE / DELETE 실행 |
+| `*.csv` | 테이블 데이터 저장 |
+
+## 시연 순서
+
+발표는 아래 순서로 진행하면 3분 30초 안에 핵심을 보여줄 수 있습니다.
+
+```bash
+gcc -fdiagnostics-color=always -g main.c -o sqlsprocessor
+
+./sqlsprocessor demo_reset.sql
+./sqlsprocessor demo_select.sql
+./sqlsprocessor demo_insert.sql
+./sqlsprocessor demo_insert_error.sql
+./sqlsprocessor demo_update.sql
+./sqlsprocessor demo_delete.sql
+```
+
+| 데모 파일 | 보여주는 내용 |
+| --- | --- |
+| `demo_reset.sql` | 기준 상태 복원 |
+| `demo_select.sql` | 전체 조회 + 조건 조회 |
+| `demo_insert.sql` | 신규 데이터 삽입 |
+| `demo_insert_error.sql` | PK 중복, UK 중복 에러 |
+| `demo_update.sql` | 조건 기반 수정 |
+| `demo_delete.sql` | 조건 기반 삭제 |
 
 ## 차별점
 
-| 포인트 | 설명 |
-| --- | --- |
-| 제약조건 처리 | `PK`, `UK`, `NN` 위반을 실행 단계에서 차단 |
-| quoted value 처리 | `'tony,stark@test.com'`처럼 쉼표가 포함된 값도 파싱 가능 |
-| 캐시 구조 | 테이블을 메모리에 적재 후 재사용 |
-| 추가 SQL 지원 | 요구사항 이상으로 `UPDATE`, `DELETE`까지 구현 |
-| 명확한 오류 메시지 | 잘못된 문장과 제약 위반을 콘솔에 즉시 표시 |
+- 최소 요구사항인 `INSERT`, `SELECT`를 넘어서 `UPDATE`, `DELETE`까지 구현했습니다.
+- `PK`, `UK`, `NN` 제약을 실행 단계에서 검증합니다.
+- `'tony,stark@test.com'`처럼 쉼표가 들어간 quoted 값도 처리합니다.
+- 잘못된 SQL 문장과 제약 위반을 콘솔 메시지로 바로 확인할 수 있습니다.
 
+## 발표에서 강조할 포인트
+
+1. 이 프로젝트는 단순 CSV 편집기가 아니라 SQL을 해석하고 실행하는 작은 DB 처리기입니다.
+2. 문자열을 바로 실행하지 않고 `파싱 -> 구조화 -> 실행` 단계를 분리했습니다.
+3. 정상 흐름뿐 아니라 중복 INSERT 같은 예외 흐름도 테스트로 검증했습니다.
+
+## 참고 문서
+
+- [학습 가이드](docs/STUDY_GUIDE.md)
+- [발표 대본](docs/PRESENTATION_SCRIPT.md)

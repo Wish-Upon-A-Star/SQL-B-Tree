@@ -2,80 +2,61 @@
 
 ## 발표 전 준비
 
-아래 빌드는 발표 시작 전에 미리 끝내둡니다.
-
 ```bash
-gcc -fdiagnostics-color=always -g main.c -o sqlproc_demo
+gcc -fdiagnostics-color=always -g main.c -o sqlsprocessor
 ```
 
 ## 3분 30초 대본
 
+안녕하세요. 4조 발표 시작하겠습니다.  
+저희는 C로 SQL 파일을 입력받아 파싱하고, 실행하고, CSV 파일에 저장하는 SQL Processor를 구현했습니다.  
+핵심은 단순히 데이터를 읽고 쓰는 것이 아니라, `입력 -> 파싱 -> 실행 -> 저장` 흐름을 직접 만드는 것이었습니다.
 
-안녕하세요. 4조 발표 시작하겠습니다. 
-이번주 과제는 C로 SQL 파일을 입력받아 파싱하고, 실행하고, CSV 파일에 저장하는 SQL Processor를 구현했습니다.  
-핵심은 단순 저장이 아닌 `입력 -> 파싱 -> 실행 -> 저장` 흐름을 구현하는 것이었습니다.
+README 구조도를 보시면, SQL 파일이 `main.c`로 들어오고, 이후 `lexer.c`, `parser.c`, `executor.c`를 거쳐 최종적으로 CSV 파일과 콘솔 출력으로 이어집니다.  
+즉, SQL 문자열을 바로 실행하는 것이 아니라 먼저 구조화한 뒤에 실행하는 방식입니다.
 
-README의 구조도를 보시면, CLI로 받은 SQL 파일이 `main.c`를 거쳐 문장 단위로 분리되고,  
-그다음 `lexer.c`, `parser.c`를 통해 `Statement` 구조체로 바뀝니다.  
-마지막으로 `executor.c`가 SELECT, INSERT, UPDATE, DELETE를 실행하고 CSV 파일에 반영합니다.
+`main.c`에서는 실행 인자나 `scanf`로 파일 경로를 받고, 파일을 `fgetc`로 한 글자씩 읽습니다.  
+이렇게 한 이유는 줄바꿈, 여러 SQL 문장, `--` 주석, 그리고 따옴표 안 문자를 안정적으로 구분하기 위해서입니다.  
+따옴표 밖에서 `;`를 만나면 하나의 SQL 문장이 끝났다고 보고 파서로 넘기고, 파싱 결과가 `INSERT`, `SELECT`, `UPDATE`, `DELETE`면 실행기로 보냅니다.
 
-코드 흐름을 조금 더 보면, `main`에서 먼저 실행 인자가 있으면 그걸 파일 경로로 받고, 없으면 `scanf`로 직접 입력받습니다.  
-그다음 파일을 한 줄씩이 아니라 `fgetc`로 한 글자씩 읽습니다. 이렇게 한 이유는 줄바꿈이 섞여 있거나 한 줄에 SQL이 여러 개 들어와도 안정적으로 처리하고, `--` 주석이나 따옴표 내부 문자를 정확히 구분하기 위해서입니다.  
-읽는 중에 따옴표 밖에서 `-`를 만나면 다음 문자도 확인해서 `--`면 줄 끝까지 주석으로 넘기고, 아니면 다시 버퍼를 되돌립니다. 따옴표 `'`가 나오면 `q` 값을 뒤집어서 지금 문자열 안인지 계속 추적합니다.  
-그리고 따옴표 밖에서 `;`를 만나면 지금까지 쌓아 둔 `buf`를 하나의 SQL 문장으로 보고 파서에 넘깁니다. 이때 앞 공백은 제거하고, 파서 결과가 `INSERT`, `SELECT`, `DELETE`, `UPDATE`면 실행기로 보내고, 아니면 잘못된 SQL로 바로 에러를 출력합니다.  
-그 외의 문자는 전부 `buf`에 계속 저장해서 최종 문장을 완성합니다.
+필수 요구사항은 `INSERT`와 `SELECT`였지만, 저희는 `UPDATE`, `DELETE`와 `PK`, `UK`, `NN` 제약조건까지 추가로 구현했습니다.
 
-필수 요구사항은 INSERT와 SELECT였지만, 저희는 UPDATE, DELETE와 PK, UK, NN 제약조건까지 추가로 구현했습니다.  
+이제 시연을 보겠습니다.
 
-이제 시연은 기능별로 분리해 둔 `demo` 파일 기준으로 보여드리겠습니다.
-
-먼저 `demo_reset.sql`로 users 테이블을 기준 상태로 되돌립니다.  
-이 단계는 발표 중 실수나 이전 실행 결과가 남아 있어도 항상 같은 상태에서 데모를 시작하기 위한 준비 단계입니다.
+먼저 기준 상태를 맞추기 위해 `demo_reset.sql`을 실행합니다.
 
 ```bash
-./sqlproc_demo demo_reset.sql
+./sqlsprocessor demo_reset.sql
 ```
 
-그다음 `demo_select.sql`을 실행해서 전체 조회와 조건 조회를 보여줍니다.  
-여기서는 테이블 전체를 읽을 수 있는지, 그리고 `WHERE id = 2` 같은 단일 조건 조회가 되는지를 확인합니다.
+그다음 `demo_select.sql`로 전체 조회와 조건 조회를 보여줍니다.
 
 ```bash
-./sqlproc_demo demo_select.sql
+./sqlsprocessor demo_select.sql
 ```
 
-이후 `demo_insert.sql`로 새로운 사용자 한 명을 추가하고, 바로 다시 조회해서 실제로 파일에 반영됐는지 확인합니다.
+이후 `demo_insert.sql`로 새 사용자를 추가하고, 바로 다시 조회해서 실제로 저장됐는지 확인합니다.
 
 ```bash
-./sqlproc_demo demo_insert.sql
+./sqlsprocessor demo_insert.sql
 ```
 
-그리고 바로 이어서 `demo_insert_error.sql`을 실행합니다.  
-여기서는 INSERT를 한 번 더 시도해서 에러가 나는 상황을 보여줍니다. 먼저 같은 `id = 4`를 다시 넣어서 PK 중복 에러를 확인하고, 그다음에는 다른 `id`를 쓰지만 같은 `email`을 넣어서 UK 중복 에러를 확인합니다.  
-이 시점에서 저희가 단순히 데이터를 추가하는 게 아니라, PK와 UK 제약을 실제 실행 단계에서 검증하고 있다는 점을 설명할 수 있습니다.
+다음으로 `demo_insert_error.sql`을 실행합니다.  
+여기서는 같은 `id`를 다시 넣어서 PK 중복 에러를 만들고, 다른 `id`지만 같은 `email`을 넣어서 UK 중복 에러도 보여줍니다.  
+이 장면으로 저희가 단순 INSERT가 아니라 제약조건까지 검증하고 있다는 점을 설명할 수 있습니다.
 
 ```bash
-./sqlproc_demo demo_insert_error.sql
+./sqlsprocessor demo_insert_error.sql
 ```
 
-다음은 `demo_update.sql`입니다.  
-이 단계에서는 `id = 2`인 사용자의 이름을 변경하고, 다시 조회해서 수정 결과가 반영됐는지 확인합니다.
+마지막으로 `demo_update.sql`과 `demo_delete.sql`을 실행해서 수정과 삭제까지 확인합니다.
 
 ```bash
-./sqlproc_demo demo_update.sql
+./sqlsprocessor demo_update.sql
+./sqlsprocessor demo_delete.sql
 ```
 
-마지막은 `demo_delete.sql`입니다.  
-여기서는 `id = 3`인 데이터를 삭제한 뒤 전체 조회를 다시 수행해서, 삭제 결과가 최종 상태에 반영됐는지 보여줍니다.
+정리하면, 저희 프로젝트는 SQL 문장을 읽고, 구조화하고, 실제 파일 데이터에 반영하는 작은 DB 처리기입니다.  
+최소 요구사항을 넘어서 CRUD 전체 흐름과 제약조건 검증까지 구현했고, 정상 흐름뿐 아니라 중복 INSERT 같은 예외 흐름도 함께 테스트했습니다.
 
-```bash
-./sqlproc_demo demo_delete.sql
-```
-
-이 시연 순서를 통해 SELECT, INSERT, UPDATE, DELETE가 각각 독립적으로 동작하고, 중복 INSERT까지 포함해서 모든 결과가 CSV 파일과 제약조건 검증에 실제로 반영된다는 점을 확인할 수 있습니다.
-
-추가로 저희는 데모 외에도 제약조건 테스트를 따로 준비했습니다.  
-PK 중복, UK 중복, NN 위반을 각각 넣어 보면 잘못된 데이터는 에러 메시지와 함께 차단되고, 정상 데이터만 반영됩니다.  
-이 부분이 중요한 이유는, SQL을 읽는 것에서 끝나는 게 아니라 실제 데이터 무결성까지 검증한다는 점입니다.
-
-추가로 quoted 값과 잘못된 SQL 문장도 케이스 파일로 검증했습니다.  
-예를 들어 이메일 안에 쉼표가 있어도 파싱이 깨지지 않고, 문법이 틀린 SQL은 즉시 거부됩니다.
+이상 발표 마치겠습니다. 감사합니다.
