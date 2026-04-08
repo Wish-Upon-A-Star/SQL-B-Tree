@@ -180,6 +180,11 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
 
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
+        if (tc->record_count >= MAX_RECORDS) {
+            printf("[오류] 레코드 개수 초과: '%s'의 최대 레코드 수(%d)에 도달해 일부 데이터를 건너뜁니다.\n", name, MAX_RECORDS);
+            continue;
+        }
+
         char buffer[1024];
         char *fields[MAX_COLS] = {0};
         parse_csv_row(line, fields, buffer);
@@ -194,6 +199,10 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
 
 /* PK 정렬 배열을 유지하며 새 레코드를 적절한 위치에 삽입합니다. */
 void insert_pk_sorted(TableCache *tc, long val, const char* row_str) {
+    if (tc->record_count >= MAX_RECORDS) {
+        return;
+    }
+
     if (tc->pk_idx == -1) {
         strncpy(tc->records[tc->record_count], row_str, 1023);
         tc->records[tc->record_count][1023] = '\0';
@@ -266,6 +275,12 @@ void execute_insert(Statement *stmt) {
     long new_id = 0;
     int i;
     int r;
+    char *endptr = NULL;
+
+    if (tc->record_count >= MAX_RECORDS) {
+        printf("[오류] INSERT 실패: 레코드 개수 초과(최대 %d건).\n", MAX_RECORDS);
+        return;
+    }
     for (i = 0; i < tc->col_count; i++) {
         char *val = (i < val_count && vals[i]) ? vals[i] : "";
         char normalized_val[256];
@@ -278,10 +293,18 @@ void execute_insert(Statement *stmt) {
             return;
         }
 
-        if (i == tc->pk_idx && strlen(normalized_val) > 0) {
-            new_id = atol(normalized_val);
+        if (i == tc->pk_idx) {
+            if (strlen(normalized_val) == 0) {
+                printf("[오류] INSERT 실패: PK 컬럼 '%s' 값이 비어 있습니다.\n", tc->cols[i].name);
+                return;
+            }
+            new_id = strtol(normalized_val, &endptr, 10);
+            if (endptr == normalized_val || *endptr != '\0') {
+                printf("[오류] INSERT 실패: PK 컬럼 '%s'은(는) 정수값이어야 합니다.\n", tc->cols[i].name);
+                return;
+            }
             if (find_in_pk_index(tc, new_id) != -1) {
-                printf("[오류] INSERT 실패: PK 중복 값 %ld 입니다.\n", new_id);
+                printf("[오류] INSERT 실패: PK 중복 값(%ld)이 이미 존재합니다.\n", new_id);
                 return;
             }
         }

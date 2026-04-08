@@ -44,11 +44,14 @@ int main(int argc, char *argv[]) {
     while ((ch = fgetc(f)) != EOF) {
         if (ch == '-' && !q) {
             int n = fgetc(f);
-            if (n == '-') {
+            if (n == EOF) {
+                // '-'가 파일의 마지막 문자일 때는 주석이 아니므로 그대로 처리
+            } else if (n == '-') {
                 while ((ch = fgetc(f)) != EOF && ch != '\n');
                 continue;
+            } else {
+                ungetc(n, f);
             }
-            ungetc(n, f);
         }
 
         if (ch == '\'') q = !q;
