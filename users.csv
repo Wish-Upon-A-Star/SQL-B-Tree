@@ -1,1 +1,4 @@
 id(PK),email(UK),phone(UK),pwd(NN),name
+1,admin@test.com,010-1111,pass123,King_Admin
+2,user1@test.com,010-2222,qwerty,User_One
+3,'ironman@stark.com','010-3333','jarvis','Tony'

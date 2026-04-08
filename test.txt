@@ -1,13 +1,15 @@
--- 1. 정상 데이터
-INSERT INTO mydb.users VALUES (1, 'user1@test.com', '010-1111', 'pass1', 'Kim');
+-- 1. 데이터 여러 개 삽입
+INSERT INTO users VALUES (3, 'ironman@stark.com', '010-3333', 'jarvis', 'Tony');
+INSERT INTO users VALUES (4, 'thor@asgard.com', '010-4444', 'hammer', 'Thor');
 
--- 2. 첫 번째 UK(이메일) 중복 방어 테스트 (실패해야 함)
-INSERT INTO mydb.users VALUES (2, 'user1@test.com', '010-2222', 'pass2', 'Lee');
+-- 2. WHERE 예시: ID 3번만 콕 집어서 조회 (printf가 뜰 거예요!)
+SELECT * FROM users WHERE id = 3;
 
--- 3. 두 번째 UK(전화번호) 중복 방어 테스트 (실패해야 함)
-INSERT INTO mydb.users VALUES (3, 'user3@test.com', '010-1111', 'pass3', 'Park');
+-- 3. UPDATE 예시: ID 1번을 찾아서 이름 변경
+UPDATE users SET name = King_Admin WHERE id = 1;
 
--- 4. 둘 다 새로운 값이면 성공
-INSERT INTO mydb.users VALUES (4, 'user4@test.com', '010-4444', 'pass4', 'Choi');
+-- 4. DELETE 예시: ID 4번 삭제
+DELETE FROM users WHERE id = 4;
 
-SELECT * FROM mydb.users;
+-- 5. 최종 확인
+SELECT * FROM users;
