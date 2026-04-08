@@ -1,15 +1,6 @@
--- 1. 데이터 여러 개 삽입
 INSERT INTO users VALUES (3, 'ironman@stark.com', '010-3333', 'jarvis', 'Tony');
 INSERT INTO users VALUES (4, 'thor@asgard.com', '010-4444', 'hammer', 'Thor');
-
--- 2. WHERE 예시: ID 3번만 콕 집어서 조회 (printf가 뜰 거예요!)
 SELECT * FROM users WHERE id = 3;
-
--- 3. UPDATE 예시: ID 1번을 찾아서 이름 변경
 UPDATE users SET name = King_Admin WHERE id = 1;
-
--- 4. DELETE 예시: ID 4번 삭제
 DELETE FROM users WHERE id = 4;
-
--- 5. 최종 확인
 SELECT * FROM users;
