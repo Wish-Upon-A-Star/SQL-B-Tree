@@ -65,32 +65,3 @@ flowchart LR
 | 추가 SQL 지원 | 요구사항 이상으로 `UPDATE`, `DELETE`까지 구현 |
 | 명확한 오류 메시지 | 잘못된 문장과 제약 위반을 콘솔에 즉시 표시 |
 
-## 테스트 시연 시나리오
-
-| 시나리오 | 파일 | 확인 포인트 |
-| --- | --- | --- |
-| 정상 흐름 | `case_basic_users_run.txt` | 조회 -> 삽입 -> 수정 -> 삭제 |
-| 제약 검증 | `case_constraints_users_run.txt` | PK/UK/NN 위반 차단 |
-| 따옴표/쉼표 | `case_quotes_users_run.txt` | quoted CSV 값 처리 |
-| 문법 오류 | `case_invalid_users_run.txt` | 잘못된 SQL 문장 거부 |
-
-발표에서는 `정상 흐름 + 제약 검증`만 시연해도 핵심이 충분히 전달됩니다.
-
-## 실제 시연에서 보여줄 결과
-
-| 테스트 | 기대 결과 |
-| --- | --- |
-| Basic Run | 행이 추가되고, 수정되고, 다시 삭제된 뒤 원상 복구됨 |
-| Constraints Run | 중복 PK/UK, 빈 NN 값은 거부되고 정상 데이터만 반영됨 |
-| Invalid Run | 잘못된 문장은 즉시 파싱 오류로 종료됨 |
-
-## 발표에서 강조할 핵심 3가지
-
-1. 이 프로젝트는 단순한 CSV 편집기가 아니라, SQL을 해석하고 실행하는 작은 DB 처리기입니다.
-2. 최소 요구사항은 `INSERT`, `SELECT`였지만, 실제 구현은 `UPDATE`, `DELETE`, 제약조건까지 확장했습니다.
-3. 빠른 구현만이 아니라 테스트 케이스로 정상 흐름과 예외 흐름을 함께 검증했습니다.
-
-## 함께 보면 좋은 문서
-
-- [학습 가이드](docs/STUDY_GUIDE.md)
-- [3분 30초 발표 대본](docs/PRESENTATION_SCRIPT.md)
