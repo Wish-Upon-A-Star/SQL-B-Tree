@@ -1,5 +1,7 @@
-INSERT INTO users VALUES (1, Hong_Gildong, 25);
-INSERT INTO users VALUES (2, Kim_Chulsoo, 30);
-SELECT * FROM users;
-INSERT INTO products VALUES (101, Laptop, 1500);
-SELECT * FROM products;
+INSERT INTO users VALUES (103, 'ironman@stark.com', 'jarvis', 'Tony_Stark');
+INSERT INTO users VALUES (101, 'new@test.com', 'secret', 'Bad_Guy');
+INSERT INTO users VALUES (104, 'user1@test.com', 'mypass', 'Duplicate_Email');
+INSERT INTO users VALUES (105, 'spider@test.com', , 'Peter_Parker');
+INSERT INTO users VALUES (106, 'hulk@test.com', 'jarvis', 'Bruce_Banner');
+INSERT INTO users VALUES (107, 'thor@asgard.com', 'mjolnir');
+SELECT * FROM mydb.users;
