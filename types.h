@@ -31,6 +31,9 @@ typedef struct {
     StatementType type;          /* SELECT/INSERT/UPDATE/DELETE */
     char table_name[256];        /* 대상 테이블명 */
     char row_data[1024];         /* INSERT VALUES(...) 안쪽 문자열 */
+    int select_all;              /* SELECT * 인지 여부 */
+    int select_col_count;        /* SELECT col1,col2 형태의 컬럼 수 */
+    char select_cols[MAX_COLS][50]; /* SELECT col1,col2 형태의 컬럼명 목록 */
     char set_col[50];            /* UPDATE ... SET col = value */
     char set_val[256];           /* UPDATE ... SET value */
     char where_col[50];          /* WHERE col = value */

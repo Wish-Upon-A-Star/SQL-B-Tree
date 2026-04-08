@@ -354,18 +354,53 @@ void execute_select(Statement *stmt) {
     if (!tc) return;
 
     int where_idx = get_col_idx(tc, stmt->where_col);
-    printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
+    int select_idx[MAX_COLS];
+    int select_count = 0;
     int i;
-    for (i = 0; i < tc->record_count; i++) {
-        if (where_idx != -1) {
-            char row_buf[1024];
-            char *fields[MAX_COLS] = {0};
-            parse_csv_row(tc->records[i], fields, row_buf);
-            if (compare_value(fields[where_idx], stmt->where_val)) {
-                printf("%s\n", tc->records[i]);
+
+    if (!stmt->select_all) {
+        for (i = 0; i < stmt->select_col_count; i++) {
+            int idx = get_col_idx(tc, stmt->select_cols[i]);
+            if (idx == -1) {
+                printf("[오류] SELECT 실패: 존재하지 않는 컬럼 '%s'.\n", stmt->select_cols[i]);
+                return;
             }
-        } else {
+            select_idx[i] = idx;
+        }
+        select_count = stmt->select_col_count;
+    }
+
+    printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
+    for (i = 0; i < tc->record_count; i++) {
+        char row_buf[1024];
+        char *fields[MAX_COLS] = {0};
+        parse_csv_row(tc->records[i], fields, row_buf);
+
+        if (where_idx != -1) {
+            if (compare_value(fields[where_idx], stmt->where_val)) {
+                if (stmt->select_all) {
+                    printf("%s\n", tc->records[i]);
+                } else {
+                    int j;
+                    for (j = 0; j < select_count; j++) {
+                        if (j > 0) printf(",");
+                        printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
+                    }
+                    printf("\n");
+                }
+            }
+            continue;
+        }
+
+        if (stmt->select_all) {
             printf("%s\n", tc->records[i]);
+        } else {
+            int j;
+            for (j = 0; j < select_count; j++) {
+                if (j > 0) printf(",");
+                printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
+            }
+            printf("\n");
         }
     }
 }
