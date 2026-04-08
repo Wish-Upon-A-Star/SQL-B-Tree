@@ -1,4 +1,3 @@
 id(PK),email(UK),phone(UK),pwd(NN),name
 1,alpha@test.com,010-1000,pw1,Alpha
-2,beta@test.com,010-2000,pw2,Beta Prime
-3,gamma@test.com,010-3000,pw3,Gamma
+2,beta@test.com,010-2000,pw2,Beta
