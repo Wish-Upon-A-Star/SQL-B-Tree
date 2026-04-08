@@ -139,17 +139,27 @@ void execute_statement(Statement *stmt) {
 // =================================================================
 // [메인 함수] scanf로 파일명 입력받기
 // =================================================================
-int main() {
+// =================================================================
+// [메인 함수] 커맨드 라인 인자 우선 처리, 없으면 scanf로 입력받기
+// =================================================================
+int main(int argc, char *argv[]) {
     char filename[256];
 
     // 1. 데이터베이스 스키마 및 테이블 준비
     init_database(); 
 
-    // 2. 사용자에게 파일 이름 입력받기
-    printf("실행할 SQL 파일 이름을 입력하세요 (예: queries.txt): ");
-    scanf("%s", filename);
+    // 2. 실행 시 파일명을 인자로 주었는지 확인
+    if (argc >= 2) {
+        // 인자값이 있는 경우 (예: ./sql_processor queries.txt)
+        // argv[1]에 있는 파일 이름을 filename 배열로 복사합니다.
+        strcpy(filename, argv[1]); 
+    } else {
+        // 인자값이 없는 경우 (예: ./sql_processor 만 입력한 경우)
+        printf("실행할 SQL 파일 이름을 입력하세요 (예: queries.txt): ");
+        scanf("%s", filename);
+    }
 
-    // 3. 입력받은 파일 열기
+    // 3. 결정된 파일 이름으로 파일 열기
     FILE *file = fopen(filename, "r");
     if (file == NULL) {
         printf("[오류] '%s' 파일을 찾을 수 없습니다. 파일 이름과 확장자를 확인해 주세요.\n", filename);
