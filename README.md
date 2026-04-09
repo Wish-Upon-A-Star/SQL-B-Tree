@@ -2,9 +2,6 @@
 
 > SQL 텍스트 파일을 입력받아 파싱하고, 실행하고, CSV 파일에 저장하는 C 기반 SQL 처리기.
 
-<img width="1146" height="646" alt="스크린샷 198" src="https://github.com/user-attachments/assets/d84c1978-55fe-4fde-ba7e-b527d57bee28" />
-
-
 
 ## 한눈에 보기
 
@@ -17,16 +14,8 @@
 | 추가 구현 | `UPDATE`, `DELETE`, `PK/UK/NN` 제약 |
 
 ## 처리 흐름
+<img width="1146" height="646" alt="스크린샷 198" src="https://github.com/user-attachments/assets/d84c1978-55fe-4fde-ba7e-b527d57bee28" />
 
-```mermaid
-flowchart LR
-    A["SQL File"] --> B["main.c"]
-    B --> C["lexer.c"]
-    C --> D["parser.c"]
-    D --> E["executor.c"]
-    E --> F["CSV File"]
-    E --> G["Console Output"]
-```
 
 `main.c`는 SQL 파일을 문자 단위로 읽으면서 주석, 따옴표, 세미콜론을 구분해 문장을 분리합니다.  
 이후 `lexer.c`와 `parser.c`가 SQL을 `Statement` 구조체로 바꾸고, `executor.c`가 실제 조회/삽입/수정/삭제를 수행합니다.
