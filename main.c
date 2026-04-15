@@ -152,9 +152,15 @@ int main(int argc, char *argv[]) {
         generate_jungle_dataset(count, output);
         return 0;
     }
+
     if (argi < argc && strcmp(argv[argi], "--benchmark") == 0) {
         int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
         run_bplus_benchmark(count);
+        return 0;
+    }
+    if (argi < argc && strcmp(argv[argi], "--benchmark-jungle") == 0) {
+        int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
+        run_jungle_benchmark(count);
         return 0;
     }
 

@@ -7,12 +7,13 @@ BENCH_TEST ?= bench_formula_test
 SRC = main.c
 SRC_DEPS = main.c lexer.c parser.c bptree.c executor.c lexer.h parser.h bptree.h executor.h types.h
 SQL ?= demo_bptree.sql
-JUNGLE_DATASET ?= bptree_benchmark_users.csv
+PYTHON ?= python
+JUNGLE_DATASET ?= jungle_benchmark_users.csv
 JUNGLE_RECORDS ?= 1000000
 BENCH_SCORE_UPDATE_ROWS ?= 100000
 BENCH_SCORE_DELETE_ROWS ?= 100000
 
-.PHONY: all build bench-tools bench-test run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark bench-smoke bench-score bench-report bench-clean clean
+.PHONY: all build bench-tools bench-test run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 
 all: build
 
@@ -59,10 +60,13 @@ scenario-jungle-update-constraints: $(TARGET)
 generate-jungle: $(JUNGLE_DATASET)
 
 generate-jungle-sql: $(JUNGLE_DATASET)
-	python3 scripts/generate_jungle_sql_workloads.py
+	$(PYTHON) scripts/generate_jungle_sql_workloads.py
 
 benchmark: $(TARGET)
 	./$(TARGET) --benchmark 1000000
+
+benchmark-jungle: $(TARGET)
+	./$(TARGET) --benchmark-jungle 1000000
 
 bench-smoke: build bench-tools
 	./$(BENCH_RUNNER) --profile smoke --seed 20260415 --repeat 3 --memtrack
@@ -84,8 +88,6 @@ bench-clean:
 	rm -f generated_sql/workload_smoke.sql generated_sql/workload_regression.sql generated_sql/workload_score.sql
 	rm -f generated_sql/workload_smoke.meta.json generated_sql/workload_regression.meta.json generated_sql/workload_score.meta.json
 	rm -f generated_sql/oracle_smoke.json generated_sql/oracle_regression.json generated_sql/oracle_score.json
-	rm -f bptree_perf_users.csv bptree_perf_users.delta
-	rm -f jungle_workload_users.csv jungle_workload_users.idx jungle_workload_users.delta
 
 clean:
 	rm -f $(TARGET) $(BENCH_GEN) $(BENCH_RUNNER) $(BENCH_TEST)

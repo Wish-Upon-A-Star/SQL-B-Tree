@@ -233,7 +233,7 @@ static int parse_benchmark_output(const char *output, Throughput *thru) {
 }
 
 static int reset_workload_csv_header(void) {
-    FILE *src = fopen("bptree_benchmark_users.csv", "r");
+    FILE *src = fopen("jungle_benchmark_users.csv", "r");
     FILE *dst = fopen("jungle_workload_users.csv", "w");
     char line[4096];
     if (!src || !dst) {
@@ -268,7 +268,7 @@ static int run_sql_file(const char *sql_file, int memtrack, double *elapsed, int
 }
 
 static double max_live_payload_bytes(int rows) {
-    FILE *f = fopen("bptree_benchmark_users.csv", "r");
+    FILE *f = fopen("jungle_benchmark_users.csv", "r");
     char line[4096];
     int count = 0;
     double total = 0.0;
