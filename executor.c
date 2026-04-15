@@ -3747,6 +3747,9 @@ void run_bplus_benchmark(int record_count) {
 
     printf("\n--- [B+ TREE BENCHMARK] ---\n");
     printf("bulk-loaded records through RowRef path: %d (%.6f sec)\n", record_count, end - start);
+    printf("auto B+ tree order: PK=%d, UK=%d\n",
+           bptree_order(tc->id_index),
+           bptree_string_order(tc->uk_indexes[0]->tree));
     fflush(stdout);
 
     start = current_seconds();
