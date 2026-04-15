@@ -131,6 +131,31 @@ static void execute_sql_text(const char *sql) {
     }
 }
 
+static int execute_sql_line_fast(char *line) {
+    char *s = line;
+    int q = 0;
+    int semicolon_count = 0;
+    char *semicolon = NULL;
+
+    while (isspace((unsigned char)*s)) s++;
+    if (*s == '\0' || (*s == '-' && s[1] == '-')) return 1;
+
+    for (char *p = s; *p; p++) {
+        if (*p == '\'') q = !q;
+        if (*p == ';' && !q) {
+            semicolon_count++;
+            semicolon = p;
+        }
+    }
+    if (semicolon_count != 1 || !semicolon) return 0;
+    for (char *p = semicolon + 1; *p; p++) {
+        if (!isspace((unsigned char)*p)) return 0;
+    }
+    *semicolon = '\0';
+    execute_sql_text(s);
+    return 1;
+}
+
 /* SQL 파일에서 ';'로 구분되는 SQL 문장을 순서대로 실행합니다. */
 int main(int argc, char *argv[]) {
     configure_console_encoding();
@@ -156,6 +181,7 @@ int main(int argc, char *argv[]) {
     if (argi < argc && strcmp(argv[argi], "--benchmark") == 0) {
         int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
         run_bplus_benchmark(count);
+        close_all_tables();
         return 0;
     }
     if (argi < argc && strcmp(argv[argi], "--benchmark-jungle") == 0) {
@@ -179,39 +205,43 @@ int main(int argc, char *argv[]) {
     }
 
     char buf[MAX_SQL_LEN];
+    char line[MAX_SQL_LEN];
     int idx = 0;
     int q = 0;
     int too_long = 0;
-    int ch;
 
-    while ((ch = fgetc(f)) != EOF) {
-        if (ch == '-' && !q) {
-            int n = fgetc(f);
-            if (n == EOF) {
-                // '-'가 파일의 마지막 문자일 때는 주석이 아니므로 그대로 처리
-            } else if (n == '-') {
-                while ((ch = fgetc(f)) != EOF && ch != '\n');
-                continue;
-            } else {
-                ungetc(n, f);
-            }
+    while (fgets(line, sizeof(line), f)) {
+        char *p;
+
+        if (idx == 0 && execute_sql_line_fast(line)) {
+            continue;
         }
 
-        if (ch == '\'') q = !q;
-
-        if (ch == ';' && !q) {
-            buf[idx] = '\0';
-            if (too_long) {
-                printf("[오류] SQL 문장이 너무 깁니다. 최대 길이=%d\n", MAX_SQL_LEN - 1);
-            } else {
-                execute_sql_text(buf);
+        p = line;
+        while (*p) {
+            int ch = (unsigned char)*p++;
+            if (ch == '-' && !q) {
+                if (*p == '-') {
+                    break;
+                }
             }
-            idx = 0;
-            too_long = 0;
-        } else if (idx < MAX_SQL_LEN - 1) {
-            buf[idx++] = (char)ch;
-        } else {
-            too_long = 1;
+
+            if (ch == '\'') q = !q;
+
+            if (ch == ';' && !q) {
+                buf[idx] = '\0';
+                if (too_long) {
+                    printf("[오류] SQL 문장이 너무 깁니다. 최대 길이=%d\n", MAX_SQL_LEN - 1);
+                } else {
+                    execute_sql_text(buf);
+                }
+                idx = 0;
+                too_long = 0;
+            } else if (idx < MAX_SQL_LEN - 1) {
+                buf[idx++] = (char)ch;
+            } else {
+                too_long = 1;
+            }
         }
     }
 

@@ -427,6 +427,47 @@ int compare_value(const char *field, const char *search_val) {
     return strcmp(f_buf, v_buf) == 0;
 }
 
+static void copy_csv_field_range(const char *start, size_t len, char *dest, size_t dest_size) {
+    if (!dest || dest_size == 0) return;
+    if (!start) {
+        dest[0] = '\0';
+        return;
+    }
+    if (len >= dest_size) len = dest_size - 1;
+    memcpy(dest, start, len);
+    dest[len] = '\0';
+    trim_and_unquote(dest);
+}
+
+static int row_field_equals(TableCache *tc, const char *row, int col_idx, const char *search_val) {
+    const char *field_start;
+    const char *p;
+    int current_col = 0;
+    int in_quotes = 0;
+    char field_buf[RECORD_SIZE];
+    char value_buf[RECORD_SIZE];
+
+    (void)tc;
+    if (!row || col_idx < 0 || !search_val) return 0;
+    field_start = row;
+    p = row;
+    while (1) {
+        if (*p == '\'') in_quotes = !in_quotes;
+        if ((*p == ',' && !in_quotes) || *p == '\0' || *p == '\r' || *p == '\n') {
+            if (current_col == col_idx) {
+                copy_csv_field_range(field_start, (size_t)(p - field_start), field_buf, sizeof(field_buf));
+                normalize_value(search_val, value_buf, sizeof(value_buf));
+                return strcmp(field_buf, value_buf) == 0;
+            }
+            if (*p == '\0' || *p == '\r' || *p == '\n') break;
+            current_col++;
+            field_start = p + 1;
+        }
+        p++;
+    }
+    return 0;
+}
+
 static void normalize_value(const char *src, char *dest, size_t dest_size) {
     strncpy(dest, src ? src : "", dest_size - 1);
     dest[dest_size - 1] = '\0';
@@ -1461,10 +1502,15 @@ static int apply_delta_ops(TableCache *tc, DeltaOp *ops, int count) {
         int row_index = find_record_index_by_key(tc, ops[i].id);
         if (ops[i].type == 'U') {
             if (row_index >= 0) {
+                char *old_row = slot_row(tc, row_index);
+                if (old_row && !remove_record_indexes(tc, old_row)) return 0;
                 if (!replace_record_at(tc, row_index, ops[i].row)) return 0;
+                if (!restore_record_indexes(tc, row_index)) return 0;
             }
         } else if (ops[i].type == 'D') {
             if (row_index >= 0) {
+                char *old_row = slot_row(tc, row_index);
+                if (old_row && !remove_record_indexes(tc, old_row)) return 0;
                 if (!delete_record_at(tc, row_index)) return 0;
             }
         }
@@ -1728,6 +1774,7 @@ int rewrite_file(TableCache *tc) {
 
     out = fopen(temp_filename, "wb");
     if (!out) return 0;
+    setvbuf(out, NULL, _IOFBF, TABLE_FILE_BUFFER_SIZE);
 
     if (!write_table_header(out, tc)) goto fail;
     for (i = 0; i < tc->record_count; i++) {
@@ -1967,20 +2014,72 @@ static int remove_record_single_uk(TableCache *tc, const char *row, int col_idx)
     return bptree_string_delete(tc->uk_indexes[uk_slot]->tree, key);
 }
 
-static int build_updated_row(TableCache *tc, const char *row, int set_idx,
-                             const char *set_value, char *new_row, size_t new_row_size) {
+static int remove_record_uk_indexes(TableCache *tc, const char *row) {
     char row_buf[RECORD_SIZE];
     char *fields[MAX_COLS] = {0};
-    size_t offset = 0;
-    int j;
+    int i;
+
+    if (!tc || !row) return 0;
+    if (tc->uk_count == 0) return 1;
+    if (!ensure_uk_indexes(tc)) return 0;
+    parse_csv_row(row, fields, row_buf);
+    for (i = 0; i < tc->uk_count; i++) {
+        char key[RECORD_SIZE];
+        int col_idx = tc->uk_indices[i];
+
+        normalize_value(fields[col_idx], key, sizeof(key));
+        if (strlen(key) == 0) continue;
+        if (!bptree_string_delete(tc->uk_indexes[i]->tree, key)) return 0;
+    }
+    return 1;
+}
+
+static int build_updated_row(TableCache *tc, const char *row, int set_idx,
+                             const char *set_value, char *new_row, size_t new_row_size) {
+    const char *field_start;
+    const char *p;
+    const char *field_end = NULL;
+    int current_col = 0;
+    int in_quotes = 0;
+    char formatted[RECORD_SIZE];
+    size_t formatted_len;
+    size_t prefix_len;
+    size_t suffix_len;
 
     if (!tc || !row || !new_row || new_row_size == 0) return 0;
+    if (set_idx < 0 || set_idx >= tc->col_count) return 0;
     new_row[0] = '\0';
-    parse_csv_row(row, fields, row_buf);
-    for (j = 0; j < tc->col_count; j++) {
-        const char *val = (j == set_idx) ? set_value : (fields[j] ? fields[j] : "");
-        if (!append_csv_field(new_row, new_row_size, &offset, val, j == tc->col_count - 1)) return 0;
+
+    field_start = row;
+    p = row;
+    while (1) {
+        if (*p == '\'') in_quotes = !in_quotes;
+        if ((*p == ',' && !in_quotes) || *p == '\0' || *p == '\r' || *p == '\n') {
+            if (current_col == set_idx) {
+                field_end = p;
+                break;
+            }
+            if (*p == '\0' || *p == '\r' || *p == '\n') break;
+            current_col++;
+            field_start = p + 1;
+        }
+        p++;
     }
+    if (!field_end) return 0;
+
+    if (strchr(set_value ? set_value : "", ',')) {
+        snprintf(formatted, sizeof(formatted), "'%.*s'",
+                 (int)(sizeof(formatted) - 3), set_value ? set_value : "");
+    } else {
+        snprintf(formatted, sizeof(formatted), "%s", set_value ? set_value : "");
+    }
+    formatted_len = strlen(formatted);
+    prefix_len = (size_t)(field_start - row);
+    suffix_len = strlen(field_end);
+    if (prefix_len + formatted_len + suffix_len >= new_row_size) return 0;
+    memcpy(new_row, row, prefix_len);
+    memcpy(new_row + prefix_len, formatted, formatted_len);
+    memcpy(new_row + prefix_len + formatted_len, field_end, suffix_len + 1);
     return 1;
 }
 
@@ -2171,10 +2270,8 @@ static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
 
     visit.out = out;
     visit.tc = tc;
-    visit.count = 0;
     visit.failed = 0;
-    if (!bptree_visit_pairs(tc->id_index, count_active_id_pair, &visit)) return 0;
-    if (fprintf(out, "ID %d\n", visit.count) < 0) return 0;
+    if (fprintf(out, "ID %d\n", tc->active_count) < 0) return 0;
     visit.failed = 0;
     if (!bptree_visit_pairs(tc->id_index, write_active_id_pair, &visit) || visit.failed) return 0;
 
@@ -2309,6 +2406,7 @@ static int load_index_snapshot(TableCache *tc) {
     get_index_filename(tc, filename, sizeof(filename));
     f = fopen(filename, "r");
     if (!f) return 0;
+    setvbuf(f, NULL, _IOFBF, TABLE_FILE_BUFFER_SIZE);
 
     snprintf(csv_filename, sizeof(csv_filename), "%s.csv", tc->table_name);
     get_delta_filename(tc, delta_filename, sizeof(delta_filename));
@@ -2503,13 +2601,12 @@ static int load_table_parse_snapshot(TableCache *tc) {
     get_index_filename(tc, filename, sizeof(filename));
     f = fopen(filename, "r");
     if (!f) return 0;
+    setvbuf(f, NULL, _IOFBF, TABLE_FILE_BUFFER_SIZE);
 
     snprintf(csv_filename, sizeof(csv_filename), "%s.csv", tc->table_name);
     get_delta_filename(tc, delta_filename, sizeof(delta_filename));
     csv_stamp = get_file_stamp(csv_filename);
     delta_stamp = get_file_stamp(delta_filename);
-    if (delta_stamp.exists) goto fail;
-
     if (!read_expected_line(f, line, sizeof(line)) || strcmp(line, "SQLPROC_IDX_V2") != 0) goto fail;
     if (!read_expected_line(f, line, sizeof(line)) ||
         sscanf(line, "TABLE %255s", csv_filename) != 1 ||
@@ -2518,12 +2615,15 @@ static int load_table_parse_snapshot(TableCache *tc) {
         sscanf(line, "CSV %d %ld %ld", &csv_exists, &csv_size, &csv_mtime) != 3) goto fail;
     if (!read_expected_line(f, line, sizeof(line)) ||
         sscanf(line, "DELTA %d %ld %ld", &delta_exists, &delta_size, &delta_mtime) != 3) goto fail;
-    if (csv_exists != csv_stamp.exists || csv_size != csv_stamp.size || csv_mtime != csv_stamp.mtime ||
-        delta_exists != delta_stamp.exists || delta_size != delta_stamp.size ||
-        delta_mtime != delta_stamp.mtime) {
+    if (csv_exists != csv_stamp.exists || csv_size != csv_stamp.size || csv_mtime != csv_stamp.mtime) {
         goto fail;
     }
-    if (delta_exists) goto fail;
+    if (!delta_stamp.exists) {
+        if (delta_exists != delta_stamp.exists || delta_size != delta_stamp.size ||
+            delta_mtime != delta_stamp.mtime) {
+            goto fail;
+        }
+    }
 
     if (!read_expected_line(f, line, sizeof(line))) goto fail;
     {
@@ -2740,6 +2840,10 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
     }
 
     if (load_table_parse_snapshot(tc)) {
+        if (delta_log_exists(tc) && !replay_delta_log(tc)) {
+            printf("[error] failed to replay delta log while loading '%s'.\n", name);
+            return 0;
+        }
         return 1;
     }
 
@@ -3184,6 +3288,11 @@ static int row_matches_statement(TableCache *tc, Statement *stmt, const char *ro
 
     if (!tc || !stmt || !row) return 0;
     if (stmt->where_count == 0) return 1;
+    if (stmt->where_count == 1 && stmt->where_conditions[0].type == WHERE_EQ) {
+        int col_idx = condition_column_index(tc, &stmt->where_conditions[0]);
+        if (col_idx < 0 || col_idx >= tc->col_count) return 0;
+        return row_field_equals(tc, row, col_idx, stmt->where_conditions[0].val);
+    }
     parse_csv_row(row, fields, row_buf);
     return row_fields_match_statement(tc, stmt, fields);
 }
@@ -3821,10 +3930,13 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
     char *old_record;
     char *new_copy;
     char new_row[RECORD_SIZE];
+    long pk_key = 0;
+    int has_pk_key = 0;
 
     if (uses_pk_lookup) {
         INFO_PRINTF("[index] B+ tree id lookup for UPDATE\n");
         if (!find_pk_row(tc, lookup_cond->val, &target_row)) return 0;
+        has_pk_key = parse_long_value(lookup_cond->val, &pk_key);
     } else if (uses_uk_lookup) {
         INFO_PRINTF("[index] UK B+ tree lookup for UPDATE on column '%s'\n", lookup_cond->col);
         if (!find_uk_row(tc, where_idx, lookup_cond->val, &target_row)) return 0;
@@ -3837,7 +3949,7 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
         printf("[error] UPDATE failed: target row could not be loaded.\n");
         return -1;
     }
-    if (!row_matches_statement(tc, stmt, old_record)) return 0;
+    if (stmt->where_count != 1 && !row_matches_statement(tc, stmt, old_record)) return 0;
     if (rebuild_uk_needed) {
         int found_row = -1;
         int uk_slot = get_uk_slot(tc, set_idx);
@@ -3866,6 +3978,9 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
         printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
         return -1;
     }
+    if (tc->row_cached[target_row] && tc->cached_record_count > 0) {
+        tc->cached_record_count--;
+    }
     tc->records[target_row] = new_copy;
     tc->row_store[target_row] = ROW_STORE_MEMORY;
     tc->row_offsets[target_row] = -1;
@@ -3883,7 +3998,10 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
         return -1;
     }
     if (can_use_delta_log(tc)) {
-        if (!append_delta_update_slot(tc, target_row, tc->records[target_row])) {
+        int delta_ok = has_pk_key ?
+            append_delta_update_key(tc, pk_key, tc->records[target_row]) :
+            append_delta_update_slot(tc, target_row, tc->records[target_row]);
+        if (!delta_ok) {
             free(tc->records[target_row]);
             tc->records[target_row] = old_record;
             if (rebuild_uk_needed) rebuild_uk_indexes(tc);
@@ -3902,7 +4020,6 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
         return -1;
     }
     free(old_record);
-    tc->snapshot_dirty = 1;
     INFO_PRINTF("[ok] UPDATE completed. rows=1\n");
     return 1;
 }
@@ -4054,6 +4171,9 @@ void execute_update(Statement *stmt) {
             free(match_flags);
             return;
         }
+        if (tc->row_cached[i] && tc->cached_record_count > 0) {
+            tc->cached_record_count--;
+        }
         old_records[i] = tc->records[i];
         tc->records[i] = new_copy;
         tc->row_store[i] = ROW_STORE_MEMORY;
@@ -4103,7 +4223,6 @@ void execute_update(Statement *stmt) {
         }
         for (i = 0; i < tc->record_count; i++) free(old_records[i]);
         free(old_records);
-        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] UPDATE completed. rows=%d\n", count);
     } else {
         free(old_records);
@@ -4152,9 +4271,12 @@ void execute_delete(Statement *stmt) {
     }
     if (uses_pk_lookup || uses_uk_lookup) {
         char *old_record;
+        long pk_key = 0;
+        int has_pk_key = 0;
 
         if (uses_pk_lookup) {
             INFO_PRINTF("[index] B+ tree id lookup for DELETE\n");
+            has_pk_key = parse_long_value(stmt->where_conditions[index_cond].val, &pk_key);
             if (!find_pk_row(tc, stmt->where_conditions[index_cond].val, &target_row)) {
                 INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
                 return;
@@ -4172,16 +4294,52 @@ void execute_delete(Statement *stmt) {
             printf("[error] DELETE failed: target row could not be loaded.\n");
             return;
         }
-        if (!row_matches_statement(tc, stmt, old_record)) {
+        if (uses_pk_lookup && stmt->where_count == 1 && has_pk_key &&
+            tc->row_ids && tc->row_ids[target_row] != pk_key) {
+            bptree_delete(tc->id_index, pk_key);
             INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
+            return;
+        }
+        if (!(uses_pk_lookup && stmt->where_count == 1 && has_pk_key) &&
+            !row_matches_statement(tc, stmt, old_record)) {
+            if (uses_pk_lookup && stmt->where_count == 1) {
+                long stale_key;
+                if (parse_long_value(stmt->where_conditions[index_cond].val, &stale_key)) {
+                    bptree_delete(tc->id_index, stale_key);
+                }
+            } else if (uses_uk_lookup && stmt->where_count == 1) {
+                int stale_uk_slot = get_uk_slot(tc, index_col);
+                char stale_key[RECORD_SIZE];
+
+                normalize_value(stmt->where_conditions[index_cond].val,
+                                stale_key, sizeof(stale_key));
+                if (stale_uk_slot != -1 && strlen(stale_key) > 0) {
+                    bptree_string_delete(tc->uk_indexes[stale_uk_slot]->tree, stale_key);
+                }
+            }
+            INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
+            return;
+        }
+        if (uses_pk_lookup && stmt->where_count == 1 && has_pk_key) {
+            if (!bptree_delete(tc->id_index, pk_key) ||
+                !remove_record_uk_indexes(tc, old_record)) {
+                printf("[error] DELETE failed: index removal failed; memory unchanged.\n");
+                return;
+            }
+        } else if (!remove_record_indexes(tc, old_record)) {
+            printf("[error] DELETE failed: index removal failed; memory unchanged.\n");
             return;
         }
         tc->record_active[target_row] = 0;
         tc->active_count--;
         if (can_use_delta_log(tc)) {
-            if (!append_delta_delete_slot(tc, target_row, old_record)) {
+            int delta_ok = (uses_pk_lookup && stmt->where_count == 1 && has_pk_key) ?
+                append_delta_delete_key(tc, pk_key) :
+                append_delta_delete_one(tc, old_record);
+            if (!delta_ok) {
                 tc->record_active[target_row] = 1;
                 tc->active_count++;
+                restore_record_indexes(tc, target_row);
                 printf("[error] DELETE failed: delta log append failed; memory restored.\n");
                 return;
             }
@@ -4192,6 +4350,7 @@ void execute_delete(Statement *stmt) {
         } else if (!rewrite_file(tc)) {
             tc->record_active[target_row] = 1;
             tc->active_count++;
+            restore_record_indexes(tc, target_row);
             printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
             return;
         }
@@ -4207,7 +4366,6 @@ void execute_delete(Statement *stmt) {
             tc->row_refs[target_row].offset = 0;
         }
         push_free_slot(tc, target_row);
-        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] DELETE completed. rows=1\n");
         return;
     }
@@ -4242,6 +4400,22 @@ void execute_delete(Statement *stmt) {
     if (count > 0) {
         for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
             if (delete_flags[read_idx] && tc->record_active[read_idx]) {
+                if (!remove_record_indexes(tc, old_records[read_idx])) {
+                    int rollback_idx;
+                    for (rollback_idx = 0; rollback_idx < read_idx; rollback_idx++) {
+                        if (removed_index_flags[rollback_idx]) restore_record_indexes(tc, rollback_idx);
+                    }
+                    free(old_records);
+                    free(delete_flags);
+                    free(removed_index_flags);
+                    printf("[error] DELETE failed: index removal failed; memory unchanged.\n");
+                    return;
+                }
+                removed_index_flags[read_idx] = 1;
+            }
+        }
+        for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
+            if (delete_flags[read_idx] && tc->record_active[read_idx]) {
                 tc->record_active[read_idx] = 0;
                 tc->active_count--;
             }
@@ -4252,6 +4426,7 @@ void execute_delete(Statement *stmt) {
                     if (delete_flags[read_idx]) {
                         tc->record_active[read_idx] = 1;
                     }
+                    if (removed_index_flags[read_idx]) restore_record_indexes(tc, read_idx);
                 }
                 tc->active_count += count;
                 free(old_records);
@@ -4269,6 +4444,7 @@ void execute_delete(Statement *stmt) {
                 if (delete_flags[read_idx]) {
                     tc->record_active[read_idx] = 1;
                 }
+                if (removed_index_flags[read_idx]) restore_record_indexes(tc, read_idx);
             }
             tc->active_count += count;
             free(old_records);
@@ -4296,7 +4472,6 @@ void execute_delete(Statement *stmt) {
         free(old_records);
         free(delete_flags);
         free(removed_index_flags);
-        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] DELETE completed. rows=%d\n", count);
     } else {
         free(old_records);
@@ -4538,6 +4713,7 @@ void run_bplus_benchmark(int record_count) {
     double delete_time;
     BPlusPair *id_pairs = NULL;
     BPlusStringPair *uk_pairs = NULL;
+    char (*name_values)[32] = NULL;
 
     if (record_count <= 0) record_count = 1;
     if (record_count > MAX_RECORDS) {
@@ -4564,10 +4740,12 @@ void run_bplus_benchmark(int record_count) {
 
     id_pairs = (BPlusPair *)calloc((size_t)record_count, sizeof(BPlusPair));
     uk_pairs = (BPlusStringPair *)calloc((size_t)record_count, sizeof(BPlusStringPair));
-    if (!id_pairs || !uk_pairs) {
+    name_values = (char (*)[32])calloc((size_t)record_count, sizeof(*name_values));
+    if (!id_pairs || !uk_pairs || !name_values) {
         printf("[error] benchmark pair arrays could not be allocated.\n");
         free(id_pairs);
         free(uk_pairs);
+        free(name_values);
         return;
     }
 
@@ -4581,6 +4759,7 @@ void run_bplus_benchmark(int record_count) {
 
         snprintf(email, sizeof(email), "user%07d@test.com", i);
         snprintf(new_line, sizeof(new_line), "%d,%s,payload%d,User%d", i, email, i, i);
+        snprintf(name_values[i - 1], sizeof(name_values[i - 1]), "User%d", i);
         if (tc->append_offset < 0) {
             if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_END) != 0) {
                 printf("[error] benchmark append offset failed.\n");
@@ -4674,22 +4853,14 @@ void run_bplus_benchmark(int record_count) {
     start = current_seconds();
     for (i = 0; i < linear_query_count; i++) {
         char target[64];
-        char line[RECORD_SIZE];
+        int row_index;
         snprintf(target, sizeof(target), "User%d", record_count - ((i * 7919) % record_count));
-        if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_SET) != 0) break;
-        if (!fgets(line, sizeof(line), tc->file)) break;
-        while (fgets(line, sizeof(line), tc->file)) {
-            char *nl = strpbrk(line, "\r\n");
-            char row_buf[RECORD_SIZE];
-            char *fields[MAX_COLS] = {0};
-            if (nl) *nl = '\0';
-            parse_csv_row(line, fields, row_buf);
-            if (compare_value(fields[3], target)) {
+        for (row_index = 0; row_index < record_count; row_index++) {
+            if (strcmp(name_values[row_index], target) == 0) {
                 found++;
                 break;
             }
         }
-        fseek(tc->file, 0, SEEK_END);
     }
     end = current_seconds();
     linear_time = end - start;
@@ -4797,6 +4968,7 @@ void run_bplus_benchmark(int record_count) {
            delete_time, record_count, delete_time / record_count);
     printf("post-mutation active rows: %d\n", tc->active_count);
     printf("matched checks: %d\n", found);
+    free(name_values);
 }
 
 void close_all_tables(void) {

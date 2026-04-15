@@ -250,6 +250,8 @@ static int reset_workload_csv_header(void) {
     fprintf(dst, "%s\n", line);
     fclose(src);
     fclose(dst);
+    remove("jungle_workload_users.delta");
+    remove("jungle_workload_users.idx");
     return 1;
 }
 
