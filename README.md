@@ -97,23 +97,23 @@ SELECT * FROM case_basic_users WHERE name = 'AutoUser';
 .\sqlsprocessor.exe --benchmark 1000000
 ```
 
-## Benchmark Output
+## 벤치마크 출력
 
-`--benchmark` now measures three lookup paths after inserting at least 1,000,000 rows through the normal INSERT path.
+`--benchmark`는 일반 INSERT 경로로 최소 1,000,000건을 넣은 뒤 세 가지 조회 경로를 측정합니다.
 
 ```powershell
 .\sqlsprocessor.exe --benchmark 1000000
 ```
 
-- `id SELECT using B+ tree`: numeric PK B+ Tree lookup.
-- `email(UK) SELECT using B+ tree`: string UK B+ Tree lookup.
-- `name SELECT using linear scan`: non-indexed full scan baseline.
+- `id SELECT using B+ tree`: 숫자 PK B+ Tree 조회입니다.
+- `email(UK) SELECT using B+ tree`: 문자열 UK B+ Tree 조회입니다.
+- `name SELECT using linear scan`: 인덱스가 없는 컬럼의 전체 스캔 기준값입니다.
 
-Use the ratio lines to compare indexed lookup against linear scan.
+아래 비율 출력으로 인덱스 조회가 전체 스캔보다 얼마나 빠른지 비교할 수 있습니다.
 
 ```text
 linear/id-index average speed ratio: ...
 linear/uk-index average speed ratio: ...
 ```
 
-The generated `bptree_benchmark_users.csv` file is tracked in this repository so the large-table load path can be tested without regenerating data every time. When an existing CSV table is opened, PK and UK indexes are bulk-built from sorted key-row pairs instead of inserting every key into the tree one by one.
+생성된 `bptree_benchmark_users.csv` 파일은 저장소에 포함되어 있습니다. 그래서 매번 데이터를 다시 만들지 않고도 큰 테이블 로드 경로를 테스트할 수 있습니다. 기존 CSV 테이블을 열 때는 모든 키를 트리에 하나씩 삽입하지 않고, 정렬된 key-row 목록으로 PK/UK 인덱스를 bulk-build합니다.
