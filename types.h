@@ -134,6 +134,11 @@ typedef struct {
     long *tail_offsets;             /* tail_pk_ids와 대응되는 CSV 파일 offset */
     int tail_count;                 /* 캐시 밖 PK offset 개수 */
     int tail_capacity;              /* tail offset 배열 용량 */
+    long *tail_delta_ids;           /* delta가 적용된 캐시 밖 PK id 목록 */
+    char **tail_delta_rows;         /* UPDATE delta row, DELETE면 NULL */
+    unsigned char *tail_delta_deleted; /* DELETE delta 여부 */
+    int tail_delta_count;           /* tail delta overlay 개수 */
+    int tail_delta_capacity;        /* tail delta overlay 용량 */
     long next_auto_id;             /* INSERT 시 자동 부여할 다음 ID */
     long next_row_id;              /* PK가 없는 테이블의 delta/index 식별자 */
     long append_offset;            /* 다음 CSV append가 시작될 byte offset */
