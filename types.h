@@ -137,6 +137,8 @@ typedef struct {
     long next_auto_id;             /* INSERT 시 자동 부여할 다음 ID */
     long next_row_id;              /* PK가 없는 테이블의 delta/index 식별자 */
     long append_offset;            /* 다음 CSV append가 시작될 byte offset */
+    int snapshot_loaded;           /* 유효한 .idx snapshot으로 현재 상태를 복구했는지 */
+    int snapshot_dirty;            /* INSERT/UPDATE/DELETE 이후 .idx 재저장이 필요한지 */
     unsigned long long last_used_seq; /* LRU 계산용 사용 순번 */
 } TableCache;
 

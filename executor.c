@@ -1825,6 +1825,8 @@ static void remove_index_snapshot(TableCache *tc) {
     if (!tc) return;
     get_index_filename(tc, filename, sizeof(filename));
     remove(filename);
+    tc->snapshot_loaded = 0;
+    tc->snapshot_dirty = 1;
 }
 
 static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
@@ -1924,6 +1926,7 @@ static int save_index_snapshot(TableCache *tc) {
         remove_index_snapshot(tc);
         return 1;
     }
+    if (tc->snapshot_loaded && !tc->snapshot_dirty) return 1;
     if (tc->file && fflush(tc->file) != 0) return 0;
     if (!close_delta_batch(tc)) return 0;
 
@@ -1970,6 +1973,8 @@ static int save_index_snapshot(TableCache *tc) {
         return 0;
     }
     INFO_PRINTF("[index] saved B+ tree index snapshot for table '%s'.\n", tc->table_name);
+    tc->snapshot_loaded = 1;
+    tc->snapshot_dirty = 0;
     return 1;
 
 fail:
@@ -2169,6 +2174,8 @@ static int load_index_snapshot(TableCache *tc) {
     free(id_pairs);
     fclose(f);
     INFO_PRINTF("[index] loaded B+ tree index snapshot for table '%s'.\n", tc->table_name);
+    tc->snapshot_loaded = 1;
+    tc->snapshot_dirty = 0;
     return 1;
 
 fail:
@@ -2385,6 +2392,8 @@ static int load_table_parse_snapshot(TableCache *tc) {
     fclose(f);
     if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
     INFO_PRINTF("[index] loaded CSV parse/index snapshot for table '%s'.\n", tc->table_name);
+    tc->snapshot_loaded = 1;
+    tc->snapshot_dirty = 0;
     return 1;
 
 fail:
@@ -2796,6 +2805,7 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
                MAX_RECORDS);
     }
     if (inserted_id) *inserted_id = id_value;
+    tc->snapshot_dirty = 1;
     return 1;
 }
 
@@ -3650,6 +3660,7 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
         return -1;
     }
     free(old_record);
+    tc->snapshot_dirty = 1;
     INFO_PRINTF("[ok] UPDATE completed. rows=1\n");
     return 1;
 }
@@ -3850,6 +3861,7 @@ void execute_update(Statement *stmt) {
         }
         for (i = 0; i < tc->record_count; i++) free(old_records[i]);
         free(old_records);
+        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] UPDATE completed. rows=%d\n", count);
     } else {
         free(old_records);
@@ -3953,6 +3965,7 @@ void execute_delete(Statement *stmt) {
             tc->row_refs[target_row].offset = 0;
         }
         push_free_slot(tc, target_row);
+        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] DELETE completed. rows=1\n");
         return;
     }
@@ -4041,6 +4054,7 @@ void execute_delete(Statement *stmt) {
         free(old_records);
         free(delete_flags);
         free(removed_index_flags);
+        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] DELETE completed. rows=%d\n", count);
     } else {
         free(old_records);
