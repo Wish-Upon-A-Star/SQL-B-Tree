@@ -10,6 +10,8 @@
 #include "executor.h"
 #include "bptree.h"
 
+#define DELTA_LINE_SIZE (RECORD_SIZE + 128)
+
 TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
 static unsigned long long g_table_access_seq = 0;
@@ -28,6 +30,8 @@ static int table_file_has_value(TableCache *tc, int col_idx, const char *value);
 static int for_each_file_row_from(TableCache *tc, long start_offset,
                                   int (*visitor)(TableCache *, const char *, void *),
                                   void *ctx);
+static int replay_delta_log(TableCache *tc);
+static int clear_delta_log(TableCache *tc);
 
 static char *dup_string(const char *src) {
     size_t len = strlen(src) + 1;
@@ -441,6 +445,257 @@ static int write_table_header(FILE *out, TableCache *tc) {
     return 1;
 }
 
+typedef struct {
+    char type;
+    long id;
+    char *row;
+} DeltaOp;
+
+static void get_delta_filename(TableCache *tc, char *filename, size_t filename_size) {
+    snprintf(filename, filename_size, "%s.delta", tc->table_name);
+}
+
+static int delta_log_exists(TableCache *tc) {
+    char filename[300];
+    FILE *f;
+
+    if (!tc) return 0;
+    get_delta_filename(tc, filename, sizeof(filename));
+    f = fopen(filename, "r");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int clear_delta_log(TableCache *tc) {
+    char filename[300];
+
+    if (!tc) return 0;
+    get_delta_filename(tc, filename, sizeof(filename));
+    remove(filename);
+    return 1;
+}
+
+static int get_row_pk_value(TableCache *tc, const char *row, long *id_value) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+
+    if (!tc || tc->pk_idx == -1 || !row || !id_value) return 0;
+    parse_csv_row(row, fields, row_buf);
+    return parse_long_value(fields[tc->pk_idx], id_value);
+}
+
+static int find_record_index_by_pk_scan(TableCache *tc, long id_value) {
+    int i;
+
+    if (!tc || tc->pk_idx == -1) return -1;
+    for (i = 0; i < tc->record_count; i++) {
+        long row_id;
+        if (get_row_pk_value(tc, tc->records[i], &row_id) && row_id == id_value) return i;
+    }
+    return -1;
+}
+
+static int delete_record_at(TableCache *tc, int row_index) {
+    int i;
+
+    if (!tc || row_index < 0 || row_index >= tc->record_count) return 0;
+    free(tc->records[row_index]);
+    for (i = row_index + 1; i < tc->record_count; i++) tc->records[i - 1] = tc->records[i];
+    tc->record_count--;
+    if (tc->record_count >= 0) tc->records[tc->record_count] = NULL;
+    return 1;
+}
+
+static int replace_record_at(TableCache *tc, int row_index, const char *row) {
+    char *copy;
+
+    if (!tc || row_index < 0 || row_index >= tc->record_count || !row) return 0;
+    copy = dup_string(row);
+    if (!copy) return 0;
+    free(tc->records[row_index]);
+    tc->records[row_index] = copy;
+    return 1;
+}
+
+static void free_delta_ops(DeltaOp *ops, int count) {
+    int i;
+
+    if (!ops) return;
+    for (i = 0; i < count; i++) free(ops[i].row);
+    free(ops);
+}
+
+static int append_delta_op(DeltaOp **ops, int *count, int *capacity, char type, long id, const char *row) {
+    DeltaOp *new_ops;
+
+    if (*count >= *capacity) {
+        int new_capacity = (*capacity == 0) ? 16 : (*capacity * 2);
+        new_ops = (DeltaOp *)realloc(*ops, (size_t)new_capacity * sizeof(DeltaOp));
+        if (!new_ops) return 0;
+        *ops = new_ops;
+        *capacity = new_capacity;
+    }
+    (*ops)[*count].type = type;
+    (*ops)[*count].id = id;
+    (*ops)[*count].row = row ? dup_string(row) : NULL;
+    if (row && !(*ops)[*count].row) return 0;
+    (*count)++;
+    return 1;
+}
+
+static int apply_delta_ops(TableCache *tc, DeltaOp *ops, int count) {
+    int i;
+
+    for (i = 0; i < count; i++) {
+        int row_index = find_record_index_by_pk_scan(tc, ops[i].id);
+        if (ops[i].type == 'U') {
+            if (row_index >= 0) {
+                if (!replace_record_at(tc, row_index, ops[i].row)) return 0;
+            }
+        } else if (ops[i].type == 'D') {
+            if (row_index >= 0) {
+                if (!delete_record_at(tc, row_index)) return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int replay_delta_log(TableCache *tc) {
+    char filename[300];
+    char line[DELTA_LINE_SIZE];
+    FILE *f;
+    DeltaOp *ops = NULL;
+    int count = 0;
+    int capacity = 0;
+    int in_batch = 0;
+    int applied_batches = 0;
+
+    if (!tc || tc->pk_idx == -1) return 1;
+    get_delta_filename(tc, filename, sizeof(filename));
+    f = fopen(filename, "r");
+    if (!f) return 1;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strpbrk(line, "\r\n");
+        size_t line_len = strlen(line);
+
+        if (!nl && line_len == sizeof(line) - 1 && !feof(f)) {
+            printf("[error] delta row too long while loading '%s'.\n", filename);
+            fclose(f);
+            free_delta_ops(ops, count);
+            return 0;
+        }
+        if (nl) *nl = '\0';
+        if (strcmp(line, "B") == 0) {
+            free_delta_ops(ops, count);
+            ops = NULL;
+            count = 0;
+            capacity = 0;
+            in_batch = 1;
+            continue;
+        }
+        if (strcmp(line, "E") == 0) {
+            if (in_batch) {
+                if (!apply_delta_ops(tc, ops, count)) {
+                    fclose(f);
+                    free_delta_ops(ops, count);
+                    return 0;
+                }
+                applied_batches++;
+            }
+            free_delta_ops(ops, count);
+            ops = NULL;
+            count = 0;
+            capacity = 0;
+            in_batch = 0;
+            continue;
+        }
+        if (in_batch && line[0] == 'U' && line[1] == '\t') {
+            char *id_text = line + 2;
+            char *row = strchr(id_text, '\t');
+            long id_value;
+
+            if (!row) continue;
+            *row++ = '\0';
+            if (!parse_long_value(id_text, &id_value)) continue;
+            if (!append_delta_op(&ops, &count, &capacity, 'U', id_value, row)) {
+                fclose(f);
+                free_delta_ops(ops, count);
+                return 0;
+            }
+        } else if (in_batch && line[0] == 'D' && line[1] == '\t') {
+            long id_value;
+            if (!parse_long_value(line + 2, &id_value)) continue;
+            if (!append_delta_op(&ops, &count, &capacity, 'D', id_value, NULL)) {
+                fclose(f);
+                free_delta_ops(ops, count);
+                return 0;
+            }
+        }
+    }
+    free_delta_ops(ops, count);
+    fclose(f);
+    if (applied_batches > 0) {
+        printf("[notice] replayed %d committed delta batch(es) for table '%s'.\n",
+               applied_batches, tc->table_name);
+    }
+    return 1;
+}
+
+static int append_delta_updates(TableCache *tc, char **old_records) {
+    char filename[300];
+    FILE *f;
+    int i;
+
+    if (!tc || tc->pk_idx == -1 || !old_records) return 0;
+    get_delta_filename(tc, filename, sizeof(filename));
+    f = fopen(filename, "a");
+    if (!f) return 0;
+    if (fprintf(f, "B\n") < 0) goto fail;
+    for (i = 0; i < tc->record_count; i++) {
+        long id_value;
+        if (!old_records[i]) continue;
+        if (!get_row_pk_value(tc, tc->records[i], &id_value)) goto fail;
+        if (fprintf(f, "U\t%ld\t%s\n", id_value, tc->records[i]) < 0) goto fail;
+    }
+    if (fprintf(f, "E\n") < 0) goto fail;
+    if (fflush(f) != 0 || ferror(f)) goto fail;
+    if (fclose(f) != 0) return 0;
+    return 1;
+
+fail:
+    fclose(f);
+    return 0;
+}
+
+static int append_delta_deletes(TableCache *tc, char **old_records, int *delete_flags, int old_count) {
+    char filename[300];
+    FILE *f;
+    int i;
+
+    if (!tc || tc->pk_idx == -1 || !old_records || !delete_flags) return 0;
+    get_delta_filename(tc, filename, sizeof(filename));
+    f = fopen(filename, "a");
+    if (!f) return 0;
+    if (fprintf(f, "B\n") < 0) goto fail;
+    for (i = 0; i < old_count; i++) {
+        long id_value;
+        if (!delete_flags[i]) continue;
+        if (!get_row_pk_value(tc, old_records[i], &id_value)) goto fail;
+        if (fprintf(f, "D\t%ld\n", id_value) < 0) goto fail;
+    }
+    if (fprintf(f, "E\n") < 0) goto fail;
+    if (fflush(f) != 0 || ferror(f)) goto fail;
+    if (fclose(f) != 0) return 0;
+    return 1;
+
+fail:
+    fclose(f);
+    return 0;
+}
+
 int rewrite_file(TableCache *tc) {
     char filename[300];
     char temp_filename[320];
@@ -474,6 +729,7 @@ int rewrite_file(TableCache *tc) {
     if (!tc->file) {
         printf("[warning] table file was rewritten, but could not be reopened for append.\n");
     }
+    clear_delta_log(tc);
     return 1;
 
 fail:
@@ -723,6 +979,10 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
             tc->cache_truncated = 1;
         }
     }
+    if (!replay_delta_log(tc)) {
+        printf("[error] failed to replay delta log while loading '%s'.\n", name);
+        return 0;
+    }
     if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
         printf("[error] failed to bulk-build indexes while loading '%s'.\n", name);
         return 0;
@@ -918,6 +1178,12 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
 
     if (!build_insert_row(tc, vals, val_count, &id_value, new_line, sizeof(new_line))) return 0;
 
+    if (!tc->cache_truncated && tc->record_count >= MAX_RECORDS && delta_log_exists(tc)) {
+        if (!rewrite_file(tc)) {
+            printf("[error] INSERT failed: could not compact pending delta log before tail append.\n");
+            return 0;
+        }
+    }
     if (!validate_file_duplicates_for_uncached_insert(tc, new_line)) return 0;
 
     if (!tc->cache_truncated && tc->record_count < MAX_RECORDS) {
@@ -1279,6 +1545,7 @@ void execute_update(Statement *stmt) {
     char **old_records;
     int target_count = 0;
     int uses_pk_lookup = 0;
+    int uses_uk_lookup = 0;
     int target_row = -1;
     int rebuild_uk_needed;
     int i;
@@ -1310,6 +1577,7 @@ void execute_update(Statement *stmt) {
     }
     rebuild_uk_needed = (tc->cols[set_idx].type == COL_UK);
     uses_pk_lookup = (where_idx == tc->pk_idx);
+    uses_uk_lookup = (!uses_pk_lookup && get_uk_slot(tc, where_idx) != -1);
 
     match_flags = (int *)calloc((size_t)tc->record_count, sizeof(int));
     if (!match_flags) {
@@ -1326,6 +1594,12 @@ void execute_update(Statement *stmt) {
     if (uses_pk_lookup) {
         printf("[index] B+ tree id lookup for UPDATE\n");
         if (find_pk_row(tc, stmt->where_val, &target_row)) {
+            match_flags[target_row] = 1;
+            target_count = 1;
+        }
+    } else if (uses_uk_lookup) {
+        printf("[index] UK B+ tree lookup for UPDATE on column '%s'\n", stmt->where_col);
+        if (find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
             match_flags[target_row] = 1;
             target_count = 1;
         }
@@ -1414,7 +1688,16 @@ void execute_update(Statement *stmt) {
             printf("[error] UPDATE failed: UK index rebuild failed; memory restored.\n");
             return;
         }
-        if (!rewrite_file(tc)) {
+        if (tc->pk_idx != -1) {
+            if (!append_delta_updates(tc, old_records)) {
+                rollback_updated_records(tc, old_records);
+                if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+                free(old_records);
+                printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
+                return;
+            }
+            printf("[delta] UPDATE persisted through append-only delta log.\n");
+        } else if (!rewrite_file(tc)) {
             rollback_updated_records(tc, old_records);
             if (rebuild_uk_needed) rebuild_uk_indexes(tc);
             free(old_records);
@@ -1440,6 +1723,7 @@ void execute_delete(Statement *stmt) {
     char **old_records;
     int *delete_flags;
     int uses_pk_lookup = 0;
+    int uses_uk_lookup = 0;
     int target_row = -1;
 
     if (!tc) return;
@@ -1457,6 +1741,7 @@ void execute_delete(Statement *stmt) {
 
     old_count = tc->record_count;
     uses_pk_lookup = (where_idx == tc->pk_idx);
+    uses_uk_lookup = (!uses_pk_lookup && get_uk_slot(tc, where_idx) != -1);
     if (old_count == 0) {
         printf("[notice] no rows matched DELETE condition.\n");
         return;
@@ -1474,6 +1759,12 @@ void execute_delete(Statement *stmt) {
     if (uses_pk_lookup) {
         printf("[index] B+ tree id lookup for DELETE\n");
         if (find_pk_row(tc, stmt->where_val, &target_row)) {
+            delete_flags[target_row] = 1;
+            count = 1;
+        }
+    } else if (uses_uk_lookup) {
+        printf("[index] UK B+ tree lookup for DELETE on column '%s'\n", stmt->where_col);
+        if (find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
             delete_flags[target_row] = 1;
             count = 1;
         }
@@ -1508,7 +1799,19 @@ void execute_delete(Statement *stmt) {
             printf("[error] DELETE failed: index rebuild failed; memory restored.\n");
             return;
         }
-        if (!rewrite_file(tc)) {
+        if (tc->pk_idx != -1) {
+            if (!append_delta_deletes(tc, old_records, delete_flags, old_count)) {
+                memcpy(tc->records, old_records, (size_t)old_count * sizeof(char *));
+                tc->record_count = old_count;
+                rebuild_id_index(tc);
+                rebuild_uk_indexes(tc);
+                free(old_records);
+                free(delete_flags);
+                printf("[error] DELETE failed: delta log append failed; memory restored.\n");
+                return;
+            }
+            printf("[delta] DELETE persisted through append-only delta log.\n");
+        } else if (!rewrite_file(tc)) {
             memcpy(tc->records, old_records, (size_t)old_count * sizeof(char *));
             tc->record_count = old_count;
             rebuild_id_index(tc);
@@ -1566,6 +1869,7 @@ void run_bplus_benchmark(int record_count) {
 
     close_all_tables();
     open_table_count = 0;
+    remove("bptree_benchmark_users.delta");
 
     f = fopen("bptree_benchmark_users.csv", "w");
     if (!f) {

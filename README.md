@@ -129,4 +129,15 @@ This implementation keeps the first 2,000,000 rows in `TableCache.records` and b
 - UPDATE/DELETE with `WHERE id = ...` uses the PK B+ Tree to locate the target row before applying the change.
 - `--benchmark` requests above 2,000,000 rows are capped to 2,000,000 rows to avoid memory blowups.
 
+## Append-Only Delta Log
+
+Cached tables with a PK no longer rewrite the whole CSV for every UPDATE or DELETE. The executor keeps B+ Tree indexes in memory and persists row changes to `<table>.delta`.
+
+- UPDATE writes committed `U` records to the delta log after memory and B+ Tree checks succeed.
+- DELETE writes committed `D` tombstone records to the delta log after memory and B+ Tree rebuild succeed.
+- On table open, the CSV is loaded first, then committed delta batches are replayed, then PK/UK B+ Tree indexes are bulk-built from the current rows.
+- Incomplete delta batches are ignored because only records between `B` and `E` markers are replayed.
+- If the table later crosses the memory cache limit, pending delta changes are compacted back into the CSV before new tail rows are appended.
+- Over-limit tables still use the slower full-file fallback because rows outside the cached prefix are not indexed in memory.
+
 생성된 `bptree_benchmark_users.csv` 파일은 저장소에 커밋하지 않습니다. 벤치마크를 실행하면 필요할 때 다시 생성됩니다. 기존 CSV 테이블을 열 때는 모든 키를 트리에 하나씩 삽입하지 않고, 정렬된 key-row 목록으로 PK/UK 인덱스를 bulk-build합니다.
