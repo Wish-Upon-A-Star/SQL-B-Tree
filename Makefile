@@ -74,7 +74,7 @@ bench-smoke: build bench-tools
 
 bench-score: build bench-tools
 ifeq ($(BENCH_SCORE_IN_TMP),1)
-	sh scripts/run_bench_score_tmp.sh "$(CURDIR)" "$(BENCH_SCORE_UPDATE_ROWS)" "$(BENCH_SCORE_DELETE_ROWS)"
+	tr -d '\r' < scripts/run_bench_score_tmp.sh | sh -s -- "$(CURDIR)" "$(BENCH_SCORE_UPDATE_ROWS)" "$(BENCH_SCORE_DELETE_ROWS)"
 else
 	./$(BENCH_RUNNER) --profile score --seed 20260415 --repeat 1 --update-rows $(BENCH_SCORE_UPDATE_ROWS) --delete-rows $(BENCH_SCORE_DELETE_ROWS) --memtrack
 endif
