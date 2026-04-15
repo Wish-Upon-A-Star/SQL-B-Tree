@@ -142,7 +142,6 @@ int main(int argc, char *argv[]) {
     int argi = 1;
 
     if (argi < argc && strcmp(argv[argi], "--quiet") == 0) {
-        set_executor_quiet(1);
         argi++;
     }
 
