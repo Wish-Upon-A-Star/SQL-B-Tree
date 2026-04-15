@@ -23,6 +23,10 @@ static int get_uk_slot(TableCache *tc, int col_idx);
 static int ensure_uk_indexes(TableCache *tc);
 static int rollback_last_record_memory(TableCache *tc);
 static void rollback_updated_records(TableCache *tc, char **old_records);
+static int table_file_has_value(TableCache *tc, int col_idx, const char *value);
+static int for_each_file_row_from(TableCache *tc, long start_offset,
+                                  int (*visitor)(TableCache *, const char *, void *),
+                                  void *ctx);
 
 static char *dup_string(const char *src) {
     size_t len = strlen(src) + 1;
@@ -337,12 +341,95 @@ static int append_record_file(TableCache *tc, const char *row, int flush_now) {
     return 1;
 }
 
+static int for_each_file_row_from(TableCache *tc, long start_offset,
+                                  int (*visitor)(TableCache *, const char *, void *),
+                                  void *ctx) {
+    char line[RECORD_SIZE];
+
+    if (!tc || !tc->file || !visitor) return 0;
+    if (fflush(tc->file) != 0) return 0;
+    if (start_offset > 0) {
+        if (fseek(tc->file, start_offset, SEEK_SET) != 0) return 0;
+    } else {
+        if (fseek(tc->file, 0, SEEK_SET) != 0) return 0;
+        if (!fgets(line, sizeof(line), tc->file)) {
+            fseek(tc->file, 0, SEEK_END);
+            return 1;
+        }
+    }
+
+    while (fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        size_t line_len = strlen(line);
+
+        if (!nl && line_len == sizeof(line) - 1 && !feof(tc->file)) {
+            printf("[error] row too long while scanning '%s' (max %d bytes).\n",
+                   tc->table_name, RECORD_SIZE - 1);
+            fseek(tc->file, 0, SEEK_END);
+            return 0;
+        }
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+        if (!visitor(tc, line, ctx)) {
+            fseek(tc->file, 0, SEEK_END);
+            return 0;
+        }
+    }
+    fseek(tc->file, 0, SEEK_END);
+    return 1;
+}
+
+typedef struct {
+    int col_idx;
+    const char *value;
+    int found;
+} FileValueSearch;
+
+static int find_value_visitor(TableCache *tc, const char *row, void *ctx) {
+    FileValueSearch *search = (FileValueSearch *)ctx;
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+
+    parse_csv_row(row, fields, row_buf);
+    if (search->col_idx >= 0 && search->col_idx < tc->col_count &&
+        compare_value(fields[search->col_idx], search->value)) {
+        search->found = 1;
+        return 0;
+    }
+    return 1;
+}
+
+static int table_file_has_value(TableCache *tc, int col_idx, const char *value) {
+    FileValueSearch search;
+    long start_offset = (tc && tc->cache_truncated) ? tc->uncached_start_offset : 0;
+
+    if (!tc || col_idx < 0 || !value || strlen(value) == 0) return 0;
+    search.col_idx = col_idx;
+    search.value = value;
+    search.found = 0;
+    if (!for_each_file_row_from(tc, start_offset, find_value_visitor, &search) && !search.found) return 0;
+    return search.found;
+}
+
 static int replace_table_file(const char *temp_filename, const char *filename) {
 #if defined(_WIN32)
     return MoveFileExA(temp_filename, filename, MOVEFILE_REPLACE_EXISTING) != 0;
 #else
     return rename(temp_filename, filename) == 0;
 #endif
+}
+
+static int write_table_header(FILE *out, TableCache *tc) {
+    int i;
+
+    for (i = 0; i < tc->col_count; i++) {
+        if (fprintf(out, "%s", tc->cols[i].name) < 0) return 0;
+        if (tc->cols[i].type == COL_PK && fprintf(out, "(PK)") < 0) return 0;
+        else if (tc->cols[i].type == COL_UK && fprintf(out, "(UK)") < 0) return 0;
+        else if (tc->cols[i].type == COL_NN && fprintf(out, "(NN)") < 0) return 0;
+        if (fprintf(out, "%s", (i == tc->col_count - 1 ? "\n" : ",")) < 0) return 0;
+    }
+    return 1;
 }
 
 int rewrite_file(TableCache *tc) {
@@ -359,13 +446,7 @@ int rewrite_file(TableCache *tc) {
     out = fopen(temp_filename, "w");
     if (!out) return 0;
 
-    for (i = 0; i < tc->col_count; i++) {
-        if (fprintf(out, "%s", tc->cols[i].name) < 0) goto fail;
-        if (tc->cols[i].type == COL_PK && fprintf(out, "(PK)") < 0) goto fail;
-        else if (tc->cols[i].type == COL_UK && fprintf(out, "(UK)") < 0) goto fail;
-        else if (tc->cols[i].type == COL_NN && fprintf(out, "(NN)") < 0) goto fail;
-        if (fprintf(out, "%s", (i == tc->col_count - 1 ? "\n" : ",")) < 0) goto fail;
-    }
+    if (!write_table_header(out, tc)) goto fail;
     for (i = 0; i < tc->record_count; i++) {
         if (fprintf(out, "%s\n", tc->records[i]) < 0) goto fail;
     }
@@ -545,6 +626,7 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
     char header[RECORD_SIZE];
     char line[RECORD_SIZE];
     long line_number = 1;
+    long file_next_auto_id = 1;
 
     reset_table_cache(tc);
     if (!tc->id_index) return 0;
@@ -592,12 +674,18 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
         if (!ensure_uk_indexes(tc)) return 0;
     }
 
-    while (fgets(line, sizeof(line), f)) {
-        char *nl = strpbrk(line, "\r\n");
+    while (1) {
+        char *nl;
         char row_buf[RECORD_SIZE];
         char *fields[MAX_COLS] = {0};
         long id_value = 0;
-        size_t line_len = strlen(line);
+        long row_offset = ftell(f);
+        size_t line_len;
+
+        if (row_offset < 0) return 0;
+        if (!fgets(line, sizeof(line), f)) break;
+        nl = strpbrk(line, "\r\n");
+        line_len = strlen(line);
 
         line_number++;
         if (!nl && line_len == sizeof(line) - 1 && !feof(f)) {
@@ -608,25 +696,32 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
 
         if (nl) *nl = '\0';
         if (strlen(line) == 0) continue;
-        if (tc->record_count >= MAX_RECORDS) {
-            printf("[error] record limit exceeded while loading '%s' (max %d). Table was not loaded partially.\n",
-                   name, MAX_RECORDS);
-            return 0;
-        }
 
         parse_csv_row(line, fields, row_buf);
         if (tc->pk_idx != -1 && fields[tc->pk_idx] && !parse_long_value(fields[tc->pk_idx], &id_value)) {
             printf("[error] invalid PK value while loading '%s': %s\n", name, fields[tc->pk_idx]);
             return 0;
         }
-        if (!append_record_raw_memory(tc, line)) {
-            printf("[error] failed to load row into memory.\n");
-            return 0;
+        if (tc->pk_idx != -1 && id_value >= file_next_auto_id) file_next_auto_id = id_value + 1;
+
+        if (tc->record_count < MAX_RECORDS) {
+            if (!append_record_raw_memory(tc, line)) {
+                printf("[error] failed to load row into memory.\n");
+                return 0;
+            }
+        } else {
+            if (!tc->cache_truncated) tc->uncached_start_offset = row_offset;
+            tc->cache_truncated = 1;
         }
     }
     if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
         printf("[error] failed to bulk-build indexes while loading '%s'.\n", name);
         return 0;
+    }
+    if (file_next_auto_id > tc->next_auto_id) tc->next_auto_id = file_next_auto_id;
+    if (tc->cache_truncated) {
+        printf("[notice] table '%s' exceeded memory cache limit (%d rows). Extra rows stay on disk and use slower CSV scans.\n",
+               name, MAX_RECORDS);
     }
     return 1;
 }
@@ -665,6 +760,22 @@ TableCache *get_table(const char *name) {
         return NULL;
     }
     return tc;
+}
+
+static int reload_table_cache(TableCache *tc) {
+    char table_name[256];
+    char filename[300];
+    FILE *f;
+
+    if (!tc) return 0;
+    strncpy(table_name, tc->table_name, sizeof(table_name) - 1);
+    table_name[sizeof(table_name) - 1] = '\0';
+    snprintf(filename, sizeof(filename), "%s.csv", table_name);
+
+    free_table_storage(tc);
+    f = fopen(filename, "r+");
+    if (!f) return 0;
+    return load_table_contents(tc, table_name, f);
 }
 
 static int build_insert_row(TableCache *tc, char *vals[MAX_COLS], int val_count, long *id_value, char *new_line, size_t line_size) {
@@ -762,6 +873,29 @@ static int append_csv_field(char *row, size_t row_size, size_t *offset, const ch
     return 1;
 }
 
+static int validate_file_duplicates_for_uncached_insert(TableCache *tc, const char *new_line) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    int i;
+
+    if (!tc || !new_line || (!tc->cache_truncated && tc->record_count < MAX_RECORDS)) return 1;
+    parse_csv_row(new_line, fields, row_buf);
+
+    if (tc->pk_idx != -1 && table_file_has_value(tc, tc->pk_idx, fields[tc->pk_idx])) {
+        printf("[error] INSERT failed: duplicate PK value %s.\n", fields[tc->pk_idx]);
+        return 0;
+    }
+    for (i = 0; i < tc->uk_count; i++) {
+        int col_idx = tc->uk_indices[i];
+        if (fields[col_idx] && strlen(fields[col_idx]) > 0 &&
+            table_file_has_value(tc, col_idx, fields[col_idx])) {
+            printf("[error] INSERT failed: '%s' violates UK constraint.\n", fields[col_idx]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, long *inserted_id) {
     char buffer[RECORD_SIZE];
     char *vals[MAX_COLS] = {0};
@@ -773,21 +907,43 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
     parse_csv_row(row_data, vals, buffer);
     while (val_count < MAX_COLS && vals[val_count]) val_count++;
 
-    if (tc->record_count >= MAX_RECORDS) {
-        printf("[error] INSERT failed: record limit exceeded (max %d).\n", MAX_RECORDS);
-        return 0;
-    }
     if (!build_insert_row(tc, vals, val_count, &id_value, new_line, sizeof(new_line))) return 0;
-    if (!append_record_memory(tc, new_line, id_value)) {
-        printf("[error] INSERT failed: could not update B+ tree index or memory store.\n");
-        return 0;
-    }
-    if (!append_record_file(tc, new_line, flush_now)) {
-        if (!rollback_last_record_memory(tc)) {
-            printf("[error] INSERT rollback failed: indexes may be stale.\n");
+
+    if (!validate_file_duplicates_for_uncached_insert(tc, new_line)) return 0;
+
+    if (!tc->cache_truncated && tc->record_count < MAX_RECORDS) {
+        if (!append_record_memory(tc, new_line, id_value)) {
+            printf("[error] INSERT failed: could not update B+ tree index or memory store.\n");
+            return 0;
         }
-        printf("[error] INSERT failed: could not append to table file.\n");
-        return 0;
+        if (!append_record_file(tc, new_line, flush_now)) {
+            if (!rollback_last_record_memory(tc)) {
+                printf("[error] INSERT rollback failed: indexes may be stale.\n");
+            }
+            printf("[error] INSERT failed: could not append to table file.\n");
+            return 0;
+        }
+    } else {
+        long append_offset;
+
+        if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_END) != 0) {
+            printf("[error] INSERT failed: could not find append position.\n");
+            return 0;
+        }
+        append_offset = ftell(tc->file);
+        if (append_offset < 0) {
+            printf("[error] INSERT failed: could not find append position.\n");
+            return 0;
+        }
+        if (!append_record_file(tc, new_line, flush_now)) {
+            printf("[error] INSERT failed: could not append to table file.\n");
+            return 0;
+        }
+        if (!tc->cache_truncated) tc->uncached_start_offset = append_offset;
+        tc->cache_truncated = 1;
+        if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
+        printf("[notice] INSERT appended to CSV only; memory cache limit is %d rows, so later lookup may use slower file scan.\n",
+               MAX_RECORDS);
     }
     if (inserted_id) *inserted_id = id_value;
     return 1;
@@ -817,6 +973,57 @@ static void print_selected_row(const char *row, int select_idx[MAX_COLS], int se
         printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
     }
     printf("\n");
+}
+
+static void execute_select_file_scan(TableCache *tc, long start_offset, int where_idx,
+                                     int select_idx[MAX_COLS], int select_count,
+                                     int select_all, const char *where_val) {
+    char line[RECORD_SIZE];
+
+    if (!tc || !tc->file) return;
+    if (fflush(tc->file) != 0) {
+        printf("[error] SELECT failed: could not scan table file.\n");
+        return;
+    }
+    if (start_offset > 0) {
+        if (fseek(tc->file, start_offset, SEEK_SET) != 0) {
+            printf("[error] SELECT failed: could not scan uncached table rows.\n");
+            return;
+        }
+        printf("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
+    } else {
+        if (fseek(tc->file, 0, SEEK_SET) != 0) {
+            printf("[error] SELECT failed: could not scan table file.\n");
+            return;
+        }
+        if (!fgets(line, sizeof(line), tc->file)) {
+            fseek(tc->file, 0, SEEK_END);
+            return;
+        }
+        printf("[scan] full CSV scan\n");
+    }
+
+    while (fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        size_t line_len = strlen(line);
+
+        if (!nl && line_len == sizeof(line) - 1 && !feof(tc->file)) {
+            printf("[error] row too long while scanning '%s' (max %d bytes).\n",
+                   tc->table_name, RECORD_SIZE - 1);
+            fseek(tc->file, 0, SEEK_END);
+            return;
+        }
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+        if (where_idx != -1) {
+            char row_buf[RECORD_SIZE];
+            char *fields[MAX_COLS] = {0};
+            parse_csv_row(line, fields, row_buf);
+            if (!compare_value(fields[where_idx], where_val)) continue;
+        }
+        print_selected_row(line, select_idx, select_count, select_all);
+    }
+    fseek(tc->file, 0, SEEK_END);
 }
 
 void execute_select(Statement *stmt) {
@@ -852,6 +1059,11 @@ void execute_select(Statement *stmt) {
         printf("[index] B+ tree id lookup\n");
         if (bptree_search(tc->id_index, key, &row_index)) {
             print_selected_row(tc->records[row_index], select_idx, select_count, stmt->select_all);
+            return;
+        }
+        if (tc->cache_truncated) {
+            execute_select_file_scan(tc, tc->uncached_start_offset, where_idx, select_idx, select_count,
+                                     stmt->select_all, stmt->where_val);
         }
         return;
     }
@@ -861,6 +1073,11 @@ void execute_select(Statement *stmt) {
         printf("[index] UK B+ tree lookup on column '%s'\n", stmt->where_col);
         if (find_uk_row(tc, where_idx, stmt->where_val, &row_index)) {
             print_selected_row(tc->records[row_index], select_idx, select_count, stmt->select_all);
+            return;
+        }
+        if (tc->cache_truncated) {
+            execute_select_file_scan(tc, tc->uncached_start_offset, where_idx, select_idx, select_count,
+                                     stmt->select_all, stmt->where_val);
         }
         return;
     }
@@ -875,6 +1092,173 @@ void execute_select(Statement *stmt) {
         }
         print_selected_row(tc->records[i], select_idx, select_count, stmt->select_all);
     }
+    if (tc->cache_truncated) {
+        execute_select_file_scan(tc, tc->uncached_start_offset, where_idx, select_idx, select_count,
+                                 stmt->select_all, stmt->where_val);
+    }
+}
+
+static int rewrite_truncated_update(TableCache *tc, int where_idx, const char *where_val,
+                                    int set_idx, const char *set_value) {
+    char filename[300];
+    char temp_filename[320];
+    char line[RECORD_SIZE];
+    FILE *out;
+    int count = 0;
+    int target_count = 0;
+    int uk_conflict = 0;
+
+    if (!tc || !tc->file) return 0;
+    if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_SET) != 0) return 0;
+    if (!fgets(line, sizeof(line), tc->file)) return 0;
+
+    while (fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        int matched;
+
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+        parse_csv_row(line, fields, row_buf);
+        matched = compare_value(fields[where_idx], where_val);
+        if (matched) target_count++;
+        if (!matched && tc->cols[set_idx].type == COL_UK && strlen(set_value) > 0 &&
+            compare_value(fields[set_idx], set_value)) {
+            uk_conflict = 1;
+        }
+    }
+    if (target_count == 0) {
+        printf("[notice] no rows matched UPDATE condition.\n");
+        fseek(tc->file, 0, SEEK_END);
+        return 1;
+    }
+    if (tc->cols[set_idx].type == COL_UK && target_count > 1) {
+        printf("[error] UPDATE failed: multiple rows would share one UK value.\n");
+        fseek(tc->file, 0, SEEK_END);
+        return 0;
+    }
+    if (uk_conflict) {
+        printf("[error] UPDATE failed: '%s' violates UK constraint.\n", set_value);
+        fseek(tc->file, 0, SEEK_END);
+        return 0;
+    }
+
+    snprintf(filename, sizeof(filename), "%s.csv", tc->table_name);
+    snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", filename);
+    out = fopen(temp_filename, "w");
+    if (!out) return 0;
+    if (!write_table_header(out, tc)) goto fail;
+
+    if (fseek(tc->file, 0, SEEK_SET) != 0) goto fail;
+    if (!fgets(line, sizeof(line), tc->file)) goto fail;
+    while (fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        int matched;
+
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+        parse_csv_row(line, fields, row_buf);
+        matched = compare_value(fields[where_idx], where_val);
+        if (matched) {
+            char new_row[RECORD_SIZE] = "";
+            size_t offset = 0;
+            int j;
+
+            for (j = 0; j < tc->col_count; j++) {
+                const char *val = (j == set_idx) ? set_value : (fields[j] ? fields[j] : "");
+                if (!append_csv_field(new_row, sizeof(new_row), &offset, val, j == tc->col_count - 1)) goto fail;
+            }
+            if (fprintf(out, "%s\n", new_row) < 0) goto fail;
+            count++;
+        } else {
+            if (fprintf(out, "%s\n", line) < 0) goto fail;
+        }
+    }
+    if (fflush(out) != 0 || ferror(out)) goto fail;
+    if (fclose(out) != 0) {
+        remove(temp_filename);
+        return 0;
+    }
+    fclose(tc->file);
+    tc->file = NULL;
+    if (!replace_table_file(temp_filename, filename)) {
+        remove(temp_filename);
+        tc->file = fopen(filename, "r+");
+        return 0;
+    }
+    if (!reload_table_cache(tc)) return 0;
+    printf("[ok] UPDATE completed with CSV scan fallback. rows=%d\n", count);
+    return 1;
+
+fail:
+    fclose(out);
+    remove(temp_filename);
+    fseek(tc->file, 0, SEEK_END);
+    return 0;
+}
+
+static int rewrite_truncated_delete(TableCache *tc, int where_idx, const char *where_val) {
+    char filename[300];
+    char temp_filename[320];
+    char line[RECORD_SIZE];
+    FILE *out;
+    int count = 0;
+
+    if (!tc || !tc->file) return 0;
+    snprintf(filename, sizeof(filename), "%s.csv", tc->table_name);
+    snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", filename);
+    out = fopen(temp_filename, "w");
+    if (!out) return 0;
+    if (!write_table_header(out, tc)) goto fail;
+
+    if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_SET) != 0) goto fail;
+    if (!fgets(line, sizeof(line), tc->file)) goto fail;
+    while (fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        int matched;
+
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+        parse_csv_row(line, fields, row_buf);
+        matched = compare_value(fields[where_idx], where_val);
+        if (matched) {
+            count++;
+            continue;
+        }
+        if (fprintf(out, "%s\n", line) < 0) goto fail;
+    }
+    if (fflush(out) != 0 || ferror(out)) goto fail;
+    if (fclose(out) != 0) {
+        remove(temp_filename);
+        return 0;
+    }
+    if (count == 0) {
+        remove(temp_filename);
+        printf("[notice] no rows matched DELETE condition.\n");
+        fseek(tc->file, 0, SEEK_END);
+        return 1;
+    }
+    fclose(tc->file);
+    tc->file = NULL;
+    if (!replace_table_file(temp_filename, filename)) {
+        remove(temp_filename);
+        tc->file = fopen(filename, "r+");
+        return 0;
+    }
+    if (!reload_table_cache(tc)) return 0;
+    printf("[ok] DELETE completed with CSV scan fallback. rows=%d\n", count);
+    return 1;
+
+fail:
+    fclose(out);
+    remove(temp_filename);
+    fseek(tc->file, 0, SEEK_END);
+    return 0;
 }
 
 void execute_update(Statement *stmt) {
@@ -904,6 +1288,12 @@ void execute_update(Statement *stmt) {
     trim_and_unquote(set_value);
     if (tc->cols[set_idx].type == COL_NN && strlen(set_value) == 0) {
         printf("[error] UPDATE failed: column '%s' violates NN constraint.\n", tc->cols[set_idx].name);
+        return;
+    }
+    if (tc->cache_truncated) {
+        if (!rewrite_truncated_update(tc, where_idx, stmt->where_val, set_idx, set_value)) {
+            printf("[error] UPDATE failed while using CSV scan fallback.\n");
+        }
         return;
     }
 
@@ -1032,6 +1422,12 @@ void execute_delete(Statement *stmt) {
     where_idx = get_col_idx(tc, stmt->where_col);
     if (where_idx == -1) {
         printf("[error] DELETE failed: WHERE column does not exist.\n");
+        return;
+    }
+    if (tc->cache_truncated) {
+        if (!rewrite_truncated_delete(tc, where_idx, stmt->where_val)) {
+            printf("[error] DELETE failed while using CSV scan fallback.\n");
+        }
         return;
     }
 

@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 
-#define MAX_RECORDS 10000000
+#define MAX_RECORDS 2000000
 #define INITIAL_RECORD_CAPACITY 1024
 #define RECORD_SIZE 1024
 #define MAX_COLS 15
@@ -64,7 +64,9 @@ typedef struct {
     BPlusTree *id_index;           /* ID/PK 기반 B+ Tree 인덱스 */
     char **records;                /* 모든 레코드 문자열 */
     int record_capacity;           /* 동적 레코드 배열 용량 */
-    int record_count;             /* 레코드 개수 */
+    int record_count;             /* 메모리에 캐시된 레코드 개수 */
+    int cache_truncated;           /* MAX_RECORDS를 넘어 파일 스캔 fallback이 필요한지 여부 */
+    long uncached_start_offset;     /* 캐시되지 않은 첫 CSV row의 파일 offset */
     long next_auto_id;             /* INSERT 시 자동 부여할 다음 ID */
     unsigned long long last_used_seq; /* LRU 계산용 사용 순번 */
 } TableCache;

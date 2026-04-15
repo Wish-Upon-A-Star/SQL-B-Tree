@@ -115,4 +115,14 @@ linear/id-index average speed ratio: ...
 linear/uk-index average speed ratio: ...
 ```
 
+## Memory Cache Limit
+
+This implementation keeps the first 2,000,000 rows in `TableCache.records` and builds B+ Tree indexes only for that cached region. If a CSV has more rows, the first uncached row offset is remembered.
+
+- PK/UK SELECT first checks the B+ Tree index. If the key is not cached, it scans only the uncached CSV tail.
+- Non-indexed SELECT scans cached rows in memory first, then scans only the uncached CSV tail.
+- INSERT beyond the memory limit appends to CSV only and keeps the uncached tail scan path active.
+- UPDATE/DELETE on over-limit tables rewrites the CSV through a full-file fallback, then reloads the cache and recomputes the uncached offset.
+- `--benchmark` requests above 2,000,000 rows are capped to 2,000,000 rows to avoid memory blowups.
+
 생성된 `bptree_benchmark_users.csv` 파일은 저장소에 포함되어 있습니다. 그래서 매번 데이터를 다시 만들지 않고도 큰 테이블 로드 경로를 테스트할 수 있습니다. 기존 CSV 테이블을 열 때는 모든 키를 트리에 하나씩 삽입하지 않고, 정렬된 key-row 목록으로 PK/UK 인덱스를 bulk-build합니다.
