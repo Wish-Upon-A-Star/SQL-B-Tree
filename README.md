@@ -76,6 +76,22 @@ SELECT * FROM case_basic_users WHERE name = 'AutoUser';
 [scan] linear scan on column 'name'
 ```
 
+## B+ Tree Range SELECT
+
+`id(PK)` 범위 조건은 B+ Tree leaf linked list를 사용합니다.
+
+```sql
+SELECT * FROM case_basic_users WHERE id BETWEEN 2 AND 4;
+```
+
+실행 결과에 다음 표시가 나오면 B+ Tree range scan 경로를 사용한 것입니다.
+
+```text
+[index] B+ tree id range lookup
+```
+
+범위 검색은 시작 key가 들어갈 leaf를 찾은 뒤, leaf의 `next` 포인터를 따라가며 끝 key까지 출력합니다.
+
 ## 성능 테스트
 
 최소 1,000,000건을 생성하고 B+ Tree 검색과 선형 검색 속도를 비교합니다.

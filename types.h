@@ -20,6 +20,12 @@ typedef enum {
     STMT_UNRECOGNIZED
 } StatementType;
 
+typedef enum {
+    WHERE_NONE,
+    WHERE_EQ,
+    WHERE_BETWEEN
+} WhereType;
+
 /* 컬럼 제약 타입입니다. (일반 / PK / UK / NN) */
 typedef enum {
     COL_NORMAL,
@@ -38,8 +44,10 @@ typedef struct {
     char select_cols[MAX_COLS][50]; /* SELECT col1,col2 형태의 컬럼명 목록 */
     char set_col[50];            /* UPDATE ... SET col = value */
     char set_val[256];           /* UPDATE ... SET value */
+    WhereType where_type;        /* WHERE condition type */
     char where_col[50];          /* WHERE col = value */
     char where_val[256];         /* WHERE value */
+    char where_end_val[256];     /* WHERE BETWEEN end value */
 } Statement;
 
 /* 컬럼 메타데이터입니다. */
@@ -92,6 +100,8 @@ typedef enum {
     TOKEN_LPAREN,
     TOKEN_RPAREN,
     TOKEN_EQ,
+    TOKEN_BETWEEN,
+    TOKEN_AND,
     TOKEN_SEMICOLON
 } SqlTokenType;
 

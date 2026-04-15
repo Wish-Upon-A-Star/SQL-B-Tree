@@ -14,10 +14,14 @@ typedef struct {
     int row_index;
 } BPlusStringPair;
 
+typedef int (*BPlusRangeVisitor)(long key, int row_index, void *ctx);
+
 BPlusTree *bptree_create(void);
 void bptree_destroy(BPlusTree *tree);
 int bptree_insert(BPlusTree *tree, long key, int row_index);
 int bptree_search(BPlusTree *tree, long key, int *row_index);
+int bptree_range_search(BPlusTree *tree, long start_key, long end_key,
+                        BPlusRangeVisitor visitor, void *ctx);
 void bptree_clear(BPlusTree *tree);
 int bptree_build_from_sorted(BPlusTree *tree, const BPlusPair *pairs, int count);
 

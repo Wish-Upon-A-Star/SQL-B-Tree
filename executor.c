@@ -1250,6 +1250,24 @@ static void print_selected_row(const char *row, int select_idx[MAX_COLS], int se
     printf("\n");
 }
 
+typedef struct {
+    TableCache *tc;
+    int select_idx[MAX_COLS];
+    int select_count;
+    int select_all;
+} RangePrintContext;
+
+static int print_range_row_visitor(long key, int row_index, void *ctx) {
+    RangePrintContext *range_ctx = (RangePrintContext *)ctx;
+    (void)key;
+
+    if (!range_ctx || !range_ctx->tc) return 0;
+    if (row_index < 0 || row_index >= range_ctx->tc->record_count) return 1;
+    print_selected_row(range_ctx->tc->records[row_index], range_ctx->select_idx,
+                       range_ctx->select_count, range_ctx->select_all);
+    return 1;
+}
+
 static void execute_select_file_scan(TableCache *tc, long start_offset, int where_idx,
                                      int select_idx[MAX_COLS], int select_count,
                                      int select_all, const char *where_val) {
@@ -1301,6 +1319,58 @@ static void execute_select_file_scan(TableCache *tc, long start_offset, int wher
     fseek(tc->file, 0, SEEK_END);
 }
 
+static void execute_select_file_range_scan(TableCache *tc, long start_offset, int where_idx,
+                                           int select_idx[MAX_COLS], int select_count,
+                                           int select_all, long start_key, long end_key) {
+    char line[RECORD_SIZE];
+
+    if (!tc || !tc->file || start_key > end_key) return;
+    if (fflush(tc->file) != 0) {
+        printf("[error] SELECT failed: could not scan table file.\n");
+        return;
+    }
+    if (start_offset > 0) {
+        if (fseek(tc->file, start_offset, SEEK_SET) != 0) {
+            printf("[error] SELECT failed: could not seek uncached CSV tail.\n");
+            return;
+        }
+        printf("[scan] uncached CSV tail range scan from offset %ld\n", start_offset);
+    } else {
+        if (fseek(tc->file, 0, SEEK_SET) != 0) {
+            printf("[error] SELECT failed: could not scan table file.\n");
+            return;
+        }
+        if (!fgets(line, sizeof(line), tc->file)) {
+            fseek(tc->file, 0, SEEK_END);
+            return;
+        }
+        printf("[scan] full CSV range scan\n");
+    }
+
+    while (fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        size_t line_len = strlen(line);
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        long row_key;
+
+        if (!nl && line_len == sizeof(line) - 1 && !feof(tc->file)) {
+            printf("[error] row too long while scanning '%s' (max %d bytes).\n",
+                   tc->table_name, RECORD_SIZE - 1);
+            fseek(tc->file, 0, SEEK_END);
+            return;
+        }
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+        parse_csv_row(line, fields, row_buf);
+        if (!parse_long_value(fields[where_idx], &row_key)) continue;
+        if (row_key >= start_key && row_key <= end_key) {
+            print_selected_row(line, select_idx, select_count, select_all);
+        }
+    }
+    fseek(tc->file, 0, SEEK_END);
+}
+
 void execute_select(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
     int where_idx;
@@ -1324,6 +1394,40 @@ void execute_select(Statement *stmt) {
     }
 
     printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
+    if (stmt->where_type == WHERE_BETWEEN) {
+        long start_key;
+        long end_key;
+        RangePrintContext range_ctx;
+
+        if (where_idx == -1) {
+            printf("[error] SELECT failed: WHERE column does not exist.\n");
+            return;
+        }
+        if (where_idx != tc->pk_idx) {
+            printf("[error] SELECT failed: BETWEEN currently uses the PK B+ tree only.\n");
+            return;
+        }
+        if (!parse_long_value(stmt->where_val, &start_key) ||
+            !parse_long_value(stmt->where_end_val, &end_key)) {
+            printf("[error] SELECT failed: BETWEEN bounds must be integers.\n");
+            return;
+        }
+        printf("[index] B+ tree id range lookup\n");
+        range_ctx.tc = tc;
+        memcpy(range_ctx.select_idx, select_idx, sizeof(range_ctx.select_idx));
+        range_ctx.select_count = select_count;
+        range_ctx.select_all = stmt->select_all;
+        if (!bptree_range_search(tc->id_index, start_key, end_key, print_range_row_visitor, &range_ctx)) {
+            printf("[error] SELECT failed: B+ tree range scan failed.\n");
+            return;
+        }
+        if (tc->cache_truncated) {
+            execute_select_file_range_scan(tc, tc->uncached_start_offset, where_idx, select_idx,
+                                           select_count, stmt->select_all, start_key, end_key);
+        }
+        return;
+    }
+
     if (where_idx == tc->pk_idx && where_idx != -1) {
         long key;
         int row_index;
@@ -1551,6 +1655,10 @@ void execute_update(Statement *stmt) {
     int i;
 
     if (!tc) return;
+    if (stmt->where_type == WHERE_BETWEEN) {
+        printf("[error] UPDATE failed: BETWEEN is supported for SELECT only.\n");
+        return;
+    }
     where_idx = get_col_idx(tc, stmt->where_col);
     set_idx = get_col_idx(tc, stmt->set_col);
     if (where_idx == -1 || set_idx == -1) {
@@ -1727,6 +1835,10 @@ void execute_delete(Statement *stmt) {
     int target_row = -1;
 
     if (!tc) return;
+    if (stmt->where_type == WHERE_BETWEEN) {
+        printf("[error] DELETE failed: BETWEEN is supported for SELECT only.\n");
+        return;
+    }
     where_idx = get_col_idx(tc, stmt->where_col);
     if (where_idx == -1) {
         printf("[error] DELETE failed: WHERE column does not exist.\n");

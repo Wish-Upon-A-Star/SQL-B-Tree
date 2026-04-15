@@ -234,6 +234,32 @@ int bptree_search(BPlusTree *tree, long key, int *row_index) {
     return 0;
 }
 
+int bptree_range_search(BPlusTree *tree, long start_key, long end_key,
+                        BPlusRangeVisitor visitor, void *ctx) {
+    BPlusNode *node;
+    int i;
+
+    if (!tree || !tree->root || !visitor) return 0;
+    if (start_key > end_key) return 1;
+
+    node = tree->root;
+    while (!node->is_leaf) {
+        i = 0;
+        while (i < node->key_count && start_key >= node->keys[i]) i++;
+        node = node->children[i];
+    }
+
+    while (node) {
+        for (i = 0; i < node->key_count; i++) {
+            if (node->keys[i] < start_key) continue;
+            if (node->keys[i] > end_key) return 1;
+            if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
+        }
+        node = node->next;
+    }
+    return 1;
+}
+
 static int insert_recursive(BPlusNode *node, long key, int row_index, long *promoted_key, BPlusNode **new_child, NodePool *pool) {
     int i;
 

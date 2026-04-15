@@ -23,26 +23,40 @@ static int finish_statement(Parser *p, int parsed) {
     return p->current_token.type == TOKEN_EOF;
 }
 
-/* WHERE col = value 형식을 파싱해 stmt에 where 컬럼/값을 채웁니다. */
+static int parse_literal(Parser *p, char *dest, size_t dest_size) {
+    if (p->current_token.type == TOKEN_STRING ||
+        p->current_token.type == TOKEN_NUMBER ||
+        p->current_token.type == TOKEN_IDENTIFIER) {
+        strncpy(dest, p->current_token.text, dest_size - 1);
+        dest[dest_size - 1] = '\0';
+        advance_parser(p);
+        return 1;
+    }
+    return 0;
+}
+
+/* WHERE col = value 또는 WHERE col BETWEEN a AND b 형식을 파싱합니다. */
 static int parse_where_clause(Parser *p, Statement *stmt) {
     if (p->current_token.type != TOKEN_WHERE) return 1;
     advance_parser(p);
 
     if (p->current_token.type != TOKEN_IDENTIFIER) return 0;
     strncpy(stmt->where_col, p->current_token.text, sizeof(stmt->where_col) - 1);
+    stmt->where_col[sizeof(stmt->where_col) - 1] = '\0';
     advance_parser(p);
 
-    if (!expect_token(p, TOKEN_EQ)) return 0;
-
-    if (p->current_token.type == TOKEN_STRING ||
-        p->current_token.type == TOKEN_NUMBER ||
-        p->current_token.type == TOKEN_IDENTIFIER) {
-        strncpy(stmt->where_val, p->current_token.text, sizeof(stmt->where_val) - 1);
+    if (p->current_token.type == TOKEN_BETWEEN) {
         advance_parser(p);
-    } else {
-        return 0;
+        stmt->where_type = WHERE_BETWEEN;
+        if (!parse_literal(p, stmt->where_val, sizeof(stmt->where_val))) return 0;
+        if (!expect_token(p, TOKEN_AND)) return 0;
+        if (!parse_literal(p, stmt->where_end_val, sizeof(stmt->where_end_val))) return 0;
+        return 1;
     }
 
+    if (!expect_token(p, TOKEN_EQ)) return 0;
+    stmt->where_type = WHERE_EQ;
+    if (!parse_literal(p, stmt->where_val, sizeof(stmt->where_val))) return 0;
     return 1;
 }
 
