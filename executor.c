@@ -1829,87 +1829,74 @@ static void remove_index_snapshot(TableCache *tc) {
     tc->snapshot_dirty = 1;
 }
 
-static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
-    BPlusPair *id_pairs = NULL;
-    BPlusStringPair *uk_pairs[MAX_UKS] = {0};
-    int uk_counts[MAX_UKS] = {0};
-    int id_count = 0;
-    int i;
-    int row_index;
+typedef struct {
+    FILE *out;
+    TableCache *tc;
+    int count;
+    int failed;
+} SnapshotVisitContext;
 
-    if (tc->active_count > 0) {
-        id_pairs = (BPlusPair *)calloc((size_t)tc->active_count, sizeof(BPlusPair));
-        if (!id_pairs) return 0;
-        for (i = 0; i < tc->uk_count; i++) {
-            uk_pairs[i] = (BPlusStringPair *)calloc((size_t)tc->active_count, sizeof(BPlusStringPair));
-            if (!uk_pairs[i]) goto fail;
-        }
-    }
+static int count_active_id_pair(long key, int row_index, void *ctx) {
+    SnapshotVisitContext *visit = (SnapshotVisitContext *)ctx;
+    (void)key;
+    if (visit && slot_is_active(visit->tc, row_index)) visit->count++;
+    return 1;
+}
 
-    for (row_index = 0; row_index < tc->record_count; row_index++) {
-        char row_buf[RECORD_SIZE];
-        char *fields[MAX_COLS] = {0};
-        char *row = slot_row(tc, row_index);
-        long id_value;
-
-        if (!row) continue;
-        if (!get_row_index_key(tc, row, row_index, &id_value)) goto fail;
-        id_pairs[id_count].key = id_value;
-        id_pairs[id_count].row_index = row_index;
-        id_count++;
-
-        parse_csv_row(row, fields, row_buf);
-        for (i = 0; i < tc->uk_count; i++) {
-            char key[RECORD_SIZE];
-            int col_idx = tc->uk_indices[i];
-
-            normalize_value(fields[col_idx], key, sizeof(key));
-            if (strlen(key) == 0) continue;
-            uk_pairs[i][uk_counts[i]].key = dup_string(key);
-            if (!uk_pairs[i][uk_counts[i]].key) goto fail;
-            uk_pairs[i][uk_counts[i]].row_index = row_index;
-            uk_counts[i]++;
-        }
-    }
-
-    if (id_count > 1) qsort(id_pairs, (size_t)id_count, sizeof(BPlusPair), compare_bplus_pair);
-    if (fprintf(out, "ID %d\n", id_count) < 0) goto fail;
-    for (i = 0; i < id_count; i++) {
-        if (fprintf(out, "%ld\t%d\n", id_pairs[i].key, id_pairs[i].row_index) < 0) goto fail;
-    }
-
-    if (fprintf(out, "UKSECTIONS %d\n", tc->uk_count) < 0) goto fail;
-    for (i = 0; i < tc->uk_count; i++) {
-        int j;
-
-        if (uk_counts[i] > 1) {
-            qsort(uk_pairs[i], (size_t)uk_counts[i], sizeof(BPlusStringPair),
-                  compare_bplus_string_pair);
-        }
-        if (fprintf(out, "UK %d %d\n", tc->uk_indices[i], uk_counts[i]) < 0) goto fail;
-        for (j = 0; j < uk_counts[i]; j++) {
-            if (fprintf(out, "%d\t%s\n", uk_pairs[i][j].row_index, uk_pairs[i][j].key) < 0) goto fail;
-        }
-    }
-
-    free(id_pairs);
-    for (i = 0; i < tc->uk_count; i++) {
-        int j;
-        for (j = 0; j < uk_counts[i]; j++) free(uk_pairs[i][j].key);
-        free(uk_pairs[i]);
+static int write_active_id_pair(long key, int row_index, void *ctx) {
+    SnapshotVisitContext *visit = (SnapshotVisitContext *)ctx;
+    if (!visit || !slot_is_active(visit->tc, row_index)) return 1;
+    if (fprintf(visit->out, "%ld\t%d\n", key, row_index) < 0) {
+        visit->failed = 1;
+        return 0;
     }
     return 1;
+}
 
-fail:
-    free(id_pairs);
+static int count_active_string_pair(const char *key, int row_index, void *ctx) {
+    SnapshotVisitContext *visit = (SnapshotVisitContext *)ctx;
+    (void)key;
+    if (visit && slot_is_active(visit->tc, row_index)) visit->count++;
+    return 1;
+}
+
+static int write_active_string_pair(const char *key, int row_index, void *ctx) {
+    SnapshotVisitContext *visit = (SnapshotVisitContext *)ctx;
+    if (!visit || !slot_is_active(visit->tc, row_index)) return 1;
+    if (fprintf(visit->out, "%d\t%s\n", row_index, key) < 0) {
+        visit->failed = 1;
+        return 0;
+    }
+    return 1;
+}
+
+static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
+    SnapshotVisitContext visit;
+    int i;
+
+    visit.out = out;
+    visit.tc = tc;
+    visit.count = 0;
+    visit.failed = 0;
+    if (!bptree_visit_pairs(tc->id_index, count_active_id_pair, &visit)) return 0;
+    if (fprintf(out, "ID %d\n", visit.count) < 0) return 0;
+    visit.failed = 0;
+    if (!bptree_visit_pairs(tc->id_index, write_active_id_pair, &visit) || visit.failed) return 0;
+
+    if (fprintf(out, "UKSECTIONS %d\n", tc->uk_count) < 0) return 0;
     for (i = 0; i < tc->uk_count; i++) {
-        int j;
-        if (uk_pairs[i]) {
-            for (j = 0; j < uk_counts[i]; j++) free(uk_pairs[i][j].key);
-            free(uk_pairs[i]);
+        visit.count = 0;
+        visit.failed = 0;
+        if (!tc->uk_indexes[i] || !tc->uk_indexes[i]->tree) return 0;
+        if (!bptree_string_visit_pairs(tc->uk_indexes[i]->tree, count_active_string_pair, &visit)) return 0;
+        if (fprintf(out, "UK %d %d\n", tc->uk_indices[i], visit.count) < 0) return 0;
+        visit.failed = 0;
+        if (!bptree_string_visit_pairs(tc->uk_indexes[i]->tree, write_active_string_pair, &visit) ||
+            visit.failed) {
+            return 0;
         }
     }
-    return 0;
+    return 1;
 }
 
 static int save_index_snapshot(TableCache *tc) {

@@ -3,10 +3,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
+#if defined(_WIN32)
+#include <windows.h>
+#define popen _popen
+#define pclose _pclose
+#else
+#include <sys/resource.h>
+#include <sys/wait.h>
+#endif
 
 #define SPEC_VERSION "bench-v1"
 #define DEFAULT_SEED 20260415u
@@ -22,6 +28,14 @@
 #define REF_DELETE 120000.0
 #define REF_UTIL_PROXY 0.03
 #define REF_UTIL_MEMTRACK 0.08
+
+#if defined(_WIN32)
+#define SQLPROCESSOR_CMD "sqlsprocessor.exe"
+#define BENCH_GENERATOR_CMD "bench_workload_generator.exe"
+#else
+#define SQLPROCESSOR_CMD "./sqlsprocessor"
+#define BENCH_GENERATOR_CMD "./bench_workload_generator"
+#endif
 
 typedef struct {
     const char *profile;
@@ -74,9 +88,17 @@ static int profile_ops(const char *profile) {
 }
 
 static double now_seconds(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER freq;
+    LARGE_INTEGER counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
 }
 
 static void trim_newline(char *s) {
@@ -141,8 +163,12 @@ static int run_command_capture(const char *cmd, char *out, size_t out_size, doub
     if (elapsed_sec) *elapsed_sec = now_seconds() - start;
 
     if (exit_code) {
+#if defined(_WIN32)
+        *exit_code = status;
+#else
         if (WIFEXITED(status)) *exit_code = WEXITSTATUS(status);
         else *exit_code = 1;
+#endif
     }
     return 1;
 }
@@ -230,9 +256,13 @@ static int reset_workload_csv_header(void) {
 static int run_sql_file(const char *sql_file, int memtrack, double *elapsed, int *exit_code, char *output, size_t output_size) {
     char cmd[1024];
     if (memtrack) {
-        snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 ./sqlsprocessor --quiet %s 2>&1", sql_file);
+#if defined(_WIN32)
+        snprintf(cmd, sizeof(cmd), "set BENCH_MEMTRACK_REPORT=1&& " SQLPROCESSOR_CMD " --quiet %s 2>&1", sql_file);
+#else
+        snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 " SQLPROCESSOR_CMD " --quiet %s 2>&1", sql_file);
+#endif
     } else {
-        snprintf(cmd, sizeof(cmd), "./sqlsprocessor --quiet %s 2>&1", sql_file);
+        snprintf(cmd, sizeof(cmd), SQLPROCESSOR_CMD " --quiet %s 2>&1", sql_file);
     }
     return run_command_capture(cmd, output, output_size, elapsed, exit_code);
 }
@@ -257,12 +287,16 @@ static double max_live_payload_bytes(int rows) {
 }
 
 static double ru_maxrss_bytes(void) {
+#if defined(_WIN32)
+    return 0.0;
+#else
     struct rusage usage;
     if (getrusage(RUSAGE_CHILDREN, &usage) != 0) return 0.0;
 #if defined(__APPLE__)
     return (double)usage.ru_maxrss;
 #else
     return (double)usage.ru_maxrss * 1024.0;
+#endif
 #endif
 }
 
@@ -383,7 +417,8 @@ int main(int argc, char **argv) {
     double live_payload;
     char delete_mode[16] = "measured";
     char util_mode[16] = "proxy";
-    char output[1 << 20];
+    char *output = NULL;
+    size_t output_size = 1u << 20;
     char cmd[1024];
     int rc;
     double total_start = now_seconds();
@@ -399,6 +434,11 @@ int main(int argc, char **argv) {
     opt.memtrack = 0;
     opt.report_only = 0;
     parse_args(argc, argv, &opt);
+    output = (char *)malloc(output_size);
+    if (!output) {
+        fprintf(stderr, "[error] memory allocation failed\n");
+        return 1;
+    }
 
     ensure_dir("artifacts");
     ensure_dir("artifacts/bench");
@@ -406,24 +446,35 @@ int main(int argc, char **argv) {
     if (opt.report_only) {
         if (!regenerate_md_from_raw()) {
             fprintf(stderr, "[error] failed to regenerate report.md from report.raw\n");
+            free(output);
             return 1;
         }
         printf("[ok] regenerated artifacts/bench/report.md\n");
+        free(output);
         return 0;
     }
 
     if (opt.memtrack) {
-        rc = system("make -B build CFLAGS='-fdiagnostics-color=always -g -DBENCH_MEMTRACK'");
+#if defined(_WIN32)
+        rc = system("gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe");
+#else
+        rc = system("make -B build CFLAGS='-O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK'");
+#endif
     } else {
-        rc = system("make -B build CFLAGS='-fdiagnostics-color=always -g'");
+#if defined(_WIN32)
+        rc = system("gcc -O2 -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe");
+#else
+        rc = system("make -B build CFLAGS='-O2 -fdiagnostics-color=always -g'");
+#endif
     }
     if (rc != 0) {
         fprintf(stderr, "[error] build failed\n");
+        free(output);
         return 1;
     }
 
     snprintf(cmd, sizeof(cmd),
-             "./bench_workload_generator --profile %s --seed %u --preload %d --update-rows %d --delete-rows %d --ops %d --output-dir generated_sql",
+             BENCH_GENERATOR_CMD " --profile %s --seed %u --preload %d --update-rows %d --delete-rows %d --ops %d --output-dir generated_sql",
              opt.profile, opt.seed, opt.rows, opt.update_rows, opt.delete_rows, opt.mixed_ops);
     if (system(cmd) != 0) {
         fprintf(stderr, "[error] workload generation failed\n");
@@ -440,7 +491,7 @@ int main(int argc, char **argv) {
         double elapsed = 0.0;
         int ok = 0;
         stage_begin("correctness success");
-        ok = run_sql_file(cmd, opt.memtrack, &elapsed, &rc, output, sizeof(output)) &&
+        ok = run_sql_file(cmd, opt.memtrack, &elapsed, &rc, output, output_size) &&
              rc == 0 &&
              !contains_token(output, "[error]") &&
              !contains_token(output, "[오류]");
@@ -456,7 +507,7 @@ int main(int argc, char **argv) {
         double elapsed = 0.0;
         int ok = 0;
         stage_begin("correctness failure");
-        ok = run_sql_file(cmd, opt.memtrack, &elapsed, &rc, output, sizeof(output)) &&
+        ok = run_sql_file(cmd, opt.memtrack, &elapsed, &rc, output, output_size) &&
              rc == 0 &&
              count_token(output, "[error]") >= EXPECTED_FAILURE_ERRORS;
         stage_end("correctness failure", ok, elapsed);
@@ -488,12 +539,19 @@ int main(int argc, char **argv) {
             double peak;
             char stage_label[128];
 
-            if (opt.memtrack) snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 ./sqlsprocessor --benchmark %d 2>&1", opt.rows);
-            else snprintf(cmd, sizeof(cmd), "./sqlsprocessor --benchmark %d 2>&1", opt.rows);
+            if (opt.memtrack) {
+#if defined(_WIN32)
+                snprintf(cmd, sizeof(cmd), "set BENCH_MEMTRACK_REPORT=1&& " SQLPROCESSOR_CMD " --benchmark %d 2>&1", opt.rows);
+#else
+                snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 " SQLPROCESSOR_CMD " --benchmark %d 2>&1", opt.rows);
+#endif
+            } else {
+                snprintf(cmd, sizeof(cmd), SQLPROCESSOR_CMD " --benchmark %d 2>&1", opt.rows);
+            }
 
             snprintf(stage_label, sizeof(stage_label), "iteration %d/%d benchmark", i + 1, opt.repeat);
             stage_begin(stage_label);
-            if (!run_command_capture(cmd, output, sizeof(output), &elapsed, &cmd_exit) || cmd_exit != 0 || !parse_benchmark_output(output, &bench)) {
+            if (!run_command_capture(cmd, output, output_size, &elapsed, &cmd_exit) || cmd_exit != 0 || !parse_benchmark_output(output, &bench)) {
                 stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "benchmark command parse failed");
@@ -512,7 +570,7 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_insert_%s.sql", opt.profile);
             snprintf(stage_label, sizeof(stage_label), "iteration %d/%d insert", i + 1, opt.repeat);
             stage_begin(stage_label);
-            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, sizeof(output)) || cmd_exit != 0) {
+            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, output_size) || cmd_exit != 0) {
                 stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "insert workload failed");
@@ -526,7 +584,7 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_update_%s.sql", opt.profile);
             snprintf(stage_label, sizeof(stage_label), "iteration %d/%d update", i + 1, opt.repeat);
             stage_begin(stage_label);
-            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, sizeof(output)) || cmd_exit != 0) {
+            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, output_size) || cmd_exit != 0) {
                 stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "update workload failed");
@@ -540,7 +598,7 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_delete_%s.sql", opt.profile);
             snprintf(stage_label, sizeof(stage_label), "iteration %d/%d delete", i + 1, opt.repeat);
             stage_begin(stage_label);
-            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, sizeof(output))) {
+            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, output_size)) {
                 stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "delete workload failed to execute");
@@ -632,7 +690,11 @@ int main(int argc, char **argv) {
         char ts[64] = "";
         time_t now = time(NULL);
         struct tm *tm_now = localtime(&now);
+#if defined(_WIN32)
+        FILE *git_pipe = popen("git rev-parse --short HEAD 2>nul", "r");
+#else
         FILE *git_pipe = popen("git rev-parse --short HEAD 2>/dev/null", "r");
+#endif
 
         if (tm_now) strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", tm_now);
         if (git_pipe && fgets(git_sha, sizeof(git_sha), git_pipe)) trim_newline(git_sha);
@@ -797,6 +859,7 @@ int main(int argc, char **argv) {
     free(insert_vals);
     free(update_vals);
     free(delete_vals);
+    free(output);
 
     return 0;
 }

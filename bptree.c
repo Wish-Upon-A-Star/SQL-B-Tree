@@ -326,6 +326,22 @@ int bptree_range_search(BPlusTree *tree, long start_key, long end_key,
     return 1;
 }
 
+int bptree_visit_pairs(BPlusTree *tree, BPlusPairVisitor visitor, void *ctx) {
+    BPlusNode *node;
+    int i;
+
+    if (!tree || !tree->root || !visitor) return 0;
+    node = tree->root;
+    while (node && !node->is_leaf) node = node->children[0];
+    while (node) {
+        for (i = 0; i < node->key_count; i++) {
+            if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
+        }
+        node = node->next;
+    }
+    return 1;
+}
+
 static int insert_recursive(BPlusTree *tree, BPlusNode *node, long key, int row_index,
                             long *promoted_key, BPlusNode **new_child) {
     int i;
@@ -760,6 +776,22 @@ int bptree_string_range_search(BPlusStringTree *tree, const char *start_key, con
         for (i = 0; i < node->key_count; i++) {
             if (strcmp(node->keys[i], start_key) < 0) continue;
             if (strcmp(node->keys[i], end_key) > 0) return 1;
+            if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
+        }
+        node = node->next;
+    }
+    return 1;
+}
+
+int bptree_string_visit_pairs(BPlusStringTree *tree, BPlusStringPairVisitor visitor, void *ctx) {
+    BPlusStringNode *node;
+    int i;
+
+    if (!tree || !tree->root || !visitor) return 0;
+    node = tree->root;
+    while (node && !node->is_leaf) node = node->children[0];
+    while (node) {
+        for (i = 0; i < node->key_count; i++) {
             if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
         }
         node = node->next;

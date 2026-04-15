@@ -10,6 +10,12 @@
 #define SOURCE_CSV "bptree_benchmark_users.csv"
 #define WORKLOAD_CSV "jungle_workload_users.csv"
 
+#if defined(_WIN32)
+#define SQLPROCESSOR_CMD "sqlsprocessor.exe"
+#else
+#define SQLPROCESSOR_CMD "./sqlsprocessor"
+#endif
+
 #define LINE_MAX_LEN 2048
 #define SQL_MAX_LEN 8192
 
@@ -90,7 +96,7 @@ static int ensure_source_csv(int rows) {
         if (header_ok) return 1;
     }
 
-    snprintf(cmd, sizeof(cmd), "./sqlsprocessor --generate-jungle %d %s", rows, SOURCE_CSV);
+    snprintf(cmd, sizeof(cmd), SQLPROCESSOR_CMD " --generate-jungle %d %s", rows, SOURCE_CSV);
     if (system(cmd) != 0) {
         fprintf(stderr, "[error] failed to generate source CSV: %s\n", cmd);
         return 0;
