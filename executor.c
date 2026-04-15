@@ -2823,6 +2823,7 @@ static void print_selected_row(const char *row, int select_idx[MAX_COLS], int se
     char *fields[MAX_COLS] = {0};
     int j;
 
+    if (g_executor_quiet) return;
     if (select_all) {
         printf("%s\n", row);
         return;
@@ -2839,6 +2840,7 @@ static void print_selected_fields(const char *row, char *fields[MAX_COLS],
                                   int select_idx[MAX_COLS], int select_count, int select_all) {
     int j;
 
+    if (g_executor_quiet) return;
     if (select_all) {
         printf("%s\n", row);
         return;
@@ -3022,7 +3024,7 @@ static void execute_select_file_scan_filtered(TableCache *tc, long start_offset,
             printf("[error] SELECT failed: could not scan uncached table rows.\n");
             return;
         }
-        printf("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
+        INFO_PRINTF("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
     } else {
         if (fseek(tc->file, 0, SEEK_SET) != 0) {
             printf("[error] SELECT failed: could not scan table file.\n");
@@ -3032,7 +3034,7 @@ static void execute_select_file_scan_filtered(TableCache *tc, long start_offset,
             fseek(tc->file, 0, SEEK_END);
             return;
         }
-        printf("[scan] full CSV scan\n");
+        INFO_PRINTF("[scan] full CSV scan\n");
     }
 
     while (fgets(line, sizeof(line), tc->file)) {
@@ -3073,7 +3075,7 @@ static void execute_select_file_scan(TableCache *tc, long start_offset, int wher
             printf("[error] SELECT failed: could not scan uncached table rows.\n");
             return;
         }
-        printf("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
+        INFO_PRINTF("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
     } else {
         if (fseek(tc->file, 0, SEEK_SET) != 0) {
             printf("[error] SELECT failed: could not scan table file.\n");
@@ -3083,7 +3085,7 @@ static void execute_select_file_scan(TableCache *tc, long start_offset, int wher
             fseek(tc->file, 0, SEEK_END);
             return;
         }
-        printf("[scan] full CSV scan\n");
+        INFO_PRINTF("[scan] full CSV scan\n");
     }
 
     while (fgets(line, sizeof(line), tc->file)) {
@@ -3160,7 +3162,7 @@ static void execute_select_file_range_scan(TableCache *tc, long start_offset, in
             printf("[error] SELECT failed: could not seek uncached CSV tail.\n");
             return;
         }
-        printf("[scan] uncached CSV tail range scan from offset %ld\n", start_offset);
+        INFO_PRINTF("[scan] uncached CSV tail range scan from offset %ld\n", start_offset);
     } else {
         if (fseek(tc->file, 0, SEEK_SET) != 0) {
             printf("[error] SELECT failed: could not scan table file.\n");
@@ -3170,7 +3172,7 @@ static void execute_select_file_range_scan(TableCache *tc, long start_offset, in
             fseek(tc->file, 0, SEEK_END);
             return;
         }
-        printf("[scan] full CSV range scan\n");
+        INFO_PRINTF("[scan] full CSV range scan\n");
     }
 
     while (fgets(line, sizeof(line), tc->file)) {
@@ -3213,7 +3215,7 @@ static void execute_select_file_string_range_scan(TableCache *tc, long start_off
             printf("[error] SELECT failed: could not seek uncached CSV tail.\n");
             return;
         }
-        printf("[scan] uncached CSV tail string range scan from offset %ld\n", start_offset);
+        INFO_PRINTF("[scan] uncached CSV tail string range scan from offset %ld\n", start_offset);
     } else {
         if (fseek(tc->file, 0, SEEK_SET) != 0) {
             printf("[error] SELECT failed: could not scan table file.\n");
@@ -3223,7 +3225,7 @@ static void execute_select_file_string_range_scan(TableCache *tc, long start_off
             fseek(tc->file, 0, SEEK_END);
             return;
         }
-        printf("[scan] full CSV string range scan\n");
+        INFO_PRINTF("[scan] full CSV string range scan\n");
     }
 
     while (fgets(line, sizeof(line), tc->file)) {
@@ -3273,7 +3275,7 @@ void execute_select(Statement *stmt) {
         select_count = stmt->select_col_count;
     }
 
-    printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
+    INFO_PRINTF("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
     choose_index_condition(tc, stmt, 1, &index_cond, &index_col);
     if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_BETWEEN) {
         WhereCondition *cond = &stmt->where_conditions[index_cond];
@@ -3344,6 +3346,7 @@ void execute_select(Statement *stmt) {
         }
         INFO_PRINTF("[index] B+ tree id lookup\n");
         if (bptree_search(tc->id_index, key, &row_index)) {
+            if (g_executor_quiet && stmt->where_count == 1) return;
             char *row = slot_row(tc, row_index);
             if (row) {
                 char row_buf[RECORD_SIZE];
@@ -3371,6 +3374,7 @@ void execute_select(Statement *stmt) {
         int row_index;
         INFO_PRINTF("[index] UK B+ tree lookup on column '%s'\n", cond->col);
         if (find_uk_row(tc, index_col, cond->val, &row_index)) {
+            if (g_executor_quiet && stmt->where_count == 1) return;
             char *row = slot_row(tc, row_index);
             if (row) {
                 char row_buf[RECORD_SIZE];
@@ -3389,7 +3393,7 @@ void execute_select(Statement *stmt) {
         return;
     }
 
-    if (stmt->where_count > 0) printf("[scan] linear scan with %d WHERE condition(s)\n", stmt->where_count);
+    if (stmt->where_count > 0) INFO_PRINTF("[scan] linear scan with %d WHERE condition(s)\n", stmt->where_count);
     for (i = 0; i < tc->record_count; i++) {
         int owned = 0;
         char *row = slot_row_scan(tc, i, &owned);
@@ -3912,7 +3916,49 @@ void execute_delete(Statement *stmt) {
         char *old_record;
 
         if (uses_pk_lookup) {
+            long key;
             INFO_PRINTF("[index] B+ tree id lookup for DELETE\n");
+            if (stmt->where_count == 1 && parse_long_value(stmt->where_conditions[index_cond].val, &key)) {
+                if (!bptree_search(tc->id_index, key, &target_row) ||
+                    !slot_is_active(tc, target_row)) {
+                    INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
+                    return;
+                }
+                tc->record_active[target_row] = 0;
+                tc->active_count--;
+                if (can_use_delta_log(tc)) {
+                    if (!append_delta_delete_key(tc, key)) {
+                        tc->record_active[target_row] = 1;
+                        tc->active_count++;
+                        printf("[error] DELETE failed: delta log append failed; memory restored.\n");
+                        return;
+                    }
+                    INFO_PRINTF("[delta] DELETE persisted through append-only delta log.\n");
+                    if (!maybe_compact_delta_log(tc)) {
+                        printf("[warning] DELETE completed, but delta compaction failed.\n");
+                    }
+                } else if (!rewrite_file(tc)) {
+                    tc->record_active[target_row] = 1;
+                    tc->active_count++;
+                    printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
+                    return;
+                }
+                free(tc->records[target_row]);
+                tc->records[target_row] = NULL;
+                if (tc->row_cached[target_row] && tc->cached_record_count > 0) tc->cached_record_count--;
+                tc->row_cached[target_row] = 0;
+                tc->row_cache_seq[target_row] = 0;
+                tc->row_store[target_row] = ROW_STORE_NONE;
+                tc->row_offsets[target_row] = 0;
+                if (tc->row_refs) {
+                    tc->row_refs[target_row].store = ROW_STORE_NONE;
+                    tc->row_refs[target_row].offset = 0;
+                }
+                push_free_slot(tc, target_row);
+                tc->snapshot_dirty = 1;
+                INFO_PRINTF("[ok] DELETE completed. rows=1\n");
+                return;
+            }
             if (!find_pk_row(tc, stmt->where_conditions[index_cond].val, &target_row)) {
                 INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
                 return;
