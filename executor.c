@@ -398,6 +398,7 @@ static int rebuild_id_index(TableCache *tc) {
     BPlusPair *pairs = NULL;
     long next_auto_id = 1;
     int pair_count = 0;
+    int sorted = 1;
     int i;
 
     if (!tc) return 0;
@@ -424,6 +425,7 @@ static int rebuild_id_index(TableCache *tc) {
 
         parse_csv_row(tc->records[i], fields, row_buf);
         if (fields[tc->pk_idx] && parse_long_value(fields[tc->pk_idx], &id_value)) {
+            if (pair_count > 0 && pairs[pair_count - 1].key >= id_value) sorted = 0;
             pairs[pair_count].key = id_value;
             pairs[pair_count].row_index = i;
             pair_count++;
@@ -434,7 +436,7 @@ static int rebuild_id_index(TableCache *tc) {
             return 0;
         }
     }
-    if (pair_count > 1) qsort(pairs, (size_t)pair_count, sizeof(BPlusPair), compare_bplus_pair);
+    if (!sorted && pair_count > 1) qsort(pairs, (size_t)pair_count, sizeof(BPlusPair), compare_bplus_pair);
     if (!bptree_build_from_sorted(new_index, pairs, pair_count)) {
         free(pairs);
         bptree_destroy(new_index);
@@ -483,10 +485,12 @@ static int rebuild_uk_indexes(TableCache *tc) {
     UniqueIndex *new_indexes[MAX_UKS] = {0};
     BPlusStringPair *pairs[MAX_UKS] = {0};
     int pair_counts[MAX_UKS] = {0};
+    int sorted[MAX_UKS] = {0};
     int i;
     int row_index;
 
     if (!tc) return 0;
+    for (i = 0; i < MAX_UKS; i++) sorted[i] = 1;
     for (i = 0; i < tc->uk_count; i++) {
         new_indexes[i] = unique_index_create(tc->uk_indices[i]);
         if (!new_indexes[i]) goto fail;
@@ -507,6 +511,9 @@ static int rebuild_uk_indexes(TableCache *tc) {
 
             normalize_value(fields[col_idx], key, sizeof(key));
             if (strlen(key) == 0) continue;
+            if (pair_counts[i] > 0 && strcmp(pairs[i][pair_counts[i] - 1].key, key) >= 0) {
+                sorted[i] = 0;
+            }
             pairs[i][pair_counts[i]].key = dup_string(key);
             if (!pairs[i][pair_counts[i]].key) goto fail;
             pairs[i][pair_counts[i]].row_index = row_index;
@@ -515,7 +522,7 @@ static int rebuild_uk_indexes(TableCache *tc) {
     }
 
     for (i = 0; i < tc->uk_count; i++) {
-        if (pair_counts[i] > 1) {
+        if (!sorted[i] && pair_counts[i] > 1) {
             qsort(pairs[i], (size_t)pair_counts[i], sizeof(BPlusStringPair), compare_bplus_string_pair);
         }
         if (!bptree_string_build_from_sorted(new_indexes[i]->tree, pairs[i], pair_counts[i])) goto fail;
