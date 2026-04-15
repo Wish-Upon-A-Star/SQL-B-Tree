@@ -2,9 +2,9 @@ CC ?= gcc
 CFLAGS ?= -fdiagnostics-color=always -g
 TARGET ?= sqlsprocessor
 SRC = main.c
-SQL ?= demo_select.sql
+SQL ?= demo_bptree.sql
 
-.PHONY: all build run demo-reset demo-select demo-insert demo-insert-error demo-edge-case demo-update demo-delete clean
+.PHONY: all build run demo-bptree clean
 
 all: build
 
@@ -16,26 +16,8 @@ $(TARGET): $(SRC)
 run: $(TARGET)
 	./$(TARGET) $(SQL)
 
-demo-reset: $(TARGET)
-	./$(TARGET) demo_reset.sql
-
-demo-select: $(TARGET)
-	./$(TARGET) demo_select.sql
-
-demo-insert: $(TARGET)
-	./$(TARGET) demo_insert.sql
-
-demo-insert-error: $(TARGET)
-	./$(TARGET) demo_insert_error.sql
-
-demo-edge-case: $(TARGET)
-	./$(TARGET) demo_edge_case.sql
-
-demo-update: $(TARGET)
-	./$(TARGET) demo_update.sql
-
-demo-delete: $(TARGET)
-	./$(TARGET) demo_delete.sql
+demo-bptree: $(TARGET)
+	./$(TARGET) demo_bptree.sql
 
 clean:
 	rm -f $(TARGET)

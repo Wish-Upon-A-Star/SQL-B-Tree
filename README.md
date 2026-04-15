@@ -25,7 +25,7 @@ make
 ## SQL 실행
 
 ```powershell
-.\sqlsprocessor.exe demo_select.sql
+.\sqlsprocessor.exe demo_bptree.sql
 ```
 
 SQL 파일은 세미콜론(`;`)으로 문장을 구분합니다.
@@ -92,7 +92,6 @@ SELECT * FROM case_basic_users WHERE name = 'AutoUser';
 ## 포함된 데모
 
 ```powershell
-.\sqlsprocessor.exe demo_select.sql
 .\sqlsprocessor.exe demo_bptree.sql
 .\sqlsprocessor.exe --benchmark 1000000
 ```
