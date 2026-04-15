@@ -12,6 +12,7 @@
 #define MAX_COLS 15
 #define MAX_TABLES 1
 #define MAX_UKS 5
+#define MAX_WHERE_CONDITIONS 8
 #define MAX_SQL_LEN 4096
 #define DELTA_COMPACT_BYTES (256 * 1024 * 1024)
 #define DELTA_COMPACT_CHECK_INTERVAL 4096
@@ -31,6 +32,13 @@ typedef enum {
     WHERE_BETWEEN
 } WhereType;
 
+typedef struct {
+    WhereType type;              /* WHERE condition type */
+    char col[50];                /* WHERE column */
+    char val[256];               /* WHERE value or BETWEEN start */
+    char end_val[256];           /* WHERE BETWEEN end value */
+} WhereCondition;
+
 /* 컬럼 제약 타입입니다. (일반 / PK / UK / NN) */
 typedef enum {
     COL_NORMAL,
@@ -49,6 +57,8 @@ typedef struct {
     char select_cols[MAX_COLS][50]; /* SELECT col1,col2 형태의 컬럼명 목록 */
     char set_col[50];            /* UPDATE ... SET col = value */
     char set_val[256];           /* UPDATE ... SET value */
+    int where_count;             /* WHERE condition count */
+    WhereCondition where_conditions[MAX_WHERE_CONDITIONS];
     WhereType where_type;        /* WHERE condition type */
     char where_col[50];          /* WHERE col = value */
     char where_val[256];         /* WHERE value */

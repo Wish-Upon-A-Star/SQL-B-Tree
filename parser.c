@@ -35,28 +35,55 @@ static int parse_literal(Parser *p, char *dest, size_t dest_size) {
     return 0;
 }
 
-/* WHERE col = value 또는 WHERE col BETWEEN a AND b 형식을 파싱합니다. */
-static int parse_where_clause(Parser *p, Statement *stmt) {
-    if (p->current_token.type != TOKEN_WHERE) return 1;
-    advance_parser(p);
+static int parse_one_condition(Parser *p, Statement *stmt) {
+    WhereCondition *cond;
 
+    if (stmt->where_count >= MAX_WHERE_CONDITIONS) return 0;
     if (p->current_token.type != TOKEN_IDENTIFIER) return 0;
-    strncpy(stmt->where_col, p->current_token.text, sizeof(stmt->where_col) - 1);
-    stmt->where_col[sizeof(stmt->where_col) - 1] = '\0';
+    cond = &stmt->where_conditions[stmt->where_count];
+    memset(cond, 0, sizeof(*cond));
+    strncpy(cond->col, p->current_token.text, sizeof(cond->col) - 1);
+    cond->col[sizeof(cond->col) - 1] = '\0';
     advance_parser(p);
 
     if (p->current_token.type == TOKEN_BETWEEN) {
         advance_parser(p);
-        stmt->where_type = WHERE_BETWEEN;
-        if (!parse_literal(p, stmt->where_val, sizeof(stmt->where_val))) return 0;
+        cond->type = WHERE_BETWEEN;
+        if (!parse_literal(p, cond->val, sizeof(cond->val))) return 0;
         if (!expect_token(p, TOKEN_AND)) return 0;
-        if (!parse_literal(p, stmt->where_end_val, sizeof(stmt->where_end_val))) return 0;
+        if (!parse_literal(p, cond->end_val, sizeof(cond->end_val))) return 0;
+        stmt->where_count++;
         return 1;
     }
 
     if (!expect_token(p, TOKEN_EQ)) return 0;
-    stmt->where_type = WHERE_EQ;
-    if (!parse_literal(p, stmt->where_val, sizeof(stmt->where_val))) return 0;
+    cond->type = WHERE_EQ;
+    if (!parse_literal(p, cond->val, sizeof(cond->val))) return 0;
+    stmt->where_count++;
+    return 1;
+}
+
+/* WHERE cond [AND cond ...] 형식을 파싱합니다. BETWEEN 내부 AND는 조건 구분자로 보지 않습니다. */
+static int parse_where_clause(Parser *p, Statement *stmt) {
+    if (p->current_token.type != TOKEN_WHERE) return 1;
+    advance_parser(p);
+
+    if (!parse_one_condition(p, stmt)) return 0;
+    while (p->current_token.type == TOKEN_AND) {
+        advance_parser(p);
+        if (!parse_one_condition(p, stmt)) return 0;
+    }
+
+    if (stmt->where_count > 0) {
+        WhereCondition *first = &stmt->where_conditions[0];
+        stmt->where_type = first->type;
+        strncpy(stmt->where_col, first->col, sizeof(stmt->where_col) - 1);
+        stmt->where_col[sizeof(stmt->where_col) - 1] = '\0';
+        strncpy(stmt->where_val, first->val, sizeof(stmt->where_val) - 1);
+        stmt->where_val[sizeof(stmt->where_val) - 1] = '\0';
+        strncpy(stmt->where_end_val, first->end_val, sizeof(stmt->where_end_val) - 1);
+        stmt->where_end_val[sizeof(stmt->where_end_val) - 1] = '\0';
+    }
     return 1;
 }
 
