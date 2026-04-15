@@ -84,6 +84,8 @@ Token get_next_token(Lexer *l) {
         else if (strcmp(upper_text, "SET") == 0) t.type = TOKEN_SET;
         else if (strcmp(upper_text, "INTO") == 0) t.type = TOKEN_INTO;
         else if (strcmp(upper_text, "VALUES") == 0) t.type = TOKEN_VALUES;
+        else if (strcmp(upper_text, "BETWEEN") == 0) t.type = TOKEN_BETWEEN;
+        else if (strcmp(upper_text, "AND") == 0) t.type = TOKEN_AND;
         else t.type = TOKEN_IDENTIFIER;
     } else if (isdigit((unsigned char)c)) {
         while (l->sql[l->pos] &&

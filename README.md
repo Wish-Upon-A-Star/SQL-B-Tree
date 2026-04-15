@@ -4,11 +4,11 @@ C 기반 SQL 처리기입니다. CSV 파일을 테이블처럼 사용하며 `INS
 
 이번 버전은 메모리 기반 B+ Tree 인덱스를 추가했습니다. 테이블의 `id(PK)` 컬럼은 자동 증가 ID로 사용할 수 있고, `WHERE id = ...` 형태의 SELECT는 B+ Tree 인덱스를 사용합니다. 다른 컬럼 조건은 비교 대상 성능 확인을 위해 선형 탐색을 사용합니다.
 
-현재 메모리 기반 구현의 안전 상한은 10,000,000건입니다. 1,000,000건을 훨씬 넘는 CSV도 로드할 수 있으며, 상한을 넘으면 부분 로드하지 않고 오류로 중단해 UPDATE/DELETE가 원본 일부를 잃지 않게 합니다.
+현재 메모리 기반 구현의 안전 상한은 2,000,000건입니다. CSV가 이 상한을 넘으면 앞쪽 2,000,000건만 `TableCache`에 캐시하고, 이후 row는 CSV에 남겨 둔 채 tail scan fallback으로 처리합니다.
 
 동시에 캐시하는 CSV 테이블은 최대 1개입니다. 다른 테이블을 열면 기존 테이블을 닫고 새 테이블을 로드해 메모리 사용량을 줄입니다.
 
-`UK` 컬럼은 컬럼별 해시 인덱스로 중복을 검사합니다. 대량 INSERT에서도 기존 전체 레코드를 매번 훑지 않고 평균 O(1)에 가깝게 UK 중복 여부를 확인합니다. UK가 없는 테이블에는 UK 해시 인덱스를 만들지 않습니다. UK 인덱스는 문자열을 한 번 더 복사하지 않고 해시와 row index를 저장하며, 해시 충돌이 나면 원본 row를 다시 읽어 정확 비교합니다.
+`UK` 컬럼은 컬럼별 문자열 B+ Tree 인덱스로 중복을 검사합니다. 과제 요구사항에 맞춰 PK와 UK 모두 B+ Tree 구조를 유지하며, UK가 없는 테이블에는 UK 인덱스를 만들지 않습니다.
 
 ## 빌드
 
@@ -70,9 +70,29 @@ ID가 아닌 컬럼 조건은 선형 탐색을 사용합니다.
 SELECT * FROM case_basic_users WHERE name = 'AutoUser';
 ```
 
+`UPDATE`와 `DELETE`도 `WHERE id = ...` 조건이면 B+ Tree로 대상 row를 먼저 찾습니다. 단, DELETE는 row index가 당겨지므로 삭제 후 PK/UK B+ Tree를 다시 빌드합니다.
+
 ```text
 [scan] linear scan on column 'name'
 ```
+
+## B+ Tree Range SELECT
+
+`id(PK)`와 `UK` 범위 조건은 B+ Tree leaf linked list를 사용합니다.
+
+```sql
+SELECT * FROM case_basic_users WHERE id BETWEEN 2 AND 4;
+SELECT * FROM case_basic_users WHERE email BETWEEN 'a@test.com' AND 'm@test.com';
+```
+
+실행 결과에 다음 표시가 나오면 B+ Tree range scan 경로를 사용한 것입니다.
+
+```text
+[index] B+ tree id range lookup
+[index] UK B+ tree range lookup on column 'email'
+```
+
+범위 검색은 시작 key가 들어갈 leaf를 찾은 뒤, leaf의 `next` 포인터를 따라가며 끝 key까지 출력합니다. 문자열 UK 범위는 `strcmp` 기준 사전순입니다.
 
 ## 성능 테스트
 
@@ -115,4 +135,40 @@ linear/id-index average speed ratio: ...
 linear/uk-index average speed ratio: ...
 ```
 
-생성된 `bptree_benchmark_users.csv` 파일은 저장소에 포함되어 있습니다. 그래서 매번 데이터를 다시 만들지 않고도 큰 테이블 로드 경로를 테스트할 수 있습니다. 기존 CSV 테이블을 열 때는 모든 키를 트리에 하나씩 삽입하지 않고, 정렬된 key-row 목록으로 PK/UK 인덱스를 bulk-build합니다.
+## Memory Cache Limit
+
+This implementation keeps the first 2,000,000 rows in `TableCache.records` and builds B+ Tree indexes for that cached region. If a CSV has more rows, the first uncached row offset is remembered and tail PK offsets are indexed in memory.
+
+- PK/UK SELECT first checks the B+ Tree index. If a PK key is not cached, exact lookup uses the tail PK offset index before falling back to scan.
+- Non-indexed SELECT scans cached rows in memory first, then scans only the uncached CSV tail.
+- INSERT beyond the memory limit appends to CSV only and keeps the uncached tail scan path active.
+- UPDATE/DELETE on over-limit tables rewrites the CSV through a full-file fallback, then reloads the cache and recomputes the uncached offset.
+- UPDATE on cached tables updates only the changed UK B+ Tree entry when the SET column is a UK column.
+- UPDATE/DELETE with `WHERE id = ...` uses the PK B+ Tree to locate the target row before applying the change.
+- `--benchmark` requests above 2,000,000 rows are capped to 2,000,000 rows to avoid memory blowups.
+
+## Append-Only Delta Log
+
+Cached tables with a PK no longer rewrite the whole CSV for every UPDATE or DELETE. The executor keeps B+ Tree indexes in memory and persists row changes to `<table>.delta`.
+
+- UPDATE writes committed `U` records to the delta log after memory and B+ Tree checks succeed.
+- DELETE writes committed `D` tombstone records to the delta log after removing only the deleted PK/UK entries from B+ Tree indexes.
+- On table open, the CSV is loaded first, then committed delta batches are replayed, then PK/UK B+ Tree indexes are bulk-built from the current rows.
+- Incomplete delta batches are ignored because only records between `B` and `E` markers are replayed.
+- If the table later crosses the memory cache limit, pending delta changes are compacted back into the CSV before new tail rows are appended.
+- Large delta logs are compacted back into the CSV once they cross `DELTA_COMPACT_BYTES`.
+- Over-limit tables still use the slower full-file fallback because rows outside the cached prefix are not indexed in memory.
+
+## Stable Slot IDs
+
+The cached prefix no longer treats `record_count` as the number of live rows. It is now the number of allocated slots. Live rows are tracked by `record_active[slot_id]`, and free deleted slots are kept in `free_slots`.
+
+- B+ Tree values store a stable `slot_id`, not a compacting array position.
+- DELETE removes matching PK/UK entries from B+ Tree indexes, marks slots inactive, then writes a delta tombstone.
+- INSERT first reuses an inactive slot when one exists, then appends the new row to the CSV for persistence.
+- SELECT, UPDATE, DELETE, PK range scans, and UK range scans all skip inactive slots.
+- CSV rewrite/compaction writes only active slots, but the in-memory slot layout remains stable while the table is open.
+
+This replaces the earlier compact-array DELETE behavior. The practical effect is that a B+ Tree search result does not become stale just because another row was deleted before it in memory.
+
+생성된 `bptree_benchmark_users.csv` 파일은 저장소에 커밋하지 않습니다. 벤치마크를 실행하면 필요할 때 다시 생성됩니다. 기존 CSV 테이블을 열 때는 모든 키를 트리에 하나씩 삽입하지 않고, 정렬된 key-row 목록으로 PK/UK 인덱스를 bulk-build합니다.
