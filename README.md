@@ -158,4 +158,16 @@ Cached tables with a PK no longer rewrite the whole CSV for every UPDATE or DELE
 - If the table later crosses the memory cache limit, pending delta changes are compacted back into the CSV before new tail rows are appended.
 - Over-limit tables still use the slower full-file fallback because rows outside the cached prefix are not indexed in memory.
 
+## Stable Slot IDs
+
+The cached prefix no longer treats `record_count` as the number of live rows. It is now the number of allocated slots. Live rows are tracked by `record_active[slot_id]`, and free deleted slots are kept in `free_slots`.
+
+- B+ Tree values store a stable `slot_id`, not a compacting array position.
+- DELETE marks matching slots inactive, rebuilds PK/UK B+ Tree indexes from active slots, then writes a delta tombstone.
+- INSERT first reuses an inactive slot when one exists, then appends the new row to the CSV for persistence.
+- SELECT, UPDATE, DELETE, PK range scans, and UK range scans all skip inactive slots.
+- CSV rewrite/compaction writes only active slots, but the in-memory slot layout remains stable while the table is open.
+
+This replaces the earlier compact-array DELETE behavior. The practical effect is that a B+ Tree search result does not become stale just because another row was deleted before it in memory.
+
 생성된 `bptree_benchmark_users.csv` 파일은 저장소에 커밋하지 않습니다. 벤치마크를 실행하면 필요할 때 다시 생성됩니다. 기존 CSV 테이블을 열 때는 모든 키를 트리에 하나씩 삽입하지 않고, 정렬된 key-row 목록으로 PK/UK 인덱스를 bulk-build합니다.

@@ -70,9 +70,14 @@ typedef struct {
     int uk_count;                 /* UK 컬럼 개수 */
     UniqueIndex *uk_indexes[MAX_UKS]; /* UK 컬럼별 B+ Tree 인덱스 */
     BPlusTree *id_index;           /* ID/PK 기반 B+ Tree 인덱스 */
-    char **records;                /* 모든 레코드 문자열 */
-    int record_capacity;           /* 동적 레코드 배열 용량 */
-    int record_count;             /* 메모리에 캐시된 레코드 개수 */
+    char **records;                /* slot_id별 레코드 문자열 */
+    int *record_active;            /* slot_id별 활성 row 여부 */
+    int record_capacity;           /* 동적 slot 배열 용량 */
+    int record_count;              /* 할당된 slot 개수 */
+    int active_count;              /* 활성 row 개수 */
+    int *free_slots;               /* 재사용 가능한 비활성 slot 목록 */
+    int free_count;                /* free_slots 개수 */
+    int free_capacity;             /* free_slots 배열 용량 */
     int cache_truncated;           /* MAX_RECORDS를 넘어 파일 스캔 fallback이 필요한지 여부 */
     long uncached_start_offset;     /* 캐시되지 않은 첫 CSV row의 파일 offset */
     long next_auto_id;             /* INSERT 시 자동 부여할 다음 ID */
