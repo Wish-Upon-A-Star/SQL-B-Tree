@@ -4122,10 +4122,50 @@ static double current_seconds(void) {
 #endif
 }
 
+void generate_jungle_dataset(int record_count, const char *filename) {
+    const char *output = (filename && filename[0]) ? filename : "bptree_benchmark_users.csv";
+    FILE *f;
+    int i;
+
+    if (record_count <= 0) record_count = 1000000;
+    if (record_count > MAX_RECORDS) record_count = MAX_RECORDS;
+
+    f = fopen(output, "wb");
+    if (!f) {
+        printf("[error] dataset file could not be created: %s\n", output);
+        return;
+    }
+
+    if (fprintf(f, "id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round\n") < 0) {
+        fclose(f);
+        printf("[error] dataset header could not be written: %s\n", output);
+        return;
+    }
+
+    for (i = 1; i <= record_count; i++) {
+        int pretest = 50 + (i % 51);
+        const char *status = (i % 3 == 0) ? "submitted" : ((i % 3 == 1) ? "pretest_pass" : "interview_wait");
+        if (fprintf(f,
+                    "%d,jungle%07d@apply.kr,010-%04d-%04d,지원자%d,sw_ai_lab,student,generated_profile,%d,gh_%07d,%s,2026_spring\n",
+                    i, i, (i / 10000) % 10000, i % 10000, i, pretest, i, status) < 0) {
+            fclose(f);
+            printf("[error] dataset write failed at row %d.\n", i);
+            return;
+        }
+    }
+
+    if (fclose(f) != 0) {
+        printf("[error] dataset file close failed: %s\n", output);
+        return;
+    }
+
+    printf("[ok] jungle applicant dataset generated: %s (%d rows)\n", output, record_count);
+}
+
 void run_bplus_benchmark(int record_count) {
     FILE *f;
     TableCache *tc;
-    const char *table_name = "bptree_benchmark_users";
+    const char *table_name = "bptree_perf_users";
     int i;
     int index_query_count = 1000;
     int uk_query_count = 1000;
@@ -4141,7 +4181,7 @@ void run_bplus_benchmark(int record_count) {
     BPlusPair *id_pairs = NULL;
     BPlusStringPair *uk_pairs = NULL;
 
-    if (record_count < 1000000) record_count = 1000000;
+    if (record_count <= 0) record_count = 1;
     if (record_count > MAX_RECORDS) {
         INFO_PRINTF("[notice] benchmark record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
         record_count = MAX_RECORDS;
@@ -4149,9 +4189,9 @@ void run_bplus_benchmark(int record_count) {
 
     close_all_tables();
     open_table_count = 0;
-    remove("bptree_benchmark_users.delta");
+    remove("bptree_perf_users.delta");
 
-    f = fopen("bptree_benchmark_users.csv", "wb");
+    f = fopen("bptree_perf_users.csv", "wb");
     if (!f) {
         printf("[error] benchmark table file could not be created.\n");
         return;
