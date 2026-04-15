@@ -1,38 +1,98 @@
-# SQLprocessor
+# SQL-B-Tree
 
-> SQL 텍스트 파일을 입력받아 파싱하고, 실행하고, CSV 파일에 저장하는 C 기반 SQL 처리기.
+C 기반 SQL 처리기입니다. CSV 파일을 테이블처럼 사용하며 `INSERT`, `SELECT`, `UPDATE`, `DELETE`를 실행합니다.
 
+이번 버전은 메모리 기반 B+ Tree 인덱스를 추가했습니다. 테이블의 `id(PK)` 컬럼은 자동 증가 ID로 사용할 수 있고, `WHERE id = ...` 형태의 SELECT는 B+ Tree 인덱스를 사용합니다. 다른 컬럼 조건은 비교 대상 성능 확인을 위해 선형 탐색을 사용합니다.
 
-## 한눈에 보기
+현재 메모리 기반 구현의 안전 상한은 10,000,000건입니다. 1,000,000건을 훨씬 넘는 CSV도 로드할 수 있으며, 상한을 넘으면 부분 로드하지 않고 오류로 중단해 UPDATE/DELETE가 원본 일부를 잃지 않게 합니다.
 
-| 항목 | 내용 |
-| --- | --- |
-| 목표 | `입력(SQL)` -> `파싱` -> `실행` -> `파일 저장` 흐름 구현 |
-| 언어 | C |
-| 저장소 | CSV 파일 기반 |
-| 필수 구현 | `INSERT`, `SELECT`, CLI 입력 |
-| 추가 구현 | `UPDATE`, `DELETE`, `PK/UK/NN` 제약 |
+동시에 캐시하는 CSV 테이블은 최대 1개입니다. 다른 테이블을 열면 기존 테이블을 닫고 새 테이블을 로드해 메모리 사용량을 줄입니다.
 
-## 처리 흐름
-<img width="1146" height="646" alt="스크린샷 198" src="https://github.com/user-attachments/assets/d84c1978-55fe-4fde-ba7e-b527d57bee28" />
+`UK` 컬럼은 컬럼별 해시 인덱스로 중복을 검사합니다. 대량 INSERT에서도 기존 전체 레코드를 매번 훑지 않고 평균 O(1)에 가깝게 UK 중복 여부를 확인합니다. UK가 없는 테이블에는 UK 해시 인덱스를 만들지 않습니다. UK 인덱스는 문자열을 한 번 더 복사하지 않고 해시와 row index를 저장하며, 해시 충돌이 나면 원본 row를 다시 읽어 정확 비교합니다.
 
+## 빌드
 
-`main.c`는 SQL 파일을 문자 단위로 읽으면서 주석, 따옴표, 세미콜론을 구분해 문장을 분리합니다.  
-이후 `lexer.c`와 `parser.c`가 SQL을 `Statement` 구조체로 바꾸고, `executor.c`가 실제 조회/삽입/수정/삭제를 수행합니다.
+```powershell
+gcc -O2 main.c -o sqlsprocessor
+```
 
-## 구현 핵심
+`make`가 있는 환경에서는 기존 Makefile도 사용할 수 있습니다.
 
-| 구성 요소 | 역할 |
-| --- | --- |
-| `main.c` | 파일 경로 입력, SQL 문장 분리, 실행 분기 |
-| `lexer.c` | SQL 문자열을 토큰으로 분해 |
-| `parser.c` | `Statement` 구조체 생성 |
-| `executor.c` | SELECT / INSERT / UPDATE / DELETE 실행 |
-| `*.csv` | 테이블 데이터 저장 |
+```bash
+make
+```
 
-## 최소 요구사항 이외 구현 사항
+## SQL 실행
 
-- 최소 요구사항인 `INSERT`, `SELECT`를 넘어서 `UPDATE`, `DELETE`까지 구현했습니다.
-- `PK`, `UK`, `NN` 제약을 실행 단계에서 검증합니다.
-- `'tony,stark@test.com'`처럼 쉼표가 들어간 quoted 값도 처리합니다.
-- 잘못된 SQL 문장과 제약 위반을 콘솔 메시지로 바로 확인할 수 있습니다.
+```powershell
+.\sqlsprocessor.exe demo_select.sql
+```
+
+SQL 파일은 세미콜론(`;`)으로 문장을 구분합니다.
+
+## 자동 ID INSERT
+
+테이블 헤더가 다음처럼 `id(PK)`를 포함하면 ID 인덱스 대상이 됩니다.
+
+```csv
+id(PK),email(UK),phone(UK),pwd(NN),name
+```
+
+`id` 값을 생략하면 다음 ID가 자동으로 부여됩니다.
+
+```sql
+INSERT INTO case_basic_users VALUES ('auto1@test.com', '010-5555', 'pw5555', 'AutoUser');
+```
+
+기존 방식처럼 ID를 직접 넣는 INSERT도 계속 지원합니다.
+
+```sql
+INSERT INTO case_basic_users VALUES (4, 'newuser@test.com', '010-4444', 'pw4444', 'NewUser');
+```
+
+## B+ Tree SELECT
+
+ID 조건 검색은 B+ Tree를 사용합니다.
+
+```sql
+SELECT * FROM case_basic_users WHERE id = 4;
+```
+
+실행 결과에 다음 표시가 나오면 인덱스 경로를 사용한 것입니다.
+
+```text
+[index] B+ tree id lookup
+```
+
+ID가 아닌 컬럼 조건은 선형 탐색을 사용합니다.
+
+```sql
+SELECT * FROM case_basic_users WHERE name = 'AutoUser';
+```
+
+```text
+[scan] linear scan on column 'name'
+```
+
+## 성능 테스트
+
+최소 1,000,000건을 생성하고 B+ Tree 검색과 선형 검색 속도를 비교합니다.
+
+```powershell
+.\sqlsprocessor.exe --benchmark 1000000
+```
+
+벤치마크는 `bptree_benchmark_users.csv`를 만들고 SQL INSERT와 같은 내부 삽입 경로로 100만 건 이상을 넣은 뒤 다음을 비교합니다. 벤치마크 테이블에는 `email(UK)`가 포함되어 UK 해시 중복 검사도 함께 검증됩니다.
+
+- `id` 기준 SELECT: B+ Tree 인덱스 검색
+- `name` 기준 SELECT: 선형 탐색
+
+벤치마크 CSV는 `.gitignore`에 등록되어 커밋되지 않습니다.
+
+## 포함된 데모
+
+```powershell
+.\sqlsprocessor.exe demo_select.sql
+.\sqlsprocessor.exe demo_bptree.sql
+.\sqlsprocessor.exe --benchmark 1000000
+```

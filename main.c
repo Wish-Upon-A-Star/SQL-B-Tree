@@ -1,6 +1,7 @@
 ﻿#include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -21,6 +22,12 @@ int main(int argc, char *argv[]) {
     configure_console_encoding();
 
     char filename[256];
+
+    if (argc >= 2 && strcmp(argv[1], "--benchmark") == 0) {
+        int count = (argc >= 3) ? atoi(argv[2]) : 1000000;
+        run_bplus_benchmark(count);
+        return 0;
+    }
 
     if (argc >= 2) {
         strncpy(filename, argv[1], 255);
@@ -91,4 +98,5 @@ int main(int argc, char *argv[]) {
  */
 #include "lexer.c"
 #include "parser.c"
+#include "bptree.c"
 #include "executor.c"

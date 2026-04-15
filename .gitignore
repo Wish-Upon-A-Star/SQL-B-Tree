@@ -1,2 +1,14 @@
 sqlsprocessor
+*.exe
 *.dSYM/
+bptree_benchmark_users.csv
+over_million_users.csv
+bptree_test_users.csv
+bptree_test.sql
+over_million_test.sql
+lru_*.csv
+lru_test.sql
+uk_*_users.csv
+uk_*_test.sql
+uk_test_users.csv
+uk_test.sql

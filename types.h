@@ -3,9 +3,11 @@
 
 #include <stdio.h>
 
-#define MAX_RECORDS 25000
+#define MAX_RECORDS 10000000
+#define INITIAL_RECORD_CAPACITY 1024
+#define RECORD_SIZE 1024
 #define MAX_COLS 15
-#define MAX_TABLES 10
+#define MAX_TABLES 1
 #define MAX_UKS 5
 #define MAX_SQL_LEN 4096
 
@@ -46,6 +48,9 @@ typedef struct {
     ColumnType type;              /* COL_NORMAL / PK / UK / NN */
 } ColumnInfo;
 
+typedef struct BPlusTree BPlusTree;
+typedef struct UniqueIndex UniqueIndex;
+
 /* 테이블 한 개를 메모리에 적재해 관리하는 캐시 구조입니다. */
 typedef struct {
     char table_name[256];         /* users 형태 이름 */
@@ -55,9 +60,12 @@ typedef struct {
     int pk_idx;                   /* PK 컬럼 인덱스, 없으면 -1 */
     int uk_indices[MAX_UKS];      /* UK 컬럼 인덱스 목록 */
     int uk_count;                 /* UK 컬럼 개수 */
-    long pk_index[MAX_RECORDS];    /* PK 정렬 인덱스 */
-    char records[MAX_RECORDS][1024]; /* 모든 레코드 문자열 */
+    UniqueIndex *uk_indexes[MAX_UKS]; /* UK 컬럼별 해시 인덱스 */
+    BPlusTree *id_index;           /* ID/PK 기반 B+ Tree 인덱스 */
+    char **records;                /* 모든 레코드 문자열 */
+    int record_capacity;           /* 동적 레코드 배열 용량 */
     int record_count;             /* 레코드 개수 */
+    long next_auto_id;             /* INSERT 시 자동 부여할 다음 ID */
     unsigned long long last_used_seq; /* LRU 계산용 사용 순번 */
 } TableCache;
 

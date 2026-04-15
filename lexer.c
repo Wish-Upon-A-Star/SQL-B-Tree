@@ -7,6 +7,11 @@
 void init_lexer(Lexer *l, const char *sql) {
     l->sql = sql;
     l->pos = 0;
+    if ((unsigned char)sql[0] == 0xEF &&
+        (unsigned char)sql[1] == 0xBB &&
+        (unsigned char)sql[2] == 0xBF) {
+        l->pos = 3;
+    }
 }
 
 /*

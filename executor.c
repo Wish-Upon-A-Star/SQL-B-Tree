@@ -1,67 +1,209 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
+#include <time.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include "executor.h"
+#include "bptree.h"
 
 TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
 static unsigned long long g_table_access_seq = 0;
 
-static void insert_pk_sorted(TableCache *tc, long val, const char* row_str);
+void parse_csv_row(const char *row, char *fields[MAX_COLS], char *buffer);
+static void normalize_value(const char *src, char *dest, size_t dest_size);
+static void rebuild_id_index(TableCache *tc);
+static int rebuild_uk_indexes(TableCache *tc);
+static int index_record_uks(TableCache *tc, int row_index);
 
-/* qsort/bsearch에서 long 비교에 쓰이는 비교 함수입니다. */
-static int compare_long(const void *a, const void *b) {
-    long val_a = *(long *)a;
-    long val_b = *(long *)b;
-    return (val_a > val_b) - (val_a < val_b);
+static char *dup_string(const char *src) {
+    size_t len = strlen(src) + 1;
+    char *copy = (char *)malloc(len);
+    if (!copy) return NULL;
+    memcpy(copy, src, len);
+    return copy;
 }
 
-/* PK 인덱스 배열에서 주어진 PK 값을 이분 탐색으로 찾습니다. */
-static int find_in_pk_index(TableCache *tc, long val) {
-    if (tc->record_count == 0 || tc->pk_idx == -1) return -1;
-    long *found = bsearch(&val, tc->pk_index, tc->record_count, sizeof(long), compare_long);
-    return found ? (int)(found - tc->pk_index) : -1;
+typedef struct UniqueEntry {
+    unsigned long long hash;
+    int row_index;
+    struct UniqueEntry *next;
+} UniqueEntry;
+
+struct UniqueIndex {
+    UniqueEntry **buckets;
+    size_t bucket_count;
+    size_t count;
+    int col_idx;
+};
+
+static unsigned long long hash_string(const char *s) {
+    unsigned long long hash = 1469598103934665603ULL;
+    while (*s) {
+        hash ^= (unsigned char)*s++;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
 }
 
-/* 문자열 앞뒤 공백을 제거하고, 필요하면 양끝의 홑따옴표를 제거합니다. */
+static UniqueIndex *unique_index_create(int col_idx) {
+    UniqueIndex *index = (UniqueIndex *)calloc(1, sizeof(UniqueIndex));
+    if (!index) return NULL;
+    index->col_idx = col_idx;
+    index->bucket_count = 2048;
+    index->buckets = (UniqueEntry **)calloc(index->bucket_count, sizeof(UniqueEntry *));
+    if (!index->buckets) {
+        free(index);
+        return NULL;
+    }
+    return index;
+}
+
+static void unique_index_clear(UniqueIndex *index) {
+    size_t i;
+    if (!index) return;
+    for (i = 0; i < index->bucket_count; i++) {
+        UniqueEntry *entry = index->buckets[i];
+        while (entry) {
+            UniqueEntry *next = entry->next;
+            free(entry);
+            entry = next;
+        }
+        index->buckets[i] = NULL;
+    }
+    index->count = 0;
+}
+
+static void unique_index_destroy(UniqueIndex *index) {
+    if (!index) return;
+    unique_index_clear(index);
+    free(index->buckets);
+    free(index);
+}
+
+static int unique_index_rehash(UniqueIndex *index, size_t new_bucket_count) {
+    UniqueEntry **new_buckets;
+    size_t i;
+
+    new_buckets = (UniqueEntry **)calloc(new_bucket_count, sizeof(UniqueEntry *));
+    if (!new_buckets) return 0;
+    for (i = 0; i < index->bucket_count; i++) {
+        UniqueEntry *entry = index->buckets[i];
+        while (entry) {
+            UniqueEntry *next = entry->next;
+            size_t bucket = entry->hash % new_bucket_count;
+            entry->next = new_buckets[bucket];
+            new_buckets[bucket] = entry;
+            entry = next;
+        }
+    }
+    free(index->buckets);
+    index->buckets = new_buckets;
+    index->bucket_count = new_bucket_count;
+    return 1;
+}
+
+static int unique_index_find(TableCache *tc, UniqueIndex *index, const char *key, int *row_index) {
+    UniqueEntry *entry;
+    unsigned long long hash;
+    size_t bucket;
+
+    if (!index || !key || strlen(key) == 0) return 0;
+    hash = hash_string(key);
+    bucket = hash % index->bucket_count;
+    entry = index->buckets[bucket];
+    while (entry) {
+        if (entry->hash == hash && entry->row_index >= 0 && entry->row_index < tc->record_count) {
+            char row_buf[RECORD_SIZE];
+            char *fields[MAX_COLS] = {0};
+            char existing_key[RECORD_SIZE];
+
+            parse_csv_row(tc->records[entry->row_index], fields, row_buf);
+            normalize_value(fields[index->col_idx], existing_key, sizeof(existing_key));
+            if (strcmp(existing_key, key) == 0) {
+                if (row_index) *row_index = entry->row_index;
+                return 1;
+            }
+        }
+        entry = entry->next;
+    }
+    return 0;
+}
+
+static int unique_index_insert(TableCache *tc, UniqueIndex *index, const char *key, int row_index) {
+    UniqueEntry *entry;
+    unsigned long long hash;
+    size_t bucket;
+
+    if (!index || !key || strlen(key) == 0) return 1;
+    if (unique_index_find(tc, index, key, NULL)) return 0;
+    if ((index->count + 1) * 4 > index->bucket_count * 3) {
+        if (!unique_index_rehash(index, index->bucket_count * 2)) return -1;
+    }
+
+    entry = (UniqueEntry *)calloc(1, sizeof(UniqueEntry));
+    if (!entry) return -1;
+    hash = hash_string(key);
+    entry->hash = hash;
+    entry->row_index = row_index;
+    bucket = hash % index->bucket_count;
+    entry->next = index->buckets[bucket];
+    index->buckets[bucket] = entry;
+    index->count++;
+    return 1;
+}
+
 void trim_and_unquote(char *str) {
+    char *start;
+    char *end;
+
     if (!str) return;
-    char *start = str;
+    start = str;
     while (isspace((unsigned char)*start)) start++;
-    char *end = start + strlen(start) - 1;
-    while (end > start && isspace((unsigned char)*end)) end--;
-    *(end + 1) = '\0';
-    if (start[0] == '\'' && end > start && *end == '\'') {
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    *end = '\0';
+
+    if (start[0] == '\'' && end > start + 1 && *(end - 1) == '\'') {
         start++;
-        *end = '\0';
+        *(end - 1) = '\0';
     }
-    if (start != str) {
-        memmove(str, start, strlen(start) + 1);
-    }
+    if (start != str) memmove(str, start, strlen(start) + 1);
 }
 
-/* 값 비교를 위해 둘 다 trim/quote 정규화한 뒤 동일 여부를 반환합니다. */
 int compare_value(const char *field, const char *search_val) {
     char f_buf[256];
     char v_buf[256];
-    strncpy(f_buf, field ? field : "", 255);
-    f_buf[255] = '\0';
-    strncpy(v_buf, search_val ? search_val : "", 255);
-    v_buf[255] = '\0';
+
+    strncpy(f_buf, field ? field : "", sizeof(f_buf) - 1);
+    f_buf[sizeof(f_buf) - 1] = '\0';
+    strncpy(v_buf, search_val ? search_val : "", sizeof(v_buf) - 1);
+    v_buf[sizeof(v_buf) - 1] = '\0';
     trim_and_unquote(f_buf);
     trim_and_unquote(v_buf);
     return strcmp(f_buf, v_buf) == 0;
 }
 
-/* CSV 한 줄을 쉼표 기준으로 나누어 fields 배열에 포인터를 채웁니다. */
+static void normalize_value(const char *src, char *dest, size_t dest_size) {
+    strncpy(dest, src ? src : "", dest_size - 1);
+    dest[dest_size - 1] = '\0';
+    trim_and_unquote(dest);
+}
+
 void parse_csv_row(const char *row, char *fields[MAX_COLS], char *buffer) {
-    strncpy(buffer, row, 1023);
-    buffer[1023] = '\0';
     int i = 0;
     int in_quotes = 0;
-    char *p = buffer;
+    char *p;
+
+    strncpy(buffer, row ? row : "", RECORD_SIZE - 1);
+    buffer[RECORD_SIZE - 1] = '\0';
+    p = buffer;
     fields[i++] = p;
+
     while (*p && i < MAX_COLS) {
         if (*p == '\'') in_quotes = !in_quotes;
         if (*p == ',' && !in_quotes) {
@@ -72,58 +214,122 @@ void parse_csv_row(const char *row, char *fields[MAX_COLS], char *buffer) {
     }
 }
 
-/* 컬럼 이름으로 컬럼 인덱스를 반환합니다. 못 찾으면 -1. */
 static int get_col_idx(TableCache *tc, const char *col_name) {
-    if (!col_name || strlen(col_name) == 0) return -1;
     int i;
+    if (!col_name || strlen(col_name) == 0) return -1;
     for (i = 0; i < tc->col_count; i++) {
         if (strcmp(tc->cols[i].name, col_name) == 0) return i;
     }
     return -1;
 }
 
-/* 메모리 캐시 상태를 현재까지의 CSV 파일 형태로 다시 저장합니다. */
-void rewrite_file(TableCache *tc) {
+static int get_uk_slot(TableCache *tc, int col_idx) {
     int i;
-    if (tc->file) fclose(tc->file);
-    char filename[300];
-    snprintf(filename, sizeof(filename), "%s.csv", tc->table_name);
-    tc->file = fopen(filename, "w+");
-    if (!tc->file) return;
-    for (i = 0; i < tc->col_count; i++) {
-        fprintf(tc->file, "%s", tc->cols[i].name);
-        if (tc->cols[i].type == COL_PK) {
-            fprintf(tc->file, "(PK)");
-        } else if (tc->cols[i].type == COL_UK) {
-            fprintf(tc->file, "(UK)");
-        } else if (tc->cols[i].type == COL_NN) {
-            fprintf(tc->file, "(NN)");
+    for (i = 0; i < tc->uk_count; i++) {
+        if (tc->uk_indices[i] == col_idx) return i;
+    }
+    return -1;
+}
+
+static int ensure_record_capacity(TableCache *tc, int required) {
+    int new_capacity;
+    char **new_records;
+
+    if (required <= tc->record_capacity) return 1;
+    new_capacity = tc->record_capacity > 0 ? tc->record_capacity : INITIAL_RECORD_CAPACITY;
+    while (new_capacity < required) {
+        if (new_capacity > MAX_RECORDS / 2) {
+            new_capacity = MAX_RECORDS;
+            break;
         }
-        fprintf(tc->file, "%s", (i == tc->col_count - 1 ? "\n" : ","));
+        new_capacity *= 2;
     }
-    for (i = 0; i < tc->record_count; i++) {
-        fprintf(tc->file, "%s\n", tc->records[i]);
-    }
-    fflush(tc->file);
+    if (required > new_capacity) return 0;
+
+    new_records = (char **)realloc(tc->records, (size_t)new_capacity * sizeof(char *));
+    if (!new_records) return 0;
+    tc->records = new_records;
+    tc->record_capacity = new_capacity;
+    return 1;
 }
 
-/* 접근 이벤트를 남겨 LRU 교체 순서를 갱신합니다. */
-static void touch_table(TableCache *tc) {
-    tc->last_used_seq = ++g_table_access_seq;
+static int append_record_memory(TableCache *tc, const char *row, long id_value) {
+    int row_index;
+
+    if (tc->record_count >= MAX_RECORDS) return 0;
+    if (!ensure_record_capacity(tc, tc->record_count + 1)) return 0;
+
+    row_index = tc->record_count;
+    tc->records[row_index] = dup_string(row);
+    if (!tc->records[row_index]) return 0;
+    tc->record_count++;
+
+    if (tc->pk_idx != -1) {
+        if (bptree_insert(tc->id_index, id_value, row_index) != 1) {
+            free(tc->records[row_index]);
+            tc->record_count--;
+            return 0;
+        }
+        if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
+    }
+    if (!index_record_uks(tc, row_index)) {
+        free(tc->records[row_index]);
+        tc->record_count--;
+        rebuild_id_index(tc);
+        rebuild_uk_indexes(tc);
+        return 0;
+    }
+    return 1;
 }
 
-/* 캐시 슬롯을 완전히 비우고 기본값으로 재설정합니다. */
+static void rollback_last_record_memory(TableCache *tc) {
+    if (!tc || tc->record_count <= 0) return;
+    tc->record_count--;
+    free(tc->records[tc->record_count]);
+    tc->records[tc->record_count] = NULL;
+    rebuild_id_index(tc);
+    rebuild_uk_indexes(tc);
+}
+
+static void free_table_storage(TableCache *tc) {
+    int i;
+
+    if (!tc) return;
+    if (tc->file) {
+        fclose(tc->file);
+        tc->file = NULL;
+    }
+    for (i = 0; i < tc->record_count; i++) free(tc->records[i]);
+    free(tc->records);
+    tc->records = NULL;
+    tc->record_capacity = 0;
+    tc->record_count = 0;
+    bptree_destroy(tc->id_index);
+    tc->id_index = NULL;
+    for (i = 0; i < tc->uk_count; i++) {
+        unique_index_destroy(tc->uk_indexes[i]);
+        tc->uk_indexes[i] = NULL;
+    }
+    tc->uk_count = 0;
+}
+
 static void reset_table_cache(TableCache *tc) {
     memset(tc, 0, sizeof(TableCache));
     tc->file = NULL;
     tc->pk_idx = -1;
+    tc->next_auto_id = 1;
+    tc->id_index = bptree_create();
 }
 
-/* 현재 가장 오래된 접근 순서의 슬롯을 찾아 반환합니다. */
+static void touch_table(TableCache *tc) {
+    tc->last_used_seq = ++g_table_access_seq;
+}
+
 static int find_lru_table_index(void) {
     int i;
     int lru_index = 0;
     unsigned long long oldest_seq = open_tables[0].last_used_seq;
+
     for (i = 1; i < open_table_count; i++) {
         if (open_tables[i].last_used_seq < oldest_seq) {
             oldest_seq = open_tables[i].last_used_seq;
@@ -133,29 +339,173 @@ static int find_lru_table_index(void) {
     return lru_index;
 }
 
-/* 파일을 열어 헤더와 레코드를 TableCache에 적재합니다. */
-static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
-    reset_table_cache(tc);
-    strncpy(tc->table_name, name, 255);
-    tc->table_name[255] = '\0';
-    tc->file = f;
-    tc->record_count = 0;
-    tc->pk_idx = -1;
-    tc->col_count = 0;
-    tc->uk_count = 0;
-    tc->last_used_seq = ++g_table_access_seq;
+static int parse_long_value(const char *value, long *out) {
+    char buf[256];
+    char *endptr;
 
-    char header[1024];
+    strncpy(buf, value ? value : "", sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    trim_and_unquote(buf);
+    if (strlen(buf) == 0 || strcmp(buf, "NULL") == 0) return 0;
+
+    *out = strtol(buf, &endptr, 10);
+    return endptr != buf && *endptr == '\0';
+}
+
+static int append_record_file(TableCache *tc, const char *row, int flush_now) {
+    if (!tc->file) return 0;
+    if (fseek(tc->file, 0, SEEK_END) != 0) return 0;
+    if (fprintf(tc->file, "%s\n", row) < 0) return 0;
+    if (flush_now && fflush(tc->file) != 0) return 0;
+    if (ferror(tc->file)) return 0;
+    return 1;
+}
+
+static int replace_table_file(const char *temp_filename, const char *filename) {
+#if defined(_WIN32)
+    return MoveFileExA(temp_filename, filename, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    return rename(temp_filename, filename) == 0;
+#endif
+}
+
+int rewrite_file(TableCache *tc) {
+    char filename[300];
+    char temp_filename[320];
+    FILE *out;
+    int i;
+
+    if (tc->file) fclose(tc->file);
+    tc->file = NULL;
+    snprintf(filename, sizeof(filename), "%s.csv", tc->table_name);
+    snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", filename);
+
+    out = fopen(temp_filename, "w");
+    if (!out) return 0;
+
+    for (i = 0; i < tc->col_count; i++) {
+        if (fprintf(out, "%s", tc->cols[i].name) < 0) goto fail;
+        if (tc->cols[i].type == COL_PK && fprintf(out, "(PK)") < 0) goto fail;
+        else if (tc->cols[i].type == COL_UK && fprintf(out, "(UK)") < 0) goto fail;
+        else if (tc->cols[i].type == COL_NN && fprintf(out, "(NN)") < 0) goto fail;
+        if (fprintf(out, "%s", (i == tc->col_count - 1 ? "\n" : ",")) < 0) goto fail;
+    }
+    for (i = 0; i < tc->record_count; i++) {
+        if (fprintf(out, "%s\n", tc->records[i]) < 0) goto fail;
+    }
+    if (fflush(out) != 0 || ferror(out)) goto fail;
+    if (fclose(out) != 0) {
+        remove(temp_filename);
+        tc->file = fopen(filename, "r+");
+        return 0;
+    }
+    if (!replace_table_file(temp_filename, filename)) {
+        remove(temp_filename);
+        tc->file = fopen(filename, "r+");
+        return 0;
+    }
+    tc->file = fopen(filename, "r+");
+    return tc->file != NULL;
+
+fail:
+    fclose(out);
+    remove(temp_filename);
+    tc->file = fopen(filename, "r+");
+    return 0;
+}
+
+static void rebuild_id_index(TableCache *tc) {
+    int i;
+
+    if (!tc->id_index) tc->id_index = bptree_create();
+    else bptree_clear(tc->id_index);
+    tc->next_auto_id = 1;
+
+    if (tc->pk_idx == -1) return;
+    for (i = 0; i < tc->record_count; i++) {
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        long id_value;
+
+        parse_csv_row(tc->records[i], fields, row_buf);
+        if (fields[tc->pk_idx] && parse_long_value(fields[tc->pk_idx], &id_value)) {
+            bptree_insert(tc->id_index, id_value, i);
+            if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
+        }
+    }
+}
+
+static int ensure_uk_indexes(TableCache *tc) {
+    int i;
+    for (i = 0; i < tc->uk_count; i++) {
+        if (!tc->uk_indexes[i]) {
+            tc->uk_indexes[i] = unique_index_create(tc->uk_indices[i]);
+            if (!tc->uk_indexes[i]) return 0;
+        }
+    }
+    return 1;
+}
+
+static int index_record_uks(TableCache *tc, int row_index) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    int i;
+
+    if (tc->uk_count == 0) return 1;
+    if (!ensure_uk_indexes(tc)) return 0;
+    parse_csv_row(tc->records[row_index], fields, row_buf);
+    for (i = 0; i < tc->uk_count; i++) {
+        char key[RECORD_SIZE];
+        int col_idx = tc->uk_indices[i];
+        int result;
+
+        normalize_value(fields[col_idx], key, sizeof(key));
+        if (strlen(key) == 0) continue;
+        result = unique_index_insert(tc, tc->uk_indexes[i], key, row_index);
+        if (result != 1) return 0;
+    }
+    return 1;
+}
+
+static int rebuild_uk_indexes(TableCache *tc) {
+    int i;
+
+    if (!ensure_uk_indexes(tc)) return 0;
+    for (i = 0; i < tc->uk_count; i++) unique_index_clear(tc->uk_indexes[i]);
+    for (i = 0; i < tc->record_count; i++) {
+        if (!index_record_uks(tc, i)) return 0;
+    }
+    return 1;
+}
+
+static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
+    char header[RECORD_SIZE];
+    char line[RECORD_SIZE];
+    long line_number = 1;
+
+    reset_table_cache(tc);
+    if (!tc->id_index) return 0;
+    strncpy(tc->table_name, name, sizeof(tc->table_name) - 1);
+    tc->file = f;
+    touch_table(tc);
+
     if (fgets(header, sizeof(header), f)) {
+        if ((unsigned char)header[0] == 0xEF &&
+            (unsigned char)header[1] == 0xBB &&
+            (unsigned char)header[2] == 0xBF) {
+            memmove(header, header + 3, strlen(header + 3) + 1);
+        }
         char *token = strtok(header, ",\r\n");
         int idx = 0;
+
         while (token && idx < MAX_COLS) {
             char *paren = strchr(token, '(');
             if (paren) {
                 int len = (int)(paren - token);
                 if (len >= (int)sizeof(tc->cols[idx].name)) len = (int)sizeof(tc->cols[idx].name) - 1;
-                strncpy(tc->cols[idx].name, token, len);
+                strncpy(tc->cols[idx].name, token, (size_t)len);
                 tc->cols[idx].name[len] = '\0';
+
                 if (strstr(paren, "(PK)")) {
                     tc->cols[idx].type = COL_PK;
                     tc->pk_idx = idx;
@@ -176,57 +526,50 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
             idx++;
         }
         tc->col_count = idx;
+        if (!ensure_uk_indexes(tc)) return 0;
     }
 
-    char line[1024];
     while (fgets(line, sizeof(line), f)) {
-        if (tc->record_count >= MAX_RECORDS) {
-            printf("[오류] 레코드 개수 초과: '%s'의 최대 레코드 수(%d)에 도달해 일부 데이터를 건너뜁니다.\n", name, MAX_RECORDS);
-            continue;
+        char *nl = strpbrk(line, "\r\n");
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        long id_value = 0;
+        size_t line_len = strlen(line);
+
+        line_number++;
+        if (!nl && line_len == sizeof(line) - 1 && !feof(f)) {
+            printf("[error] row too long while loading '%s' at line %ld (max %d bytes).\n",
+                   name, line_number, RECORD_SIZE - 1);
+            return 0;
         }
 
-        char buffer[1024];
-        char *fields[MAX_COLS] = {0};
-        parse_csv_row(line, fields, buffer);
-        long cp = (tc->pk_idx != -1 && fields[tc->pk_idx]) ? atol(fields[tc->pk_idx]) : 0;
-        char *nl = strpbrk(line, "\r\n");
         if (nl) *nl = '\0';
-        insert_pk_sorted(tc, cp, line);
-        tc->record_count++;
+        if (strlen(line) == 0) continue;
+        if (tc->record_count >= MAX_RECORDS) {
+            printf("[error] record limit exceeded while loading '%s' (max %d). Table was not loaded partially.\n",
+                   name, MAX_RECORDS);
+            return 0;
+        }
+
+        parse_csv_row(line, fields, row_buf);
+        if (tc->pk_idx != -1 && fields[tc->pk_idx] && !parse_long_value(fields[tc->pk_idx], &id_value)) {
+            printf("[error] invalid PK value while loading '%s': %s\n", name, fields[tc->pk_idx]);
+            return 0;
+        }
+        if (!append_record_memory(tc, line, id_value)) {
+            printf("[error] failed to load row into memory.\n");
+            return 0;
+        }
     }
     return 1;
 }
 
-/* PK 정렬 배열을 유지하며 새 레코드를 적절한 위치에 삽입합니다. */
-void insert_pk_sorted(TableCache *tc, long val, const char* row_str) {
-    if (tc->record_count >= MAX_RECORDS) {
-        return;
-    }
-
-    if (tc->pk_idx == -1) {
-        strncpy(tc->records[tc->record_count], row_str, 1023);
-        tc->records[tc->record_count][1023] = '\0';
-        return;
-    }
-    int i = tc->record_count - 1;
-    while (i >= 0 && tc->pk_index[i] > val) {
-        tc->pk_index[i + 1] = tc->pk_index[i];
-        strncpy(tc->records[i + 1], tc->records[i], 1023);
-        tc->records[i + 1][1023] = '\0';
-        i--;
-    }
-    tc->pk_index[i + 1] = val;
-    strncpy(tc->records[i + 1], row_str, 1023);
-    tc->records[i + 1][1023] = '\0';
-}
-
-/*
- * 캐시에 이미 열려 있으면 재사용하고,
- * 없으면 파일을 열어 로드합니다.
- * 캐시가 꽉 차면 LRU 정책으로 하나를 닫고 교체합니다.
- */
-TableCache* get_table(const char* name) {
+TableCache *get_table(const char *name) {
+    char filename[300];
+    FILE *f;
+    TableCache *tc;
     int i;
+
     for (i = 0; i < open_table_count; i++) {
         if (strcmp(open_tables[i].table_name, name) == 0) {
             touch_table(&open_tables[i]);
@@ -234,135 +577,194 @@ TableCache* get_table(const char* name) {
         }
     }
 
-    char filename[300];
     snprintf(filename, sizeof(filename), "%s.csv", name);
-    FILE *f = fopen(filename, "r+");
+    f = fopen(filename, "r+");
     if (!f) {
-        printf("[알림] '%s.csv' 파일을 열 수 없습니다.\n", name);
+        printf("[notice] '%s.csv' does not exist.\n", name);
         return NULL;
     }
 
-    TableCache *tc = NULL;
     if (open_table_count < MAX_TABLES) {
         tc = &open_tables[open_table_count++];
     } else {
         int evict_idx = find_lru_table_index();
         tc = &open_tables[evict_idx];
-        printf("[안내] LRU 정책으로 '%s'를 닫고 '%s'를 새로 엽니다.\n", tc->table_name, name);
-        if (tc->file) fclose(tc->file);
+        free_table_storage(tc);
     }
 
     if (!load_table_contents(tc, name, f)) {
-        if (open_table_count < MAX_TABLES) open_table_count--;
-        fclose(f);
+        free_table_storage(tc);
+        if (tc == &open_tables[open_table_count - 1]) open_table_count--;
         return NULL;
     }
     return tc;
 }
 
-/* INSERT: NN/PK/UK 제약을 검사한 뒤 레코드를 추가하고 파일을 갱신합니다. */
-void execute_insert(Statement *stmt) {
-    TableCache *tc = get_table(stmt->table_name);
-    if (!tc) return;
-
-    char buffer[1024];
-    char *vals[MAX_COLS] = {0};
-    parse_csv_row(stmt->row_data, vals, buffer);
-
-    int val_count = 0;
-    while (vals[val_count] && val_count < MAX_COLS) val_count++;
-
-    long new_id = 0;
+static int build_insert_row(TableCache *tc, char *vals[MAX_COLS], int val_count, long *id_value, char *new_line, size_t line_size) {
     int i;
-    int r;
-    char *endptr = NULL;
-
-    if (tc->record_count >= MAX_RECORDS) {
-        printf("[오류] INSERT 실패: 레코드 개수 초과(최대 %d건).\n", MAX_RECORDS);
-        return;
-    }
-    for (i = 0; i < tc->col_count; i++) {
-        char *val = (i < val_count && vals[i]) ? vals[i] : "";
-        char normalized_val[256];
-        strncpy(normalized_val, val, sizeof(normalized_val) - 1);
-        normalized_val[sizeof(normalized_val) - 1] = '\0';
-        trim_and_unquote(normalized_val);
-
-        if (tc->cols[i].type == COL_NN && strlen(normalized_val) == 0) {
-            printf("[오류] INSERT 실패: '%s' 컬럼은 NN 제약을 위반했습니다.\n", tc->cols[i].name);
-            return;
-        }
-
-        if (i == tc->pk_idx) {
-            if (strlen(normalized_val) == 0) {
-                printf("[오류] INSERT 실패: PK 컬럼 '%s' 값이 비어 있습니다.\n", tc->cols[i].name);
-                return;
-            }
-            new_id = strtol(normalized_val, &endptr, 10);
-            if (endptr == normalized_val || *endptr != '\0') {
-                printf("[오류] INSERT 실패: PK 컬럼 '%s'은(는) 정수값이어야 합니다.\n", tc->cols[i].name);
-                return;
-            }
-            if (find_in_pk_index(tc, new_id) != -1) {
-                printf("[오류] INSERT 실패: PK 중복 값(%ld)이 이미 존재합니다.\n", new_id);
-                return;
-            }
-        }
-
-        if (tc->cols[i].type == COL_UK && strlen(normalized_val) > 0) {
-            for (r = 0; r < tc->record_count; r++) {
-                char row_buf[1024];
-                char *f[MAX_COLS] = {0};
-                parse_csv_row(tc->records[r], f, row_buf);
-                if (compare_value(f[i], normalized_val)) {
-                    printf("[오류] INSERT 실패: '%s'는 UK 제약을 위반합니다.\n", normalized_val);
-                    return;
-                }
-            }
-        }
-    }
-
-    char new_line[1024] = "";
     size_t offset = 0;
-    for (i = 0; i < tc->col_count; i++) {
-        const char *v = (i < val_count && vals[i]) ? vals[i] : ((tc->cols[i].type == COL_NN) ? "" : "NULL");
-        char normalized_storage_val[1024];
-        char formatted_val[1024];
-        strncpy(normalized_storage_val, v, sizeof(normalized_storage_val) - 1);
-        normalized_storage_val[sizeof(normalized_storage_val) - 1] = '\0';
-        trim_and_unquote(normalized_storage_val);
-        if (strchr(normalized_storage_val, ',')) {
-            snprintf(formatted_val, sizeof(formatted_val), "'%.*s'", (int)(sizeof(formatted_val) - 3), normalized_storage_val);
-            v = formatted_val;
-        } else {
-            v = normalized_storage_val;
+    int has_auto_id = 0;
+
+    *id_value = 0;
+    if (val_count > tc->col_count) {
+        printf("[error] INSERT failed: too many values for table '%s'.\n", tc->table_name);
+        return 0;
+    }
+    if (tc->pk_idx != -1) {
+        char *pk_val = (tc->pk_idx < val_count) ? vals[tc->pk_idx] : NULL;
+        if (val_count == tc->col_count - 1 && tc->pk_idx == 0) has_auto_id = 1;
+        if (!pk_val || strlen(pk_val) == 0 || compare_value(pk_val, "NULL")) has_auto_id = 1;
+
+        if (has_auto_id) *id_value = tc->next_auto_id;
+        else if (!parse_long_value(pk_val, id_value)) {
+            printf("[error] INSERT failed: PK column '%s' must be an integer.\n", tc->cols[tc->pk_idx].name);
+            return 0;
         }
-        int w = snprintf(new_line + offset, sizeof(new_line) - offset, "%s%s", v, (i < tc->col_count - 1) ? "," : "");
-        if (w < 0 || (size_t)w >= sizeof(new_line) - offset) break;
-        offset += w;
+
+        if (bptree_search(tc->id_index, *id_value, NULL)) {
+            printf("[error] INSERT failed: duplicate PK value %ld.\n", *id_value);
+            return 0;
+        }
     }
 
-    insert_pk_sorted(tc, new_id, new_line);
-    tc->record_count++;
-    rewrite_file(tc);
-    printf("[완료] INSERT 처리했습니다.\n");
+    for (i = 0; i < tc->col_count; i++) {
+        const char *source;
+        char normalized[RECORD_SIZE];
+        char formatted[RECORD_SIZE];
+        int source_index = i;
+        int w;
+
+        if (has_auto_id && i == tc->pk_idx) {
+            snprintf(normalized, sizeof(normalized), "%ld", *id_value);
+            source = normalized;
+        } else {
+            if (has_auto_id && tc->pk_idx == 0) source_index = i - 1;
+            source = (source_index >= 0 && source_index < val_count && vals[source_index]) ? vals[source_index] : "";
+            strncpy(normalized, source, sizeof(normalized) - 1);
+            normalized[sizeof(normalized) - 1] = '\0';
+            trim_and_unquote(normalized);
+            source = normalized;
+        }
+
+        if (tc->cols[i].type == COL_NN && strlen(source) == 0) {
+            printf("[error] INSERT failed: column '%s' violates NN constraint.\n", tc->cols[i].name);
+            return 0;
+        }
+        if (i == tc->pk_idx && strlen(source) == 0) {
+            printf("[error] INSERT failed: PK column '%s' is empty.\n", tc->cols[i].name);
+            return 0;
+        }
+        if (tc->cols[i].type == COL_UK && strlen(source) > 0) {
+            int uk_slot = get_uk_slot(tc, i);
+            if (uk_slot == -1 || !ensure_uk_indexes(tc)) {
+                printf("[error] INSERT failed: UK index is not available.\n");
+                return 0;
+            }
+            if (unique_index_find(tc, tc->uk_indexes[uk_slot], source, NULL)) {
+                printf("[error] INSERT failed: '%s' violates UK constraint.\n", source);
+                return 0;
+            }
+        }
+
+        if (strchr(source, ',')) {
+            snprintf(formatted, sizeof(formatted), "'%.*s'", (int)(sizeof(formatted) - 3), source);
+            source = formatted;
+        }
+        w = snprintf(new_line + offset, line_size - offset, "%s%s", source, (i < tc->col_count - 1) ? "," : "");
+        if (w < 0 || (size_t)w >= line_size - offset) {
+            printf("[error] INSERT failed: row is too long.\n");
+            return 0;
+        }
+        offset += (size_t)w;
+    }
+    return 1;
 }
 
-/* SELECT: where 조건이 있으면 조건 행만, 없으면 전부 출력합니다. */
+static int append_csv_field(char *row, size_t row_size, size_t *offset, const char *value, int is_last) {
+    char formatted[RECORD_SIZE];
+    const char *source = value ? value : "";
+    int w;
+
+    if (strchr(source, ',')) {
+        snprintf(formatted, sizeof(formatted), "'%.*s'", (int)(sizeof(formatted) - 3), source);
+        source = formatted;
+    }
+    w = snprintf(row + *offset, row_size - *offset, "%s%s", source, is_last ? "" : ",");
+    if (w < 0 || (size_t)w >= row_size - *offset) return 0;
+    *offset += (size_t)w;
+    return 1;
+}
+
+static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, long *inserted_id) {
+    char buffer[RECORD_SIZE];
+    char *vals[MAX_COLS] = {0};
+    char new_line[RECORD_SIZE] = "";
+    int val_count = 0;
+    long id_value = 0;
+
+    if (!tc) return 0;
+    parse_csv_row(row_data, vals, buffer);
+    while (val_count < MAX_COLS && vals[val_count]) val_count++;
+
+    if (tc->record_count >= MAX_RECORDS) {
+        printf("[error] INSERT failed: record limit exceeded (max %d).\n", MAX_RECORDS);
+        return 0;
+    }
+    if (!build_insert_row(tc, vals, val_count, &id_value, new_line, sizeof(new_line))) return 0;
+    if (!append_record_memory(tc, new_line, id_value)) {
+        printf("[error] INSERT failed: could not update B+ tree index or memory store.\n");
+        return 0;
+    }
+    if (!append_record_file(tc, new_line, flush_now)) {
+        rollback_last_record_memory(tc);
+        printf("[error] INSERT failed: could not append to table file.\n");
+        return 0;
+    }
+    if (inserted_id) *inserted_id = id_value;
+    return 1;
+}
+
+void execute_insert(Statement *stmt) {
+    TableCache *tc = get_table(stmt->table_name);
+    long id_value = 0;
+
+    if (!tc) return;
+    if (!insert_row_data(tc, stmt->row_data, 1, &id_value)) return;
+    printf("[ok] INSERT completed. id=%ld\n", id_value);
+}
+
+static void print_selected_row(const char *row, int select_idx[MAX_COLS], int select_count, int select_all) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    int j;
+
+    if (select_all) {
+        printf("%s\n", row);
+        return;
+    }
+    parse_csv_row(row, fields, row_buf);
+    for (j = 0; j < select_count; j++) {
+        if (j > 0) printf(",");
+        printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
+    }
+    printf("\n");
+}
+
 void execute_select(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
-    if (!tc) return;
-
-    int where_idx = get_col_idx(tc, stmt->where_col);
+    int where_idx;
     int select_idx[MAX_COLS];
     int select_count = 0;
     int i;
+
+    if (!tc) return;
+    where_idx = get_col_idx(tc, stmt->where_col);
 
     if (!stmt->select_all) {
         for (i = 0; i < stmt->select_col_count; i++) {
             int idx = get_col_idx(tc, stmt->select_cols[i]);
             if (idx == -1) {
-                printf("[오류] SELECT 실패: 존재하지 않는 컬럼 '%s'.\n", stmt->select_cols[i]);
+                printf("[error] SELECT failed: unknown column '%s'.\n", stmt->select_cols[i]);
                 return;
             }
             select_idx[i] = idx;
@@ -371,70 +773,76 @@ void execute_select(Statement *stmt) {
     }
 
     printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
+    if (where_idx == tc->pk_idx && where_idx != -1) {
+        long key;
+        int row_index;
+        if (!parse_long_value(stmt->where_val, &key)) {
+            printf("[error] SELECT failed: id condition must be an integer.\n");
+            return;
+        }
+        printf("[index] B+ tree id lookup\n");
+        if (bptree_search(tc->id_index, key, &row_index)) {
+            print_selected_row(tc->records[row_index], select_idx, select_count, stmt->select_all);
+        }
+        return;
+    }
+
+    if (where_idx != -1) printf("[scan] linear scan on column '%s'\n", stmt->where_col);
     for (i = 0; i < tc->record_count; i++) {
-        char row_buf[1024];
-        char *fields[MAX_COLS] = {0};
-        parse_csv_row(tc->records[i], fields, row_buf);
-
         if (where_idx != -1) {
-            if (compare_value(fields[where_idx], stmt->where_val)) {
-                if (stmt->select_all) {
-                    printf("%s\n", tc->records[i]);
-                } else {
-                    int j;
-                    for (j = 0; j < select_count; j++) {
-                        if (j > 0) printf(",");
-                        printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
-                    }
-                    printf("\n");
-                }
-            }
-            continue;
+            char row_buf[RECORD_SIZE];
+            char *fields[MAX_COLS] = {0};
+            parse_csv_row(tc->records[i], fields, row_buf);
+            if (!compare_value(fields[where_idx], stmt->where_val)) continue;
         }
-
-        if (stmt->select_all) {
-            printf("%s\n", tc->records[i]);
-        } else {
-            int j;
-            for (j = 0; j < select_count; j++) {
-                if (j > 0) printf(",");
-                printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
-            }
-            printf("\n");
-        }
+        print_selected_row(tc->records[i], select_idx, select_count, stmt->select_all);
     }
 }
 
-/* UPDATE: where 조건 대상 행을 찾아 set 컬럼을 변경합니다. */
 void execute_update(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
-    if (!tc) return;
-
-    int where_idx = get_col_idx(tc, stmt->where_col);
-    int set_idx = get_col_idx(tc, stmt->set_col);
-    if (where_idx == -1 || set_idx == -1) {
-        printf("[오류] WHERE 조건을 해석할 수 없습니다.\n");
-        return;
-    }
-
-    if (set_idx == tc->pk_idx) {
-        printf("[오류] PK(기본키) 컬럼은 UPDATE에서 변경할 수 없습니다.\n");
-        return;
-    }
-
-    trim_and_unquote(stmt->set_val);
-    if (tc->cols[set_idx].type == COL_NN && strlen(stmt->set_val) == 0) {
-        printf("[오류] UPDATE 실패: '%s'는 NN 제약을 위반했습니다.\n", tc->cols[set_idx].name);
-        return;
-    }
-
-    int match_flags[MAX_RECORDS] = {0};
+    int where_idx;
+    int set_idx;
+    char set_value[256];
+    int *match_flags;
+    char **old_records;
     int target_count = 0;
     int i;
-    int r;
-    int j;
+
+    if (!tc) return;
+    where_idx = get_col_idx(tc, stmt->where_col);
+    set_idx = get_col_idx(tc, stmt->set_col);
+    if (where_idx == -1 || set_idx == -1) {
+        printf("[error] UPDATE failed: WHERE or SET column does not exist.\n");
+        return;
+    }
+    if (set_idx == tc->pk_idx) {
+        printf("[error] UPDATE failed: PK column cannot be changed.\n");
+        return;
+    }
+
+    strncpy(set_value, stmt->set_val, sizeof(set_value) - 1);
+    set_value[sizeof(set_value) - 1] = '\0';
+    trim_and_unquote(set_value);
+    if (tc->cols[set_idx].type == COL_NN && strlen(set_value) == 0) {
+        printf("[error] UPDATE failed: column '%s' violates NN constraint.\n", tc->cols[set_idx].name);
+        return;
+    }
+
+    match_flags = (int *)calloc((size_t)tc->record_count, sizeof(int));
+    if (!match_flags) {
+        printf("[error] UPDATE failed: out of memory.\n");
+        return;
+    }
+    old_records = (char **)calloc((size_t)tc->record_count, sizeof(char *));
+    if (!old_records) {
+        printf("[error] UPDATE failed: out of memory.\n");
+        free(match_flags);
+        return;
+    }
+
     for (i = 0; i < tc->record_count; i++) {
-        char row_buf[1024];
+        char row_buf[RECORD_SIZE];
         char *f[MAX_COLS] = {0};
         parse_csv_row(tc->records[i], f, row_buf);
         if (compare_value(f[where_idx], stmt->where_val)) {
@@ -442,95 +850,282 @@ void execute_update(Statement *stmt) {
             target_count++;
         }
     }
-
-    if (tc->cols[set_idx].type == COL_UK) {
-        if (target_count > 1) {
-            printf("[오류] UPDATE 실패: WHERE 조건이 여러 행을 가리켜 UK 제약이 깨집니다.\n");
-            return;
-        }
-        for (r = 0; r < tc->record_count; r++) {
-            if (match_flags[r]) continue;
-            char row_buf[1024];
-            char *f[MAX_COLS] = {0};
-            parse_csv_row(tc->records[r], f, row_buf);
-            if (compare_value(f[set_idx], stmt->set_val)) {
-                printf("[오류] UPDATE 실패: '%s'는 UK 제약 위반 값입니다.\n", stmt->set_val);
-                return;
-            }
-        }
-    }
-
-    int count = 0;
-    for (i = 0; i < tc->record_count; i++) {
-        if (!match_flags[i]) continue;
-        char row_buf[1024];
-        char *fields[MAX_COLS] = {0};
-        parse_csv_row(tc->records[i], fields, row_buf);
-
-        char new_row[1024] = "";
-        size_t offset = 0;
-        for (j = 0; j < tc->col_count; j++) {
-            const char *val = (j == set_idx) ? stmt->set_val : (fields[j] ? fields[j] : "");
-            int w = snprintf(new_row + offset, sizeof(new_row) - offset, "%s%s", val, (j < tc->col_count - 1) ? "," : "");
-            if (w < 0 || (size_t)w >= sizeof(new_row) - offset) break;
-            offset += w;
-        }
-        strncpy(tc->records[i], new_row, 1023);
-        tc->records[i][1023] = '\0';
-        count++;
-    }
-
-    if (count > 0) {
-        rewrite_file(tc);
-        printf("[완료] %d개의 행이 수정되었습니다.\n", count);
-    } else {
-        printf("[알림] 조건에 맞는 행이 없습니다.\n");
-    }
-}
-
-/* DELETE: where 조건을 만족하는 행을 삭제합니다. */
-void execute_delete(Statement *stmt) {
-    TableCache *tc = get_table(stmt->table_name);
-    if (!tc) return;
-
-    int where_idx = get_col_idx(tc, stmt->where_col);
-    if (where_idx == -1) {
-        printf("[오류] WHERE 조건을 해석할 수 없습니다.\n");
+    if (target_count == 0) {
+        free(old_records);
+        free(match_flags);
+        printf("[notice] no rows matched UPDATE condition.\n");
         return;
     }
 
-    int count = 0;
-    int i;
-    int j;
-    for (i = 0; i < tc->record_count; i++) {
-        char row_buf[1024];
-        char *fields[MAX_COLS] = {0};
-        parse_csv_row(tc->records[i], fields, row_buf);
-        if (compare_value(fields[where_idx], stmt->where_val)) {
-            for (j = i; j < tc->record_count - 1; j++) {
-                tc->pk_index[j] = tc->pk_index[j + 1];
-                strncpy(tc->records[j], tc->records[j + 1], 1023);
-                tc->records[j][1023] = '\0';
-            }
-            tc->record_count--;
-            count++;
-            i--;
+    if (tc->cols[set_idx].type == COL_UK) {
+        int found_row = -1;
+        int uk_slot = get_uk_slot(tc, set_idx);
+        if (target_count > 1) {
+            printf("[error] UPDATE failed: multiple rows would share one UK value.\n");
+            free(old_records);
+            free(match_flags);
+            return;
+        }
+        if (uk_slot == -1 || !ensure_uk_indexes(tc)) {
+            printf("[error] UPDATE failed: UK index is not available.\n");
+            free(old_records);
+            free(match_flags);
+            return;
+        }
+        if (strlen(set_value) > 0 &&
+            unique_index_find(tc, tc->uk_indexes[uk_slot], set_value, &found_row) &&
+            (found_row < 0 || !match_flags[found_row])) {
+            printf("[error] UPDATE failed: '%s' violates UK constraint.\n", set_value);
+            free(old_records);
+            free(match_flags);
+            return;
         }
     }
 
+    int count = 0;
+    for (i = 0; i < tc->record_count; i++) {
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        char new_row[RECORD_SIZE] = "";
+        size_t offset = 0;
+        int j;
+
+        if (!match_flags[i]) continue;
+        parse_csv_row(tc->records[i], fields, row_buf);
+        for (j = 0; j < tc->col_count; j++) {
+            const char *val = (j == set_idx) ? set_value : (fields[j] ? fields[j] : "");
+            if (!append_csv_field(new_row, sizeof(new_row), &offset, val, j == tc->col_count - 1)) break;
+        }
+        if (j != tc->col_count) {
+            printf("[error] UPDATE failed: rebuilt row is too long.\n");
+            free(old_records);
+            free(match_flags);
+            return;
+        }
+        char *new_copy = dup_string(new_row);
+        if (!new_copy) {
+            printf("[error] UPDATE failed: out of memory.\n");
+            free(old_records);
+            free(match_flags);
+            return;
+        }
+        old_records[i] = tc->records[i];
+        tc->records[i] = new_copy;
+        count++;
+    }
+
+    free(match_flags);
     if (count > 0) {
-        rewrite_file(tc);
-        printf("[완료] %d개의 행이 삭제되었습니다.\n", count);
+        if (!rewrite_file(tc)) {
+            for (i = 0; i < tc->record_count; i++) {
+                if (old_records[i]) {
+                    free(tc->records[i]);
+                    tc->records[i] = old_records[i];
+                    old_records[i] = NULL;
+                }
+            }
+            free(old_records);
+            printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
+            return;
+        }
+        for (i = 0; i < tc->record_count; i++) free(old_records[i]);
+        free(old_records);
+        if (!rebuild_uk_indexes(tc)) {
+            printf("[error] UPDATE warning: UK index rebuild failed.\n");
+            return;
+        }
+        printf("[ok] UPDATE completed. rows=%d\n", count);
     } else {
-        printf("[알림] 삭제할 행이 없습니다.\n");
+        free(old_records);
+        printf("[notice] no rows matched UPDATE condition.\n");
     }
 }
 
-/* 프로그램 종료 시 열려 있는 테이블 파일 핸들을 닫습니다. */
+void execute_delete(Statement *stmt) {
+    TableCache *tc = get_table(stmt->table_name);
+    int where_idx;
+    int count = 0;
+    int read_idx;
+    int write_idx = 0;
+    int old_count;
+    char **old_records;
+    int *delete_flags;
+
+    if (!tc) return;
+    where_idx = get_col_idx(tc, stmt->where_col);
+    if (where_idx == -1) {
+        printf("[error] DELETE failed: WHERE column does not exist.\n");
+        return;
+    }
+
+    old_count = tc->record_count;
+    if (old_count == 0) {
+        printf("[notice] no rows matched DELETE condition.\n");
+        return;
+    }
+    old_records = (char **)malloc((size_t)old_count * sizeof(char *));
+    delete_flags = (int *)calloc((size_t)old_count, sizeof(int));
+    if (!old_records || !delete_flags) {
+        free(old_records);
+        free(delete_flags);
+        printf("[error] DELETE failed: out of memory.\n");
+        return;
+    }
+    memcpy(old_records, tc->records, (size_t)old_count * sizeof(char *));
+
+    for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        int matched;
+
+        parse_csv_row(tc->records[read_idx], fields, row_buf);
+        matched = compare_value(fields[where_idx], stmt->where_val);
+        if (matched) {
+            delete_flags[read_idx] = 1;
+            count++;
+            continue;
+        }
+        tc->records[write_idx++] = tc->records[read_idx];
+    }
+    tc->record_count = write_idx;
+
+    if (count > 0) {
+        rebuild_id_index(tc);
+        if (!rewrite_file(tc)) {
+            memcpy(tc->records, old_records, (size_t)old_count * sizeof(char *));
+            tc->record_count = old_count;
+            rebuild_id_index(tc);
+            free(old_records);
+            free(delete_flags);
+            printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
+            return;
+        }
+        for (read_idx = 0; read_idx < old_count; read_idx++) {
+            if (delete_flags[read_idx]) free(old_records[read_idx]);
+        }
+        if (!rebuild_uk_indexes(tc)) {
+            free(old_records);
+            free(delete_flags);
+            printf("[error] DELETE warning: UK index rebuild failed.\n");
+            return;
+        }
+        free(old_records);
+        free(delete_flags);
+        printf("[ok] DELETE completed. rows=%d\n", count);
+    } else {
+        free(old_records);
+        free(delete_flags);
+        printf("[notice] no rows matched DELETE condition.\n");
+    }
+}
+
+static double current_seconds(void) {
+#if defined(_WIN32)
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    if (frequency.QuadPart == 0) QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    return (double)clock() / CLOCKS_PER_SEC;
+#endif
+}
+
+void run_bplus_benchmark(int record_count) {
+    FILE *f;
+    TableCache *tc;
+    const char *table_name = "bptree_benchmark_users";
+    int i;
+    int index_query_count = 100000;
+    int linear_query_count = 30;
+    int found = 0;
+    double start;
+    double end;
+    double indexed_time;
+    double linear_time;
+
+    if (record_count < 1000000) record_count = 1000000;
+    if (record_count > MAX_RECORDS) {
+        printf("[notice] benchmark record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
+        record_count = MAX_RECORDS;
+    }
+
+    close_all_tables();
+    open_table_count = 0;
+
+    f = fopen("bptree_benchmark_users.csv", "w");
+    if (!f) {
+        printf("[error] benchmark table file could not be created.\n");
+        return;
+    }
+    if (fprintf(f, "id(PK),email(UK),payload(NN),name\n") < 0 || fclose(f) != 0) {
+        printf("[error] benchmark table header could not be written.\n");
+        return;
+    }
+
+    tc = get_table(table_name);
+    if (!tc) return;
+
+    start = current_seconds();
+    for (i = 1; i <= record_count; i++) {
+        char row_data[128];
+        snprintf(row_data, sizeof(row_data), "user%d@test.com,payload%d,User%d", i, i, i);
+        if (!insert_row_data(tc, row_data, 0, NULL)) {
+            printf("[error] benchmark insert failed at row %d.\n", i);
+            return;
+        }
+    }
+    if (fflush(tc->file) != 0 || ferror(tc->file)) {
+        printf("[error] benchmark insert flush failed.\n");
+        return;
+    }
+    end = current_seconds();
+
+    printf("\n--- [B+ TREE BENCHMARK] ---\n");
+    printf("inserted records through INSERT path: %d (%.6f sec)\n", record_count, end - start);
+
+    start = current_seconds();
+    for (i = 0; i < index_query_count; i++) {
+        long key = (long)((i * 7919) % record_count) + 1;
+        int row_index;
+        if (bptree_search(tc->id_index, key, &row_index)) found += row_index >= 0;
+    }
+    end = current_seconds();
+    indexed_time = end - start;
+
+    start = current_seconds();
+    for (i = 0; i < linear_query_count; i++) {
+        char target[64];
+        int r;
+        snprintf(target, sizeof(target), "User%d", ((i * 7919) % record_count) + 1);
+        for (r = 0; r < tc->record_count; r++) {
+            char row_buf[RECORD_SIZE];
+            char *fields[MAX_COLS] = {0};
+            parse_csv_row(tc->records[r], fields, row_buf);
+            if (compare_value(fields[3], target)) {
+                found++;
+                break;
+            }
+        }
+    }
+    end = current_seconds();
+    linear_time = end - start;
+
+    printf("records: %d\n", record_count);
+    printf("id SELECT using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
+           indexed_time, index_query_count, indexed_time / index_query_count);
+    printf("name SELECT using linear scan: %.6f sec total (%d queries, %.9f sec/query)\n",
+           linear_time, linear_query_count, linear_time / linear_query_count);
+    if (indexed_time > 0.0) {
+        double index_avg = indexed_time / index_query_count;
+        double linear_avg = linear_time / linear_query_count;
+        printf("linear/index average speed ratio: %.2fx\n", linear_avg / index_avg);
+    }
+    printf("matched checks: %d\n", found);
+}
+
 void close_all_tables(void) {
     int i;
-    for (i = 0; i < open_table_count; i++) {
-        if (open_tables[i].file) fclose(open_tables[i].file);
-    }
+    for (i = 0; i < open_table_count; i++) free_table_storage(&open_tables[i]);
+    open_table_count = 0;
 }
-
