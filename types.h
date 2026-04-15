@@ -11,6 +11,7 @@
 #define MAX_UKS 5
 #define MAX_SQL_LEN 4096
 #define DELTA_COMPACT_BYTES (64 * 1024 * 1024)
+#define DELTA_COMPACT_CHECK_INTERVAL 4096
 
 /* 실행할 Statement 종류입니다. */
 typedef enum {
@@ -65,6 +66,7 @@ typedef struct {
     char table_name[256];         /* users 형태 이름 */
     FILE *file;                   /* 현재 열려 있는 CSV 파일 포인터 */
     FILE *delta_file;             /* append-only delta log writer */
+    int delta_ops_since_compact_check; /* delta compaction 크기 확인 주기 */
     ColumnInfo cols[MAX_COLS];    /* 헤더 파싱 결과 */
     int col_count;                /* 컬럼 개수 */
     int pk_idx;                   /* PK 컬럼 인덱스, 없으면 -1 */

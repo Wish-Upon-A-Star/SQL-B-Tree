@@ -44,15 +44,21 @@ int main(int argc, char *argv[]) {
     configure_console_encoding();
 
     char filename[256];
+    int argi = 1;
 
-    if (argc >= 2 && strcmp(argv[1], "--benchmark") == 0) {
-        int count = (argc >= 3) ? atoi(argv[2]) : 1000000;
+    if (argi < argc && strcmp(argv[argi], "--quiet") == 0) {
+        set_executor_quiet(1);
+        argi++;
+    }
+
+    if (argi < argc && strcmp(argv[argi], "--benchmark") == 0) {
+        int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
         run_bplus_benchmark(count);
         return 0;
     }
 
-    if (argc >= 2) {
-        strncpy(filename, argv[1], 255);
+    if (argi < argc) {
+        strncpy(filename, argv[argi], 255);
         filename[255] = '\0';
     } else {
         printf("입력 SQL 파일 경로: ");

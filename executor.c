@@ -15,6 +15,13 @@
 TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
 static unsigned long long g_table_access_seq = 0;
+static int g_executor_quiet = 0;
+
+#define INFO_PRINTF(...) do { if (!g_executor_quiet) printf(__VA_ARGS__); } while (0)
+
+void set_executor_quiet(int quiet) {
+    g_executor_quiet = quiet ? 1 : 0;
+}
 
 void parse_csv_row(const char *row, char *fields[MAX_COLS], char *buffer);
 static void normalize_value(const char *src, char *dest, size_t dest_size);
@@ -26,6 +33,7 @@ static int ensure_uk_indexes(TableCache *tc);
 static void rollback_updated_records(TableCache *tc, char **old_records);
 static int remove_record_indexes(TableCache *tc, const char *row);
 static int restore_record_indexes(TableCache *tc, int slot_id);
+static int append_csv_field(char *row, size_t row_size, size_t *offset, const char *value, int is_last);
 static int parse_long_value(const char *value, long *out);
 static int slot_is_active(TableCache *tc, int slot_id);
 static char *slot_row(TableCache *tc, int slot_id);
@@ -418,6 +426,7 @@ static void free_table_storage(TableCache *tc) {
         fclose(tc->delta_file);
         tc->delta_file = NULL;
     }
+    tc->delta_ops_since_compact_check = 0;
     for (i = 0; i < tc->record_count; i++) free(tc->records[i]);
     free(tc->records);
     free(tc->record_active);
@@ -617,6 +626,7 @@ static int clear_delta_log(TableCache *tc) {
     }
     get_delta_filename(tc, filename, sizeof(filename));
     remove(filename);
+    tc->delta_ops_since_compact_check = 0;
     return 1;
 }
 
@@ -653,9 +663,12 @@ static int maybe_compact_delta_log(TableCache *tc) {
     long size;
 
     if (!tc || tc->cache_truncated || tc->pk_idx == -1) return 1;
+    tc->delta_ops_since_compact_check++;
+    if (tc->delta_ops_since_compact_check < DELTA_COMPACT_CHECK_INTERVAL) return 1;
+    tc->delta_ops_since_compact_check = 0;
     size = delta_log_size(tc);
     if (size < DELTA_COMPACT_BYTES) return 1;
-    printf("[delta] compacting %ld-byte delta log into CSV.\n", size);
+    INFO_PRINTF("[delta] compacting %ld-byte delta log into CSV.\n", size);
     return rewrite_file(tc);
 }
 
@@ -815,7 +828,7 @@ static int replay_delta_log(TableCache *tc) {
     free_delta_ops(ops, count);
     fclose(f);
     if (applied_batches > 0) {
-        printf("[notice] replayed %d committed delta batch(es) for table '%s'.\n",
+        INFO_PRINTF("[notice] replayed %d committed delta batch(es) for table '%s'.\n",
                applied_batches, tc->table_name);
     }
     return 1;
@@ -842,6 +855,18 @@ static int append_delta_updates(TableCache *tc, char **old_records) {
 
 fail:
     return 0;
+}
+
+static int append_delta_update_one(TableCache *tc, const char *new_record) {
+    FILE *f;
+    long id_value;
+
+    if (!tc || tc->pk_idx == -1 || !new_record) return 0;
+    if (!get_row_pk_value(tc, new_record, &id_value)) return 0;
+    f = get_delta_writer(tc);
+    if (!f) return 0;
+    if (fprintf(f, "B\nU\t%ld\t%s\nE\n", id_value, new_record) < 0) return 0;
+    return ferror(f) ? 0 : 1;
 }
 
 static int append_delta_deletes(TableCache *tc, char **old_records, int *delete_flags, int old_count) {
@@ -1047,6 +1072,23 @@ static int remove_record_single_uk(TableCache *tc, const char *row, int col_idx)
     uk_slot = get_uk_slot(tc, col_idx);
     if (uk_slot == -1) return 0;
     return bptree_string_delete(tc->uk_indexes[uk_slot]->tree, key);
+}
+
+static int build_updated_row(TableCache *tc, const char *row, int set_idx,
+                             const char *set_value, char *new_row, size_t new_row_size) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    size_t offset = 0;
+    int j;
+
+    if (!tc || !row || !new_row || new_row_size == 0) return 0;
+    new_row[0] = '\0';
+    parse_csv_row(row, fields, row_buf);
+    for (j = 0; j < tc->col_count; j++) {
+        const char *val = (j == set_idx) ? set_value : (fields[j] ? fields[j] : "");
+        if (!append_csv_field(new_row, new_row_size, &offset, val, j == tc->col_count - 1)) return 0;
+    }
+    return 1;
 }
 
 static int remove_record_indexes(TableCache *tc, const char *row) {
@@ -1257,7 +1299,7 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
     }
     if (file_next_auto_id > tc->next_auto_id) tc->next_auto_id = file_next_auto_id;
     if (tc->cache_truncated) {
-        printf("[notice] table '%s' exceeded memory cache limit (%d rows). Extra rows stay on disk; PK equality can use tail offset index, other predicates scan the tail.\n",
+        INFO_PRINTF("[notice] table '%s' exceeded memory cache limit (%d rows). Extra rows stay on disk; PK equality can use tail offset index, other predicates scan the tail.\n",
                name, MAX_RECORDS);
     }
     return 1;
@@ -1495,7 +1537,7 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
         }
         tc->cache_truncated = 1;
         if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
-        printf("[notice] INSERT appended to CSV only; memory cache limit is %d rows, so later lookup may use slower file scan.\n",
+        INFO_PRINTF("[notice] INSERT appended to CSV only; memory cache limit is %d rows, so later lookup may use slower file scan.\n",
                MAX_RECORDS);
     }
     if (inserted_id) *inserted_id = id_value;
@@ -1508,7 +1550,7 @@ void execute_insert(Statement *stmt) {
 
     if (!tc) return;
     if (!insert_row_data(tc, stmt->row_data, 0, &id_value)) return;
-    printf("[ok] INSERT completed. id=%ld\n", id_value);
+    INFO_PRINTF("[ok] INSERT completed. id=%ld\n", id_value);
 }
 
 static void print_selected_row(const char *row, int select_idx[MAX_COLS], int select_count, int select_all) {
@@ -1633,7 +1675,7 @@ static int print_tail_pk_offset_row(TableCache *tc, long offset, long key,
         fseek(tc->file, 0, SEEK_END);
         return 0;
     }
-    printf("[index] tail PK offset lookup\n");
+    INFO_PRINTF("[index] tail PK offset lookup\n");
     print_selected_row(line, select_idx, select_count, select_all);
     fseek(tc->file, 0, SEEK_END);
     return 1;
@@ -1787,7 +1829,7 @@ void execute_select(Statement *stmt) {
                 printf("[error] SELECT failed: BETWEEN bounds must be integers for PK range search.\n");
                 return;
             }
-            printf("[index] B+ tree id range lookup\n");
+            INFO_PRINTF("[index] B+ tree id range lookup\n");
             if (!bptree_range_search(tc->id_index, start_key, end_key, print_range_row_visitor, &range_ctx)) {
                 printf("[error] SELECT failed: B+ tree range scan failed.\n");
                 return;
@@ -1810,7 +1852,7 @@ void execute_select(Statement *stmt) {
             }
             normalize_value(stmt->where_val, start_text, sizeof(start_text));
             normalize_value(stmt->where_end_val, end_text, sizeof(end_text));
-            printf("[index] UK B+ tree range lookup on column '%s'\n", stmt->where_col);
+            INFO_PRINTF("[index] UK B+ tree range lookup on column '%s'\n", stmt->where_col);
             if (!bptree_string_range_search(tc->uk_indexes[uk_slot]->tree, start_text, end_text,
                                             print_string_range_row_visitor, &range_ctx)) {
                 printf("[error] SELECT failed: UK B+ tree range scan failed.\n");
@@ -1834,7 +1876,7 @@ void execute_select(Statement *stmt) {
             printf("[error] SELECT failed: id condition must be an integer.\n");
             return;
         }
-        printf("[index] B+ tree id lookup\n");
+        INFO_PRINTF("[index] B+ tree id lookup\n");
         if (bptree_search(tc->id_index, key, &row_index)) {
             char *row = slot_row(tc, row_index);
             if (row) print_selected_row(row, select_idx, select_count, stmt->select_all);
@@ -1854,7 +1896,7 @@ void execute_select(Statement *stmt) {
 
     if (where_idx != -1 && tc->cols[where_idx].type == COL_UK) {
         int row_index;
-        printf("[index] UK B+ tree lookup on column '%s'\n", stmt->where_col);
+        INFO_PRINTF("[index] UK B+ tree lookup on column '%s'\n", stmt->where_col);
         if (find_uk_row(tc, where_idx, stmt->where_val, &row_index)) {
             char *row = slot_row(tc, row_index);
             if (row) print_selected_row(row, select_idx, select_count, stmt->select_all);
@@ -1916,7 +1958,7 @@ static int rewrite_truncated_update(TableCache *tc, int where_idx, const char *w
         }
     }
     if (target_count == 0) {
-        printf("[notice] no rows matched UPDATE condition.\n");
+        INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
         fseek(tc->file, 0, SEEK_END);
         return 1;
     }
@@ -1977,7 +2019,7 @@ static int rewrite_truncated_update(TableCache *tc, int where_idx, const char *w
         return 0;
     }
     if (!reload_table_cache(tc)) return 0;
-    printf("[ok] UPDATE completed with CSV scan fallback. rows=%d\n", count);
+    INFO_PRINTF("[ok] UPDATE completed with CSV scan fallback. rows=%d\n", count);
     return 1;
 
 fail:
@@ -2026,7 +2068,7 @@ static int rewrite_truncated_delete(TableCache *tc, int where_idx, const char *w
     }
     if (count == 0) {
         remove(temp_filename);
-        printf("[notice] no rows matched DELETE condition.\n");
+        INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
         fseek(tc->file, 0, SEEK_END);
         return 1;
     }
@@ -2038,7 +2080,7 @@ static int rewrite_truncated_delete(TableCache *tc, int where_idx, const char *w
         return 0;
     }
     if (!reload_table_cache(tc)) return 0;
-    printf("[ok] DELETE completed with CSV scan fallback. rows=%d\n", count);
+    INFO_PRINTF("[ok] DELETE completed with CSV scan fallback. rows=%d\n", count);
     return 1;
 
 fail:
@@ -2095,6 +2137,85 @@ void execute_update(Statement *stmt) {
     uses_pk_lookup = (where_idx == tc->pk_idx);
     uses_uk_lookup = (!uses_pk_lookup && get_uk_slot(tc, where_idx) != -1);
 
+    if (uses_pk_lookup || uses_uk_lookup) {
+        char *old_record;
+        char *new_copy;
+        char new_row[RECORD_SIZE];
+
+        if (uses_pk_lookup) {
+            INFO_PRINTF("[index] B+ tree id lookup for UPDATE\n");
+            if (!find_pk_row(tc, stmt->where_val, &target_row)) {
+                INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
+                return;
+            }
+        } else {
+            INFO_PRINTF("[index] UK B+ tree lookup for UPDATE on column '%s'\n", stmt->where_col);
+            if (!find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
+                INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
+                return;
+            }
+        }
+        old_record = tc->records[target_row];
+        if (rebuild_uk_needed) {
+            int found_row = -1;
+            int uk_slot = get_uk_slot(tc, set_idx);
+            if (uk_slot == -1 || !ensure_uk_indexes(tc)) {
+                printf("[error] UPDATE failed: UK index is not available.\n");
+                return;
+            }
+            if (strlen(set_value) > 0 &&
+                unique_index_find(tc, tc->uk_indexes[uk_slot], set_value, &found_row) &&
+                found_row != target_row) {
+                printf("[error] UPDATE failed: '%s' violates UK constraint.\n", set_value);
+                return;
+            }
+        }
+        if (!build_updated_row(tc, old_record, set_idx, set_value, new_row, sizeof(new_row))) {
+            printf("[error] UPDATE failed: rebuilt row is too long.\n");
+            return;
+        }
+        new_copy = dup_string(new_row);
+        if (!new_copy) {
+            printf("[error] UPDATE failed: out of memory.\n");
+            return;
+        }
+        if (rebuild_uk_needed && !remove_record_single_uk(tc, old_record, set_idx)) {
+            free(new_copy);
+            printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
+            return;
+        }
+        tc->records[target_row] = new_copy;
+        if (rebuild_uk_needed && !index_record_single_uk(tc, target_row, set_idx)) {
+            free(tc->records[target_row]);
+            tc->records[target_row] = old_record;
+            rebuild_uk_indexes(tc);
+            printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
+            return;
+        }
+        if (tc->pk_idx != -1) {
+            if (!append_delta_update_one(tc, tc->records[target_row])) {
+                free(tc->records[target_row]);
+                tc->records[target_row] = old_record;
+                if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+                printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
+                return;
+            }
+            INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
+            if (!maybe_compact_delta_log(tc)) {
+                printf("[warning] UPDATE completed, but delta compaction failed.\n");
+            }
+        } else if (!rewrite_file(tc)) {
+            free(tc->records[target_row]);
+            tc->records[target_row] = old_record;
+            if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+            printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
+            return;
+        }
+        free(old_record);
+        INFO_PRINTF("[ok] UPDATE completed. rows=1\n");
+        return;
+    }
+
     match_flags = (int *)calloc((size_t)tc->record_count, sizeof(int));
     if (!match_flags) {
         printf("[error] UPDATE failed: out of memory.\n");
@@ -2108,13 +2229,13 @@ void execute_update(Statement *stmt) {
     }
 
     if (uses_pk_lookup) {
-        printf("[index] B+ tree id lookup for UPDATE\n");
+        INFO_PRINTF("[index] B+ tree id lookup for UPDATE\n");
         if (find_pk_row(tc, stmt->where_val, &target_row)) {
             match_flags[target_row] = 1;
             target_count = 1;
         }
     } else if (uses_uk_lookup) {
-        printf("[index] UK B+ tree lookup for UPDATE on column '%s'\n", stmt->where_col);
+        INFO_PRINTF("[index] UK B+ tree lookup for UPDATE on column '%s'\n", stmt->where_col);
         if (find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
             match_flags[target_row] = 1;
             target_count = 1;
@@ -2135,7 +2256,7 @@ void execute_update(Statement *stmt) {
     if (target_count == 0) {
         free(old_records);
         free(match_flags);
-        printf("[notice] no rows matched UPDATE condition.\n");
+        INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
         return;
     }
 
@@ -2224,7 +2345,7 @@ void execute_update(Statement *stmt) {
                 printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
                 return;
             }
-            printf("[delta] UPDATE persisted through append-only delta log.\n");
+            INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
             if (!maybe_compact_delta_log(tc)) {
                 printf("[warning] UPDATE completed, but delta compaction failed.\n");
             }
@@ -2237,10 +2358,10 @@ void execute_update(Statement *stmt) {
         }
         for (i = 0; i < tc->record_count; i++) free(old_records[i]);
         free(old_records);
-        printf("[ok] UPDATE completed. rows=%d\n", count);
+        INFO_PRINTF("[ok] UPDATE completed. rows=%d\n", count);
     } else {
         free(old_records);
-        printf("[notice] no rows matched UPDATE condition.\n");
+        INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
     }
 }
 
@@ -2278,22 +2399,22 @@ void execute_delete(Statement *stmt) {
     uses_pk_lookup = (where_idx == tc->pk_idx);
     uses_uk_lookup = (!uses_pk_lookup && get_uk_slot(tc, where_idx) != -1);
     if (old_count == 0) {
-        printf("[notice] no rows matched DELETE condition.\n");
+        INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
         return;
     }
     if (uses_pk_lookup || uses_uk_lookup) {
         char *old_record;
 
         if (uses_pk_lookup) {
-            printf("[index] B+ tree id lookup for DELETE\n");
+            INFO_PRINTF("[index] B+ tree id lookup for DELETE\n");
             if (!find_pk_row(tc, stmt->where_val, &target_row)) {
-                printf("[notice] no rows matched DELETE condition.\n");
+                INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
                 return;
             }
         } else {
-            printf("[index] UK B+ tree lookup for DELETE on column '%s'\n", stmt->where_col);
+            INFO_PRINTF("[index] UK B+ tree lookup for DELETE on column '%s'\n", stmt->where_col);
             if (!find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
-                printf("[notice] no rows matched DELETE condition.\n");
+                INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
                 return;
             }
         }
@@ -2316,7 +2437,7 @@ void execute_delete(Statement *stmt) {
                 printf("[error] DELETE failed: delta log append failed; memory restored.\n");
                 return;
             }
-            printf("[delta] DELETE persisted through append-only delta log.\n");
+            INFO_PRINTF("[delta] DELETE persisted through append-only delta log.\n");
             if (!maybe_compact_delta_log(tc)) {
                 printf("[warning] DELETE completed, but delta compaction failed.\n");
             }
@@ -2332,7 +2453,7 @@ void execute_delete(Statement *stmt) {
         free(tc->records[target_row]);
         tc->records[target_row] = NULL;
         push_free_slot(tc, target_row);
-        printf("[ok] DELETE completed. rows=1\n");
+        INFO_PRINTF("[ok] DELETE completed. rows=1\n");
         return;
     }
     old_records = (char **)malloc((size_t)old_count * sizeof(char *));
@@ -2348,13 +2469,13 @@ void execute_delete(Statement *stmt) {
     memcpy(old_records, tc->records, (size_t)old_count * sizeof(char *));
 
     if (uses_pk_lookup) {
-        printf("[index] B+ tree id lookup for DELETE\n");
+        INFO_PRINTF("[index] B+ tree id lookup for DELETE\n");
         if (find_pk_row(tc, stmt->where_val, &target_row)) {
             delete_flags[target_row] = 1;
             count = 1;
         }
     } else if (uses_uk_lookup) {
-        printf("[index] UK B+ tree lookup for DELETE on column '%s'\n", stmt->where_col);
+        INFO_PRINTF("[index] UK B+ tree lookup for DELETE on column '%s'\n", stmt->where_col);
         if (find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
             delete_flags[target_row] = 1;
             count = 1;
@@ -2417,7 +2538,7 @@ void execute_delete(Statement *stmt) {
                 printf("[error] DELETE failed: delta log append failed; memory restored.\n");
                 return;
             }
-            printf("[delta] DELETE persisted through append-only delta log.\n");
+            INFO_PRINTF("[delta] DELETE persisted through append-only delta log.\n");
             if (!maybe_compact_delta_log(tc)) {
                 printf("[warning] DELETE completed, but delta compaction failed.\n");
             }
@@ -2447,12 +2568,12 @@ void execute_delete(Statement *stmt) {
         free(old_records);
         free(delete_flags);
         free(removed_index_flags);
-        printf("[ok] DELETE completed. rows=%d\n", count);
+        INFO_PRINTF("[ok] DELETE completed. rows=%d\n", count);
     } else {
         free(old_records);
         free(delete_flags);
         free(removed_index_flags);
-        printf("[notice] no rows matched DELETE condition.\n");
+        INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
     }
 }
 
@@ -2485,7 +2606,7 @@ void run_bplus_benchmark(int record_count) {
 
     if (record_count < 1000000) record_count = 1000000;
     if (record_count > MAX_RECORDS) {
-        printf("[notice] benchmark record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
+        INFO_PRINTF("[notice] benchmark record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
         record_count = MAX_RECORDS;
     }
 
