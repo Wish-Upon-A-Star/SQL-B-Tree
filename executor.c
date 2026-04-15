@@ -44,6 +44,10 @@ static int for_each_file_row_from(TableCache *tc, long start_offset,
 static int replay_delta_log(TableCache *tc);
 static int clear_delta_log(TableCache *tc);
 static int maybe_compact_delta_log(TableCache *tc);
+static int close_delta_batch(TableCache *tc);
+static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_idx,
+                                     int set_idx, const char *set_value, int uses_pk_lookup,
+                                     int uses_uk_lookup, int rebuild_uk_needed);
 int rewrite_file(TableCache *tc);
 
 static char *dup_string(const char *src) {
@@ -423,9 +427,13 @@ static void free_table_storage(TableCache *tc) {
         tc->file = NULL;
     }
     if (tc->delta_file) {
+        if (!close_delta_batch(tc)) {
+            printf("[warning] delta log batch close failed for table '%s'.\n", tc->table_name);
+        }
         fclose(tc->delta_file);
         tc->delta_file = NULL;
     }
+    tc->delta_batch_open = 0;
     tc->delta_ops_since_compact_check = 0;
     for (i = 0; i < tc->record_count; i++) free(tc->records[i]);
     free(tc->records);
@@ -621,9 +629,11 @@ static int clear_delta_log(TableCache *tc) {
 
     if (!tc) return 0;
     if (tc->delta_file) {
+        close_delta_batch(tc);
         fclose(tc->delta_file);
         tc->delta_file = NULL;
     }
+    tc->delta_batch_open = 0;
     get_delta_filename(tc, filename, sizeof(filename));
     remove(filename);
     tc->delta_ops_since_compact_check = 0;
@@ -640,13 +650,32 @@ static FILE *get_delta_writer(TableCache *tc) {
     return tc->delta_file;
 }
 
+static int begin_delta_batch(TableCache *tc) {
+    FILE *f;
+
+    if (!tc) return 0;
+    if (tc->delta_batch_open) return 1;
+    f = get_delta_writer(tc);
+    if (!f) return 0;
+    if (fprintf(f, "B\n") < 0) return 0;
+    tc->delta_batch_open = 1;
+    return 1;
+}
+
+static int close_delta_batch(TableCache *tc) {
+    if (!tc || !tc->delta_file || !tc->delta_batch_open) return 1;
+    if (fprintf(tc->delta_file, "E\n") < 0) return 0;
+    tc->delta_batch_open = 0;
+    return fflush(tc->delta_file) == 0 && !ferror(tc->delta_file);
+}
+
 static long delta_log_size(TableCache *tc) {
     char filename[300];
     FILE *f;
     long size;
 
     if (!tc) return 0;
-    if (tc->delta_file) fflush(tc->delta_file);
+    if (!close_delta_batch(tc)) return 0;
     get_delta_filename(tc, filename, sizeof(filename));
     f = fopen(filename, "rb");
     if (!f) return 0;
@@ -841,7 +870,7 @@ static int append_delta_updates(TableCache *tc, char **old_records) {
     if (!tc || tc->pk_idx == -1 || !old_records) return 0;
     f = get_delta_writer(tc);
     if (!f) return 0;
-    if (fprintf(f, "B\n") < 0) goto fail;
+    if (!begin_delta_batch(tc)) goto fail;
     for (i = 0; i < tc->record_count; i++) {
         long id_value;
         if (!old_records[i]) continue;
@@ -849,7 +878,6 @@ static int append_delta_updates(TableCache *tc, char **old_records) {
         if (!get_row_pk_value(tc, tc->records[i], &id_value)) goto fail;
         if (fprintf(f, "U\t%ld\t%s\n", id_value, tc->records[i]) < 0) goto fail;
     }
-    if (fprintf(f, "E\n") < 0) goto fail;
     if (ferror(f)) goto fail;
     return 1;
 
@@ -865,7 +893,8 @@ static int append_delta_update_one(TableCache *tc, const char *new_record) {
     if (!get_row_pk_value(tc, new_record, &id_value)) return 0;
     f = get_delta_writer(tc);
     if (!f) return 0;
-    if (fprintf(f, "B\nU\t%ld\t%s\nE\n", id_value, new_record) < 0) return 0;
+    if (!begin_delta_batch(tc)) return 0;
+    if (fprintf(f, "U\t%ld\t%s\n", id_value, new_record) < 0) return 0;
     return ferror(f) ? 0 : 1;
 }
 
@@ -876,14 +905,13 @@ static int append_delta_deletes(TableCache *tc, char **old_records, int *delete_
     if (!tc || tc->pk_idx == -1 || !old_records || !delete_flags) return 0;
     f = get_delta_writer(tc);
     if (!f) return 0;
-    if (fprintf(f, "B\n") < 0) goto fail;
+    if (!begin_delta_batch(tc)) goto fail;
     for (i = 0; i < old_count; i++) {
         long id_value;
         if (!delete_flags[i]) continue;
         if (!get_row_pk_value(tc, old_records[i], &id_value)) goto fail;
         if (fprintf(f, "D\t%ld\n", id_value) < 0) goto fail;
     }
-    if (fprintf(f, "E\n") < 0) goto fail;
     if (ferror(f)) goto fail;
     return 1;
 
@@ -899,7 +927,8 @@ static int append_delta_delete_one(TableCache *tc, const char *old_record) {
     if (!get_row_pk_value(tc, old_record, &id_value)) return 0;
     f = get_delta_writer(tc);
     if (!f) return 0;
-    if (fprintf(f, "B\nD\t%ld\nE\n", id_value) < 0) return 0;
+    if (!begin_delta_batch(tc)) return 0;
+    if (fprintf(f, "D\t%ld\n", id_value) < 0) return 0;
     return ferror(f) ? 0 : 1;
 }
 
@@ -2090,6 +2119,85 @@ fail:
     return 0;
 }
 
+static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_idx,
+                                     int set_idx, const char *set_value, int uses_pk_lookup,
+                                     int uses_uk_lookup, int rebuild_uk_needed) {
+    int target_row = -1;
+    char *old_record;
+    char *new_copy;
+    char new_row[RECORD_SIZE];
+
+    if (uses_pk_lookup) {
+        INFO_PRINTF("[index] B+ tree id lookup for UPDATE\n");
+        if (!find_pk_row(tc, stmt->where_val, &target_row)) return 0;
+    } else if (uses_uk_lookup) {
+        INFO_PRINTF("[index] UK B+ tree lookup for UPDATE on column '%s'\n", stmt->where_col);
+        if (!find_uk_row(tc, where_idx, stmt->where_val, &target_row)) return 0;
+    } else {
+        return -1;
+    }
+
+    old_record = tc->records[target_row];
+    if (rebuild_uk_needed) {
+        int found_row = -1;
+        int uk_slot = get_uk_slot(tc, set_idx);
+        if (uk_slot == -1 || !ensure_uk_indexes(tc)) {
+            printf("[error] UPDATE failed: UK index is not available.\n");
+            return -1;
+        }
+        if (strlen(set_value) > 0 &&
+            unique_index_find(tc, tc->uk_indexes[uk_slot], set_value, &found_row) &&
+            found_row != target_row) {
+            printf("[error] UPDATE failed: '%s' violates UK constraint.\n", set_value);
+            return -1;
+        }
+    }
+    if (!build_updated_row(tc, old_record, set_idx, set_value, new_row, sizeof(new_row))) {
+        printf("[error] UPDATE failed: rebuilt row is too long.\n");
+        return -1;
+    }
+    new_copy = dup_string(new_row);
+    if (!new_copy) {
+        printf("[error] UPDATE failed: out of memory.\n");
+        return -1;
+    }
+    if (rebuild_uk_needed && !remove_record_single_uk(tc, old_record, set_idx)) {
+        free(new_copy);
+        printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
+        return -1;
+    }
+    tc->records[target_row] = new_copy;
+    if (rebuild_uk_needed && !index_record_single_uk(tc, target_row, set_idx)) {
+        free(tc->records[target_row]);
+        tc->records[target_row] = old_record;
+        rebuild_uk_indexes(tc);
+        printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
+        return -1;
+    }
+    if (tc->pk_idx != -1) {
+        if (!append_delta_update_one(tc, tc->records[target_row])) {
+            free(tc->records[target_row]);
+            tc->records[target_row] = old_record;
+            if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+            printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
+            return -1;
+        }
+        INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
+        if (!maybe_compact_delta_log(tc)) {
+            printf("[warning] UPDATE completed, but delta compaction failed.\n");
+        }
+    } else if (!rewrite_file(tc)) {
+        free(tc->records[target_row]);
+        tc->records[target_row] = old_record;
+        if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+        printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
+        return -1;
+    }
+    free(old_record);
+    INFO_PRINTF("[ok] UPDATE completed. rows=1\n");
+    return 1;
+}
+
 void execute_update(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
     int where_idx;
@@ -2138,81 +2246,9 @@ void execute_update(Statement *stmt) {
     uses_uk_lookup = (!uses_pk_lookup && get_uk_slot(tc, where_idx) != -1);
 
     if (uses_pk_lookup || uses_uk_lookup) {
-        char *old_record;
-        char *new_copy;
-        char new_row[RECORD_SIZE];
-
-        if (uses_pk_lookup) {
-            INFO_PRINTF("[index] B+ tree id lookup for UPDATE\n");
-            if (!find_pk_row(tc, stmt->where_val, &target_row)) {
-                INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
-                return;
-            }
-        } else {
-            INFO_PRINTF("[index] UK B+ tree lookup for UPDATE on column '%s'\n", stmt->where_col);
-            if (!find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
-                INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
-                return;
-            }
-        }
-        old_record = tc->records[target_row];
-        if (rebuild_uk_needed) {
-            int found_row = -1;
-            int uk_slot = get_uk_slot(tc, set_idx);
-            if (uk_slot == -1 || !ensure_uk_indexes(tc)) {
-                printf("[error] UPDATE failed: UK index is not available.\n");
-                return;
-            }
-            if (strlen(set_value) > 0 &&
-                unique_index_find(tc, tc->uk_indexes[uk_slot], set_value, &found_row) &&
-                found_row != target_row) {
-                printf("[error] UPDATE failed: '%s' violates UK constraint.\n", set_value);
-                return;
-            }
-        }
-        if (!build_updated_row(tc, old_record, set_idx, set_value, new_row, sizeof(new_row))) {
-            printf("[error] UPDATE failed: rebuilt row is too long.\n");
-            return;
-        }
-        new_copy = dup_string(new_row);
-        if (!new_copy) {
-            printf("[error] UPDATE failed: out of memory.\n");
-            return;
-        }
-        if (rebuild_uk_needed && !remove_record_single_uk(tc, old_record, set_idx)) {
-            free(new_copy);
-            printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
-            return;
-        }
-        tc->records[target_row] = new_copy;
-        if (rebuild_uk_needed && !index_record_single_uk(tc, target_row, set_idx)) {
-            free(tc->records[target_row]);
-            tc->records[target_row] = old_record;
-            rebuild_uk_indexes(tc);
-            printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
-            return;
-        }
-        if (tc->pk_idx != -1) {
-            if (!append_delta_update_one(tc, tc->records[target_row])) {
-                free(tc->records[target_row]);
-                tc->records[target_row] = old_record;
-                if (rebuild_uk_needed) rebuild_uk_indexes(tc);
-                printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
-                return;
-            }
-            INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
-            if (!maybe_compact_delta_log(tc)) {
-                printf("[warning] UPDATE completed, but delta compaction failed.\n");
-            }
-        } else if (!rewrite_file(tc)) {
-            free(tc->records[target_row]);
-            tc->records[target_row] = old_record;
-            if (rebuild_uk_needed) rebuild_uk_indexes(tc);
-            printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
-            return;
-        }
-        free(old_record);
-        INFO_PRINTF("[ok] UPDATE completed. rows=1\n");
+        int result = execute_update_single_row(tc, stmt, where_idx, set_idx, set_value,
+                                               uses_pk_lookup, uses_uk_lookup, rebuild_uk_needed);
+        if (result == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
         return;
     }
 
