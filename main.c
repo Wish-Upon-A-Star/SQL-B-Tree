@@ -109,6 +109,8 @@ static void configure_console_encoding(void) {
 #endif
 }
 
+static int try_execute_insert_fast(const char *sql);
+
 static void execute_sql_text(const char *sql) {
     Statement stmt;
     const char *s = sql;
@@ -121,6 +123,10 @@ static void execute_sql_text(const char *sql) {
     while (isspace((unsigned char)*s)) s++;
     if (*s == '\0') return;
 
+    if (try_execute_insert_fast(s)) {
+        return;
+    }
+
     if (parse_statement(s, &stmt)) {
         if (stmt.type == STMT_INSERT) execute_insert(&stmt);
         else if (stmt.type == STMT_SELECT) execute_select(&stmt);
@@ -129,6 +135,72 @@ static void execute_sql_text(const char *sql) {
     } else {
         printf("[오류] 잘못된 SQL 문장입니다: %s\n", s);
     }
+}
+
+static int keyword_match_ci(const char *s, const char *kw) {
+    while (*kw) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*kw)) return 0;
+        s++;
+        kw++;
+    }
+    return 1;
+}
+
+static const char *skip_sql_spaces(const char *s) {
+    while (isspace((unsigned char)*s)) s++;
+    return s;
+}
+
+static int try_execute_insert_fast(const char *sql) {
+    Statement stmt;
+    const char *p;
+    const char *table_start;
+    const char *values_start;
+    const char *row_start;
+    const char *row_end = NULL;
+    int q = 0;
+    size_t table_len;
+    size_t row_len;
+
+    p = skip_sql_spaces(sql);
+    if (!keyword_match_ci(p, "insert")) return 0;
+    p = skip_sql_spaces(p + 6);
+    if (!keyword_match_ci(p, "into")) return 0;
+    p = skip_sql_spaces(p + 4);
+
+    table_start = p;
+    while (*p && !isspace((unsigned char)*p) && *p != '(') p++;
+    table_len = (size_t)(p - table_start);
+    if (table_len == 0 || table_len >= sizeof(stmt.table_name)) return 0;
+
+    p = skip_sql_spaces(p);
+    if (!keyword_match_ci(p, "values")) return 0;
+    p = skip_sql_spaces(p + 6);
+    if (*p != '(') return 0;
+
+    row_start = p + 1;
+    for (values_start = row_start; *values_start; values_start++) {
+        if (*values_start == '\'') q = !q;
+        if (*values_start == ')' && !q) {
+            row_end = values_start;
+            break;
+        }
+    }
+    if (!row_end) return 0;
+    p = skip_sql_spaces(row_end + 1);
+    if (*p != '\0') return 0;
+
+    row_len = (size_t)(row_end - row_start);
+    if (row_len >= sizeof(stmt.row_data)) return 0;
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.type = STMT_INSERT;
+    memcpy(stmt.table_name, table_start, table_len);
+    stmt.table_name[table_len] = '\0';
+    memcpy(stmt.row_data, row_start, row_len);
+    stmt.row_data[row_len] = '\0';
+    execute_insert(&stmt);
+    return 1;
 }
 
 static int execute_sql_line_fast(char *line) {

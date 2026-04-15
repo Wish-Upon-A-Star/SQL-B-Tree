@@ -4700,8 +4700,8 @@ void run_bplus_benchmark(int record_count) {
     TableCache *tc;
     const char *table_name = "bptree_perf_users";
     int i;
-    int index_query_count = 1000;
-    int uk_query_count = 1000;
+    int index_query_count = 10000;
+    int uk_query_count = 10000;
     int linear_query_count = 1;
     int found = 0;
     double start;
