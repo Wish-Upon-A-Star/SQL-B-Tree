@@ -10,8 +10,8 @@ SQL ?= demo_bptree.sql
 PYTHON ?= python
 JUNGLE_DATASET ?= jungle_benchmark_users.csv
 JUNGLE_RECORDS ?= 1000000
-BENCH_SCORE_UPDATE_ROWS ?= 100000
-BENCH_SCORE_DELETE_ROWS ?= 100000
+BENCH_SCORE_UPDATE_ROWS ?= 1000000
+BENCH_SCORE_DELETE_ROWS ?= 1000000
 
 .PHONY: all build bench-tools bench-test run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 

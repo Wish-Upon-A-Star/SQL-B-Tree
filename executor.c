@@ -4700,8 +4700,8 @@ void run_bplus_benchmark(int record_count) {
     TableCache *tc;
     const char *table_name = "bptree_perf_users";
     int i;
-    int index_query_count = 10000;
-    int uk_query_count = 10000;
+    int index_query_count = 50000;
+    int uk_query_count = 50000;
     int linear_query_count = 1;
     int found = 0;
     double start;
@@ -4714,6 +4714,8 @@ void run_bplus_benchmark(int record_count) {
     BPlusPair *id_pairs = NULL;
     BPlusStringPair *uk_pairs = NULL;
     char (*name_values)[32] = NULL;
+    long *id_targets = NULL;
+    char (*uk_targets)[64] = NULL;
 
     if (record_count <= 0) record_count = 1;
     if (record_count > MAX_RECORDS) {
@@ -4741,12 +4743,23 @@ void run_bplus_benchmark(int record_count) {
     id_pairs = (BPlusPair *)calloc((size_t)record_count, sizeof(BPlusPair));
     uk_pairs = (BPlusStringPair *)calloc((size_t)record_count, sizeof(BPlusStringPair));
     name_values = (char (*)[32])calloc((size_t)record_count, sizeof(*name_values));
-    if (!id_pairs || !uk_pairs || !name_values) {
+    id_targets = (long *)calloc((size_t)index_query_count, sizeof(*id_targets));
+    uk_targets = (char (*)[64])calloc((size_t)uk_query_count, sizeof(*uk_targets));
+    if (!id_pairs || !uk_pairs || !name_values || !id_targets || !uk_targets) {
         printf("[error] benchmark pair arrays could not be allocated.\n");
         free(id_pairs);
         free(uk_pairs);
         free(name_values);
+        free(id_targets);
+        free(uk_targets);
         return;
+    }
+
+    for (i = 0; i < index_query_count; i++) {
+        id_targets[i] = (long)((i * 7919) % record_count) + 1;
+    }
+    for (i = 0; i < uk_query_count; i++) {
+        snprintf(uk_targets[i], sizeof(uk_targets[i]), "user%07d@test.com", ((i * 7919) % record_count) + 1);
     }
 
     start = current_seconds();
@@ -4765,6 +4778,9 @@ void run_bplus_benchmark(int record_count) {
                 printf("[error] benchmark append offset failed.\n");
                 free(id_pairs);
                 free(uk_pairs);
+                free(name_values);
+                free(id_targets);
+                free(uk_targets);
                 return;
             }
             tc->append_offset = ftell(tc->file);
@@ -4774,6 +4790,9 @@ void run_bplus_benchmark(int record_count) {
             printf("[error] benchmark append failed at row %d.\n", i);
             free(id_pairs);
             free(uk_pairs);
+            free(name_values);
+            free(id_targets);
+            free(uk_targets);
             return;
         }
         row_id = tc->next_row_id++;
@@ -4781,6 +4800,9 @@ void run_bplus_benchmark(int record_count) {
             printf("[error] benchmark insert failed at row %d.\n", i);
             free(id_pairs);
             free(uk_pairs);
+            free(name_values);
+            free(id_targets);
+            free(uk_targets);
             return;
         }
         id_pairs[i - 1].key = i;
@@ -4790,6 +4812,9 @@ void run_bplus_benchmark(int record_count) {
             printf("[error] benchmark UK key allocation failed at row %d.\n", i);
             free(id_pairs);
             free(uk_pairs);
+            free(name_values);
+            free(id_targets);
+            free(uk_targets);
             return;
         }
         uk_pairs[i - 1].row_index = inserted_slot;
@@ -4798,6 +4823,9 @@ void run_bplus_benchmark(int record_count) {
         printf("[error] benchmark insert flush failed.\n");
         free(id_pairs);
         free(uk_pairs);
+        free(name_values);
+        free(id_targets);
+        free(uk_targets);
         return;
     }
     tc->next_auto_id = (long)record_count + 1;
@@ -4805,12 +4833,18 @@ void run_bplus_benchmark(int record_count) {
         printf("[error] benchmark PK B+ tree bulk build failed.\n");
         free(id_pairs);
         free(uk_pairs);
+        free(name_values);
+        free(id_targets);
+        free(uk_targets);
         return;
     }
     if (!ensure_uk_indexes(tc) || tc->uk_count != 1) {
         printf("[error] benchmark UK index is not available.\n");
         free(id_pairs);
         free(uk_pairs);
+        free(name_values);
+        free(id_targets);
+        free(uk_targets);
         return;
     }
     if (!bptree_string_build_from_sorted(tc->uk_indexes[0]->tree, uk_pairs, record_count)) {
@@ -4818,6 +4852,9 @@ void run_bplus_benchmark(int record_count) {
         free(id_pairs);
         for (i = 0; i < record_count; i++) free(uk_pairs[i].key);
         free(uk_pairs);
+        free(name_values);
+        free(id_targets);
+        free(uk_targets);
         return;
     }
     end = current_seconds();
@@ -4833,19 +4870,16 @@ void run_bplus_benchmark(int record_count) {
 
     start = current_seconds();
     for (i = 0; i < index_query_count; i++) {
-        long key = (long)((i * 7919) % record_count) + 1;
         int row_index;
-        if (bptree_search(tc->id_index, key, &row_index)) found += row_index >= 0;
+        if (bptree_search(tc->id_index, id_targets[i], &row_index)) found += row_index >= 0;
     }
     end = current_seconds();
     id_indexed_time = end - start;
 
     start = current_seconds();
     for (i = 0; i < uk_query_count; i++) {
-        char target[64];
         int row_index;
-        snprintf(target, sizeof(target), "user%07d@test.com", ((i * 7919) % record_count) + 1);
-        if (find_uk_row(tc, 1, target, &row_index)) found += row_index >= 0;
+        if (find_uk_row(tc, 1, uk_targets[i], &row_index)) found += row_index >= 0;
     }
     end = current_seconds();
     uk_indexed_time = end - start;
@@ -4969,6 +5003,8 @@ void run_bplus_benchmark(int record_count) {
     printf("post-mutation active rows: %d\n", tc->active_count);
     printf("matched checks: %d\n", found);
     free(name_values);
+    free(id_targets);
+    free(uk_targets);
 }
 
 void close_all_tables(void) {

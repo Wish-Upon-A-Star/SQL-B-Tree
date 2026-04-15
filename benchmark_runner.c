@@ -72,12 +72,12 @@ static int profile_rows(const char *profile) {
 }
 
 static int profile_update_rows(const char *profile) {
-    if (strcmp(profile, "score") == 0) return 100000;
+    if (strcmp(profile, "score") == 0) return 1000000;
     return profile_rows(profile);
 }
 
 static int profile_delete_rows(const char *profile) {
-    if (strcmp(profile, "score") == 0) return 100000;
+    if (strcmp(profile, "score") == 0) return 1000000;
     return profile_rows(profile);
 }
 
