@@ -1,0 +1,27 @@
+services:
+  sqlprocessor:
+    build:
+      context: .
+    image: sqlprocessor:local
+    working_dir: /app
+    command: ["sh", "-lc", "printf \"%s\\n\" \"SELECT * FROM case_basic_users WHERE id = 2;\" \"SELECT * FROM case_basic_users WHERE email = 'user1@test.com';\" > /tmp/docker_demo.sql && ./sqlsprocessor /tmp/docker_demo.sql"]
+
+  benchmark:
+    build:
+      context: .
+    image: sqlprocessor:local
+    working_dir: /app
+    command: ["make", "benchmark"]
+    profiles:
+      - benchmark
+
+  shell:
+    build:
+      context: .
+    image: sqlprocessor:local
+    working_dir: /app
+    command: ["bash"]
+    stdin_open: true
+    tty: true
+    profiles:
+      - shell

@@ -1,0 +1,17 @@
+.git
+.gitignore
+.vscode
+.devcontainer
+artifacts
+generated_sql
+docs
+*.exe
+*.dSYM
+main
+sqlsprocessor
+sqlsprocessor_*
+benchmark_runner
+bench_workload_generator
+bench_formula_test
+*.tmp
+*.delta
