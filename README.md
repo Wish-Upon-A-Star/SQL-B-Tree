@@ -96,3 +96,24 @@ SELECT * FROM case_basic_users WHERE name = 'AutoUser';
 .\sqlsprocessor.exe demo_bptree.sql
 .\sqlsprocessor.exe --benchmark 1000000
 ```
+
+## Benchmark Output
+
+`--benchmark` now measures three lookup paths after inserting at least 1,000,000 rows through the normal INSERT path.
+
+```powershell
+.\sqlsprocessor.exe --benchmark 1000000
+```
+
+- `id SELECT using B+ tree`: numeric PK B+ Tree lookup.
+- `email(UK) SELECT using B+ tree`: string UK B+ Tree lookup.
+- `name SELECT using linear scan`: non-indexed full scan baseline.
+
+Use the ratio lines to compare indexed lookup against linear scan.
+
+```text
+linear/id-index average speed ratio: ...
+linear/uk-index average speed ratio: ...
+```
+
+The generated `bptree_benchmark_users.csv` file is tracked in this repository so the large-table load path can be tested without regenerating data every time. When an existing CSV table is opened, PK and UK indexes are bulk-built from sorted key-row pairs instead of inserting every key into the tree one by one.

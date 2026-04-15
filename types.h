@@ -60,7 +60,7 @@ typedef struct {
     int pk_idx;                   /* PK 컬럼 인덱스, 없으면 -1 */
     int uk_indices[MAX_UKS];      /* UK 컬럼 인덱스 목록 */
     int uk_count;                 /* UK 컬럼 개수 */
-    UniqueIndex *uk_indexes[MAX_UKS]; /* UK 컬럼별 해시 인덱스 */
+    UniqueIndex *uk_indexes[MAX_UKS]; /* UK 컬럼별 B+ Tree 인덱스 */
     BPlusTree *id_index;           /* ID/PK 기반 B+ Tree 인덱스 */
     char **records;                /* 모든 레코드 문자열 */
     int record_capacity;           /* 동적 레코드 배열 용량 */

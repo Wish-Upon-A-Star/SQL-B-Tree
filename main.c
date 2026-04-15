@@ -17,6 +17,28 @@ static void configure_console_encoding(void) {
 #endif
 }
 
+static void execute_sql_text(const char *sql) {
+    Statement stmt;
+    const char *s = sql;
+
+    if ((unsigned char)s[0] == 0xEF &&
+        (unsigned char)s[1] == 0xBB &&
+        (unsigned char)s[2] == 0xBF) {
+        s += 3;
+    }
+    while (isspace((unsigned char)*s)) s++;
+    if (*s == '\0') return;
+
+    if (parse_statement(s, &stmt)) {
+        if (stmt.type == STMT_INSERT) execute_insert(&stmt);
+        else if (stmt.type == STMT_SELECT) execute_select(&stmt);
+        else if (stmt.type == STMT_DELETE) execute_delete(&stmt);
+        else if (stmt.type == STMT_UPDATE) execute_update(&stmt);
+    } else {
+        printf("[오류] 잘못된 SQL 문장입니다: %s\n", s);
+    }
+}
+
 /* SQL 파일에서 ';'로 구분되는 SQL 문장을 순서대로 실행합니다. */
 int main(int argc, char *argv[]) {
     configure_console_encoding();
@@ -46,6 +68,7 @@ int main(int argc, char *argv[]) {
     char buf[MAX_SQL_LEN];
     int idx = 0;
     int q = 0;
+    int too_long = 0;
     int ch;
 
     while ((ch = fgetc(f)) != EOF) {
@@ -65,24 +88,26 @@ int main(int argc, char *argv[]) {
 
         if (ch == ';' && !q) {
             buf[idx] = '\0';
-            char *s = buf;
-
-            while (isspace((unsigned char)*s)) s++;
-
-            if (strlen(s) > 0) {
-                Statement stmt;
-                if (parse_statement(s, &stmt)) {
-                    if (stmt.type == STMT_INSERT) execute_insert(&stmt);
-                    else if (stmt.type == STMT_SELECT) execute_select(&stmt);
-                    else if (stmt.type == STMT_DELETE) execute_delete(&stmt);
-                    else if (stmt.type == STMT_UPDATE) execute_update(&stmt);
-                } else {
-                    printf("[오류] 잘못된 SQL 문장입니다: %s\n", s);
-                }
+            if (too_long) {
+                printf("[오류] SQL 문장이 너무 깁니다. 최대 길이=%d\n", MAX_SQL_LEN - 1);
+            } else {
+                execute_sql_text(buf);
             }
             idx = 0;
+            too_long = 0;
         } else if (idx < MAX_SQL_LEN - 1) {
             buf[idx++] = (char)ch;
+        } else {
+            too_long = 1;
+        }
+    }
+
+    if (idx > 0) {
+        buf[idx] = '\0';
+        if (too_long) {
+            printf("[오류] SQL 문장이 너무 깁니다. 최대 길이=%d\n", MAX_SQL_LEN - 1);
+        } else {
+            execute_sql_text(buf);
         }
     }
 

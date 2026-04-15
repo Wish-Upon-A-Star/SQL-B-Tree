@@ -16,9 +16,13 @@ static unsigned long long g_table_access_seq = 0;
 
 void parse_csv_row(const char *row, char *fields[MAX_COLS], char *buffer);
 static void normalize_value(const char *src, char *dest, size_t dest_size);
-static void rebuild_id_index(TableCache *tc);
+static int rebuild_id_index(TableCache *tc);
 static int rebuild_uk_indexes(TableCache *tc);
 static int index_record_uks(TableCache *tc, int row_index);
+static int get_uk_slot(TableCache *tc, int col_idx);
+static int ensure_uk_indexes(TableCache *tc);
+static int rollback_last_record_memory(TableCache *tc);
+static void rollback_updated_records(TableCache *tc, char **old_records);
 
 static char *dup_string(const char *src) {
     size_t len = strlen(src) + 1;
@@ -28,133 +32,79 @@ static char *dup_string(const char *src) {
     return copy;
 }
 
-typedef struct UniqueEntry {
-    unsigned long long hash;
-    int row_index;
-    struct UniqueEntry *next;
-} UniqueEntry;
+static int compare_bplus_pair(const void *a, const void *b) {
+    const BPlusPair *pa = (const BPlusPair *)a;
+    const BPlusPair *pb = (const BPlusPair *)b;
+    return (pa->key > pb->key) - (pa->key < pb->key);
+}
+
+static int compare_bplus_string_pair(const void *a, const void *b) {
+    const BPlusStringPair *pa = (const BPlusStringPair *)a;
+    const BPlusStringPair *pb = (const BPlusStringPair *)b;
+    return strcmp(pa->key, pb->key);
+}
 
 struct UniqueIndex {
-    UniqueEntry **buckets;
-    size_t bucket_count;
-    size_t count;
+    BPlusStringTree *tree;
     int col_idx;
 };
-
-static unsigned long long hash_string(const char *s) {
-    unsigned long long hash = 1469598103934665603ULL;
-    while (*s) {
-        hash ^= (unsigned char)*s++;
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
 
 static UniqueIndex *unique_index_create(int col_idx) {
     UniqueIndex *index = (UniqueIndex *)calloc(1, sizeof(UniqueIndex));
     if (!index) return NULL;
     index->col_idx = col_idx;
-    index->bucket_count = 2048;
-    index->buckets = (UniqueEntry **)calloc(index->bucket_count, sizeof(UniqueEntry *));
-    if (!index->buckets) {
+    index->tree = bptree_string_create();
+    if (!index->tree) {
         free(index);
         return NULL;
     }
     return index;
 }
 
-static void unique_index_clear(UniqueIndex *index) {
-    size_t i;
-    if (!index) return;
-    for (i = 0; i < index->bucket_count; i++) {
-        UniqueEntry *entry = index->buckets[i];
-        while (entry) {
-            UniqueEntry *next = entry->next;
-            free(entry);
-            entry = next;
-        }
-        index->buckets[i] = NULL;
-    }
-    index->count = 0;
-}
-
 static void unique_index_destroy(UniqueIndex *index) {
     if (!index) return;
-    unique_index_clear(index);
-    free(index->buckets);
+    bptree_string_destroy(index->tree);
     free(index);
 }
 
-static int unique_index_rehash(UniqueIndex *index, size_t new_bucket_count) {
-    UniqueEntry **new_buckets;
-    size_t i;
-
-    new_buckets = (UniqueEntry **)calloc(new_bucket_count, sizeof(UniqueEntry *));
-    if (!new_buckets) return 0;
-    for (i = 0; i < index->bucket_count; i++) {
-        UniqueEntry *entry = index->buckets[i];
-        while (entry) {
-            UniqueEntry *next = entry->next;
-            size_t bucket = entry->hash % new_bucket_count;
-            entry->next = new_buckets[bucket];
-            new_buckets[bucket] = entry;
-            entry = next;
-        }
-    }
-    free(index->buckets);
-    index->buckets = new_buckets;
-    index->bucket_count = new_bucket_count;
-    return 1;
-}
-
 static int unique_index_find(TableCache *tc, UniqueIndex *index, const char *key, int *row_index) {
-    UniqueEntry *entry;
-    unsigned long long hash;
-    size_t bucket;
+    int found_row;
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    char existing_key[RECORD_SIZE];
 
     if (!index || !key || strlen(key) == 0) return 0;
-    hash = hash_string(key);
-    bucket = hash % index->bucket_count;
-    entry = index->buckets[bucket];
-    while (entry) {
-        if (entry->hash == hash && entry->row_index >= 0 && entry->row_index < tc->record_count) {
-            char row_buf[RECORD_SIZE];
-            char *fields[MAX_COLS] = {0};
-            char existing_key[RECORD_SIZE];
+    if (!bptree_string_search(index->tree, key, &found_row)) return 0;
+    if (found_row < 0 || found_row >= tc->record_count) return 0;
 
-            parse_csv_row(tc->records[entry->row_index], fields, row_buf);
-            normalize_value(fields[index->col_idx], existing_key, sizeof(existing_key));
-            if (strcmp(existing_key, key) == 0) {
-                if (row_index) *row_index = entry->row_index;
-                return 1;
-            }
-        }
-        entry = entry->next;
+    parse_csv_row(tc->records[found_row], fields, row_buf);
+    normalize_value(fields[index->col_idx], existing_key, sizeof(existing_key));
+    if (strcmp(existing_key, key) == 0) {
+        if (row_index) *row_index = found_row;
+        return 1;
     }
     return 0;
 }
 
+static int find_uk_row(TableCache *tc, int col_idx, const char *value, int *row_index) {
+    char key[RECORD_SIZE];
+    int uk_slot;
+
+    if (!tc || col_idx < 0 || !value) return 0;
+    uk_slot = get_uk_slot(tc, col_idx);
+    if (uk_slot == -1 || !ensure_uk_indexes(tc)) return 0;
+    normalize_value(value, key, sizeof(key));
+    if (strlen(key) == 0) return 0;
+    return unique_index_find(tc, tc->uk_indexes[uk_slot], key, row_index);
+}
+
 static int unique_index_insert(TableCache *tc, UniqueIndex *index, const char *key, int row_index) {
-    UniqueEntry *entry;
-    unsigned long long hash;
-    size_t bucket;
+    int result;
 
     if (!index || !key || strlen(key) == 0) return 1;
     if (unique_index_find(tc, index, key, NULL)) return 0;
-    if ((index->count + 1) * 4 > index->bucket_count * 3) {
-        if (!unique_index_rehash(index, index->bucket_count * 2)) return -1;
-    }
-
-    entry = (UniqueEntry *)calloc(1, sizeof(UniqueEntry));
-    if (!entry) return -1;
-    hash = hash_string(key);
-    entry->hash = hash;
-    entry->row_index = row_index;
-    bucket = hash % index->bucket_count;
-    entry->next = index->buckets[bucket];
-    index->buckets[bucket] = entry;
-    index->count++;
-    return 1;
+    result = bptree_string_insert(index->tree, key, row_index);
+    return result == 1 ? 1 : result;
 }
 
 void trim_and_unquote(char *str) {
@@ -253,6 +203,19 @@ static int ensure_record_capacity(TableCache *tc, int required) {
     return 1;
 }
 
+static int append_record_raw_memory(TableCache *tc, const char *row) {
+    int row_index;
+
+    if (tc->record_count >= MAX_RECORDS) return 0;
+    if (!ensure_record_capacity(tc, tc->record_count + 1)) return 0;
+
+    row_index = tc->record_count;
+    tc->records[row_index] = dup_string(row);
+    if (!tc->records[row_index]) return 0;
+    tc->record_count++;
+    return 1;
+}
+
 static int append_record_memory(TableCache *tc, const char *row, long id_value) {
     int row_index;
 
@@ -275,20 +238,33 @@ static int append_record_memory(TableCache *tc, const char *row, long id_value) 
     if (!index_record_uks(tc, row_index)) {
         free(tc->records[row_index]);
         tc->record_count--;
-        rebuild_id_index(tc);
-        rebuild_uk_indexes(tc);
+        if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
+            printf("[error] INSERT rollback failed: indexes may be stale.\n");
+        }
         return 0;
     }
     return 1;
 }
 
-static void rollback_last_record_memory(TableCache *tc) {
-    if (!tc || tc->record_count <= 0) return;
+static int rollback_last_record_memory(TableCache *tc) {
+    if (!tc || tc->record_count <= 0) return 0;
     tc->record_count--;
     free(tc->records[tc->record_count]);
     tc->records[tc->record_count] = NULL;
-    rebuild_id_index(tc);
-    rebuild_uk_indexes(tc);
+    return rebuild_id_index(tc) && rebuild_uk_indexes(tc);
+}
+
+static void rollback_updated_records(TableCache *tc, char **old_records) {
+    int i;
+
+    if (!tc || !old_records) return;
+    for (i = 0; i < tc->record_count; i++) {
+        if (old_records[i]) {
+            free(tc->records[i]);
+            tc->records[i] = old_records[i];
+            old_records[i] = NULL;
+        }
+    }
 }
 
 static void free_table_storage(TableCache *tc) {
@@ -405,7 +381,10 @@ int rewrite_file(TableCache *tc) {
         return 0;
     }
     tc->file = fopen(filename, "r+");
-    return tc->file != NULL;
+    if (!tc->file) {
+        printf("[warning] table file was rewritten, but could not be reopened for append.\n");
+    }
+    return 1;
 
 fail:
     fclose(out);
@@ -414,14 +393,30 @@ fail:
     return 0;
 }
 
-static void rebuild_id_index(TableCache *tc) {
+static int rebuild_id_index(TableCache *tc) {
+    BPlusTree *new_index;
+    BPlusPair *pairs = NULL;
+    long next_auto_id = 1;
+    int pair_count = 0;
     int i;
 
-    if (!tc->id_index) tc->id_index = bptree_create();
-    else bptree_clear(tc->id_index);
-    tc->next_auto_id = 1;
+    if (!tc) return 0;
+    new_index = bptree_create();
+    if (!new_index) return 0;
 
-    if (tc->pk_idx == -1) return;
+    if (tc->pk_idx == -1) {
+        bptree_destroy(tc->id_index);
+        tc->id_index = new_index;
+        tc->next_auto_id = next_auto_id;
+        return 1;
+    }
+    if (tc->record_count > 0) {
+        pairs = (BPlusPair *)calloc((size_t)tc->record_count, sizeof(BPlusPair));
+        if (!pairs) {
+            bptree_destroy(new_index);
+            return 0;
+        }
+    }
     for (i = 0; i < tc->record_count; i++) {
         char row_buf[RECORD_SIZE];
         char *fields[MAX_COLS] = {0};
@@ -429,10 +424,27 @@ static void rebuild_id_index(TableCache *tc) {
 
         parse_csv_row(tc->records[i], fields, row_buf);
         if (fields[tc->pk_idx] && parse_long_value(fields[tc->pk_idx], &id_value)) {
-            bptree_insert(tc->id_index, id_value, i);
-            if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
+            pairs[pair_count].key = id_value;
+            pairs[pair_count].row_index = i;
+            pair_count++;
+            if (id_value >= next_auto_id) next_auto_id = id_value + 1;
+        } else {
+            free(pairs);
+            bptree_destroy(new_index);
+            return 0;
         }
     }
+    if (pair_count > 1) qsort(pairs, (size_t)pair_count, sizeof(BPlusPair), compare_bplus_pair);
+    if (!bptree_build_from_sorted(new_index, pairs, pair_count)) {
+        free(pairs);
+        bptree_destroy(new_index);
+        return 0;
+    }
+    free(pairs);
+    bptree_destroy(tc->id_index);
+    tc->id_index = new_index;
+    tc->next_auto_id = next_auto_id;
+    return 1;
 }
 
 static int ensure_uk_indexes(TableCache *tc) {
@@ -468,14 +480,63 @@ static int index_record_uks(TableCache *tc, int row_index) {
 }
 
 static int rebuild_uk_indexes(TableCache *tc) {
+    UniqueIndex *new_indexes[MAX_UKS] = {0};
+    BPlusStringPair *pairs[MAX_UKS] = {0};
+    int pair_counts[MAX_UKS] = {0};
     int i;
+    int row_index;
 
-    if (!ensure_uk_indexes(tc)) return 0;
-    for (i = 0; i < tc->uk_count; i++) unique_index_clear(tc->uk_indexes[i]);
-    for (i = 0; i < tc->record_count; i++) {
-        if (!index_record_uks(tc, i)) return 0;
+    if (!tc) return 0;
+    for (i = 0; i < tc->uk_count; i++) {
+        new_indexes[i] = unique_index_create(tc->uk_indices[i]);
+        if (!new_indexes[i]) goto fail;
+        if (tc->record_count > 0) {
+            pairs[i] = (BPlusStringPair *)calloc((size_t)tc->record_count, sizeof(BPlusStringPair));
+            if (!pairs[i]) goto fail;
+        }
+    }
+
+    for (row_index = 0; row_index < tc->record_count; row_index++) {
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+
+        parse_csv_row(tc->records[row_index], fields, row_buf);
+        for (i = 0; i < tc->uk_count; i++) {
+            char key[RECORD_SIZE];
+            int col_idx = tc->uk_indices[i];
+
+            normalize_value(fields[col_idx], key, sizeof(key));
+            if (strlen(key) == 0) continue;
+            pairs[i][pair_counts[i]].key = dup_string(key);
+            if (!pairs[i][pair_counts[i]].key) goto fail;
+            pairs[i][pair_counts[i]].row_index = row_index;
+            pair_counts[i]++;
+        }
+    }
+
+    for (i = 0; i < tc->uk_count; i++) {
+        if (pair_counts[i] > 1) {
+            qsort(pairs[i], (size_t)pair_counts[i], sizeof(BPlusStringPair), compare_bplus_string_pair);
+        }
+        if (!bptree_string_build_from_sorted(new_indexes[i]->tree, pairs[i], pair_counts[i])) goto fail;
+        for (row_index = 0; row_index < pair_counts[i]; row_index++) free(pairs[i][row_index].key);
+        free(pairs[i]);
+        pairs[i] = NULL;
+        unique_index_destroy(tc->uk_indexes[i]);
+        tc->uk_indexes[i] = new_indexes[i];
     }
     return 1;
+
+fail:
+    for (i = 0; i < tc->uk_count; i++) {
+        if (pairs[i]) {
+            int j;
+            for (j = 0; j < pair_counts[i]; j++) free(pairs[i][j].key);
+            free(pairs[i]);
+        }
+        unique_index_destroy(new_indexes[i]);
+    }
+    return 0;
 }
 
 static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
@@ -556,10 +617,14 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
             printf("[error] invalid PK value while loading '%s': %s\n", name, fields[tc->pk_idx]);
             return 0;
         }
-        if (!append_record_memory(tc, line, id_value)) {
+        if (!append_record_raw_memory(tc, line)) {
             printf("[error] failed to load row into memory.\n");
             return 0;
         }
+    }
+    if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
+        printf("[error] failed to bulk-build indexes while loading '%s'.\n", name);
+        return 0;
     }
     return 1;
 }
@@ -716,7 +781,9 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
         return 0;
     }
     if (!append_record_file(tc, new_line, flush_now)) {
-        rollback_last_record_memory(tc);
+        if (!rollback_last_record_memory(tc)) {
+            printf("[error] INSERT rollback failed: indexes may be stale.\n");
+        }
         printf("[error] INSERT failed: could not append to table file.\n");
         return 0;
     }
@@ -782,6 +849,15 @@ void execute_select(Statement *stmt) {
         }
         printf("[index] B+ tree id lookup\n");
         if (bptree_search(tc->id_index, key, &row_index)) {
+            print_selected_row(tc->records[row_index], select_idx, select_count, stmt->select_all);
+        }
+        return;
+    }
+
+    if (where_idx != -1 && tc->cols[where_idx].type == COL_UK) {
+        int row_index;
+        printf("[index] UK B+ tree lookup on column '%s'\n", stmt->where_col);
+        if (find_uk_row(tc, where_idx, stmt->where_val, &row_index)) {
             print_selected_row(tc->records[row_index], select_idx, select_count, stmt->select_all);
         }
         return;
@@ -897,6 +973,7 @@ void execute_update(Statement *stmt) {
             if (!append_csv_field(new_row, sizeof(new_row), &offset, val, j == tc->col_count - 1)) break;
         }
         if (j != tc->col_count) {
+            rollback_updated_records(tc, old_records);
             printf("[error] UPDATE failed: rebuilt row is too long.\n");
             free(old_records);
             free(match_flags);
@@ -904,6 +981,7 @@ void execute_update(Statement *stmt) {
         }
         char *new_copy = dup_string(new_row);
         if (!new_copy) {
+            rollback_updated_records(tc, old_records);
             printf("[error] UPDATE failed: out of memory.\n");
             free(old_records);
             free(match_flags);
@@ -916,24 +994,21 @@ void execute_update(Statement *stmt) {
 
     free(match_flags);
     if (count > 0) {
+        if (!rebuild_uk_indexes(tc)) {
+            rollback_updated_records(tc, old_records);
+            free(old_records);
+            printf("[error] UPDATE failed: UK index rebuild failed; memory restored.\n");
+            return;
+        }
         if (!rewrite_file(tc)) {
-            for (i = 0; i < tc->record_count; i++) {
-                if (old_records[i]) {
-                    free(tc->records[i]);
-                    tc->records[i] = old_records[i];
-                    old_records[i] = NULL;
-                }
-            }
+            rollback_updated_records(tc, old_records);
+            rebuild_uk_indexes(tc);
             free(old_records);
             printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
             return;
         }
         for (i = 0; i < tc->record_count; i++) free(old_records[i]);
         free(old_records);
-        if (!rebuild_uk_indexes(tc)) {
-            printf("[error] UPDATE warning: UK index rebuild failed.\n");
-            return;
-        }
         printf("[ok] UPDATE completed. rows=%d\n", count);
     } else {
         free(old_records);
@@ -990,11 +1065,21 @@ void execute_delete(Statement *stmt) {
     tc->record_count = write_idx;
 
     if (count > 0) {
-        rebuild_id_index(tc);
+        if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
+            memcpy(tc->records, old_records, (size_t)old_count * sizeof(char *));
+            tc->record_count = old_count;
+            rebuild_id_index(tc);
+            rebuild_uk_indexes(tc);
+            free(old_records);
+            free(delete_flags);
+            printf("[error] DELETE failed: index rebuild failed; memory restored.\n");
+            return;
+        }
         if (!rewrite_file(tc)) {
             memcpy(tc->records, old_records, (size_t)old_count * sizeof(char *));
             tc->record_count = old_count;
             rebuild_id_index(tc);
+            rebuild_uk_indexes(tc);
             free(old_records);
             free(delete_flags);
             printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
@@ -1002,12 +1087,6 @@ void execute_delete(Statement *stmt) {
         }
         for (read_idx = 0; read_idx < old_count; read_idx++) {
             if (delete_flags[read_idx]) free(old_records[read_idx]);
-        }
-        if (!rebuild_uk_indexes(tc)) {
-            free(old_records);
-            free(delete_flags);
-            printf("[error] DELETE warning: UK index rebuild failed.\n");
-            return;
         }
         free(old_records);
         free(delete_flags);
@@ -1037,11 +1116,13 @@ void run_bplus_benchmark(int record_count) {
     const char *table_name = "bptree_benchmark_users";
     int i;
     int index_query_count = 100000;
+    int uk_query_count = 100000;
     int linear_query_count = 30;
     int found = 0;
     double start;
     double end;
-    double indexed_time;
+    double id_indexed_time;
+    double uk_indexed_time;
     double linear_time;
 
     if (record_count < 1000000) record_count = 1000000;
@@ -1091,7 +1172,17 @@ void run_bplus_benchmark(int record_count) {
         if (bptree_search(tc->id_index, key, &row_index)) found += row_index >= 0;
     }
     end = current_seconds();
-    indexed_time = end - start;
+    id_indexed_time = end - start;
+
+    start = current_seconds();
+    for (i = 0; i < uk_query_count; i++) {
+        char target[64];
+        int row_index;
+        snprintf(target, sizeof(target), "user%d@test.com", ((i * 7919) % record_count) + 1);
+        if (find_uk_row(tc, 1, target, &row_index)) found += row_index >= 0;
+    }
+    end = current_seconds();
+    uk_indexed_time = end - start;
 
     start = current_seconds();
     for (i = 0; i < linear_query_count; i++) {
@@ -1113,13 +1204,20 @@ void run_bplus_benchmark(int record_count) {
 
     printf("records: %d\n", record_count);
     printf("id SELECT using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
-           indexed_time, index_query_count, indexed_time / index_query_count);
+           id_indexed_time, index_query_count, id_indexed_time / index_query_count);
+    printf("email(UK) SELECT using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
+           uk_indexed_time, uk_query_count, uk_indexed_time / uk_query_count);
     printf("name SELECT using linear scan: %.6f sec total (%d queries, %.9f sec/query)\n",
            linear_time, linear_query_count, linear_time / linear_query_count);
-    if (indexed_time > 0.0) {
-        double index_avg = indexed_time / index_query_count;
+    if (id_indexed_time > 0.0) {
+        double index_avg = id_indexed_time / index_query_count;
         double linear_avg = linear_time / linear_query_count;
-        printf("linear/index average speed ratio: %.2fx\n", linear_avg / index_avg);
+        printf("linear/id-index average speed ratio: %.2fx\n", linear_avg / index_avg);
+    }
+    if (uk_indexed_time > 0.0) {
+        double uk_avg = uk_indexed_time / uk_query_count;
+        double linear_avg = linear_time / linear_query_count;
+        printf("linear/uk-index average speed ratio: %.2fx\n", linear_avg / uk_avg);
     }
     printf("matched checks: %d\n", found);
 }

@@ -1,7 +1,6 @@
 sqlsprocessor
 *.exe
 *.dSYM/
-bptree_benchmark_users.csv
 over_million_users.csv
 bptree_test_users.csv
 bptree_test.sql

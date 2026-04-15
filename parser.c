@@ -18,6 +18,11 @@ static int expect_token(Parser *p, SqlTokenType type) {
     return 0;
 }
 
+static int finish_statement(Parser *p, int parsed) {
+    if (!parsed) return 0;
+    return p->current_token.type == TOKEN_EOF;
+}
+
 /* WHERE col = value 형식을 파싱해 stmt에 where 컬럼/값을 채웁니다. */
 static int parse_where_clause(Parser *p, Statement *stmt) {
     if (p->current_token.type != TOKEN_WHERE) return 1;
@@ -38,6 +43,26 @@ static int parse_where_clause(Parser *p, Statement *stmt) {
         return 0;
     }
 
+    return 1;
+}
+
+static const char *find_values_close_paren(const char *open_paren) {
+    const char *cur = open_paren + 1;
+    int in_quote = 0;
+
+    while (*cur) {
+        if (*cur == '\'') in_quote = !in_quote;
+        else if (*cur == ')' && !in_quote) return cur;
+        cur++;
+    }
+    return NULL;
+}
+
+static int only_trailing_space(const char *s) {
+    while (*s) {
+        if (!isspace((unsigned char)*s)) return 0;
+        s++;
+    }
     return 1;
 }
 
@@ -97,16 +122,19 @@ static int parse_insert(Parser *p, Statement *stmt) {
     if (!expect_token(p, TOKEN_VALUES)) return 0;
     if (p->current_token.type != TOKEN_LPAREN) return 0;
 
-    open_paren = strchr(p->lexer.sql, '(');
-    close_paren = strrchr(p->lexer.sql, ')');
+    open_paren = p->lexer.sql + p->lexer.pos - 1;
+    close_paren = find_values_close_paren(open_paren);
     if (!open_paren || !close_paren || close_paren <= open_paren) return 0;
+    if (!only_trailing_space(close_paren + 1)) return 0;
 
     len = (int)(close_paren - open_paren - 1);
     if (len >= (int)sizeof(stmt->row_data)) len = (int)sizeof(stmt->row_data) - 1;
     strncpy(stmt->row_data, open_paren + 1, len);
     stmt->row_data[len] = '\0';
+    p->lexer.pos = (int)(close_paren - p->lexer.sql + 1);
+    advance_parser(p);
 
-    return 1;
+    return p->current_token.type == TOKEN_EOF;
 }
 
 /* UPDATE 구문 파싱: UPDATE table SET col = value [WHERE col = value] */
@@ -162,10 +190,10 @@ int parse_statement(const char *sql, Statement *stmt) {
     advance_parser(&p);
 
     switch (p.current_token.type) {
-        case TOKEN_SELECT: return parse_select(&p, stmt);
+        case TOKEN_SELECT: return finish_statement(&p, parse_select(&p, stmt));
         case TOKEN_INSERT: return parse_insert(&p, stmt);
-        case TOKEN_UPDATE: return parse_update(&p, stmt);
-        case TOKEN_DELETE: return parse_delete(&p, stmt);
+        case TOKEN_UPDATE: return finish_statement(&p, parse_update(&p, stmt));
+        case TOKEN_DELETE: return finish_statement(&p, parse_delete(&p, stmt));
         default:
             stmt->type = STMT_UNRECOGNIZED;
             return 0;
