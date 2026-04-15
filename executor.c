@@ -18,6 +18,10 @@ TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
 static unsigned long long g_table_access_seq = 0;
 static int g_executor_quiet = 0;
+static const char *const JUNGLE_BENCHMARK_CSV = "jungle_benchmark_users.csv";
+static const char *const JUNGLE_BENCHMARK_TABLE = "jungle_benchmark_users";
+static const char *const JUNGLE_BENCHMARK_HEADER =
+    "id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round\n";
 
 #define INFO_PRINTF(...) do { if (!g_executor_quiet) printf(__VA_ARGS__); } while (0)
 
@@ -84,6 +88,21 @@ static int compare_bplus_string_pair(const void *a, const void *b) {
     return strcmp(pa->key, pb->key);
 }
 
+static int path_exists(const char *filename) {
+    struct stat st;
+
+    return filename && stat(filename, &st) == 0;
+}
+
+static int clamp_record_count(int record_count, int minimum) {
+    if (record_count < minimum) record_count = minimum;
+    if (record_count > MAX_RECORDS) {
+        printf("[notice] record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
+        record_count = MAX_RECORDS;
+    }
+    return record_count;
+}
+
 struct UniqueIndex {
     BPlusStringTree *tree;
     int col_idx;
@@ -139,6 +158,222 @@ static int find_pk_row(TableCache *tc, const char *value, int *row_index) {
     if (!slot_is_active(tc, found_row)) return 0;
     if (row_index) *row_index = found_row;
     return 1;
+}
+
+static const char *jungle_track_for_id(int id) {
+    static const char *const tracks[] = {
+        "sw_ai_lab", "game_lab", "game_tech_lab"
+    };
+    return tracks[(id - 1) % 3];
+}
+
+static const char *jungle_background_for_id(int id) {
+    int bucket = (id - 1) % 100;
+
+    if (bucket < 62) return "student";
+    if (bucket < 74) return "newgrad";
+    if (bucket < 86) return "incumbent";
+    if (bucket < 95) return "switcher";
+    return "selftaught";
+}
+
+static int jungle_pretest_for_id(int id) {
+    long long mixed = (long long)id * 73LL + (long long)((id - 1) % 97) * 19LL + 17LL;
+    return 35 + (int)(mixed % 66LL);
+}
+
+static void build_jungle_history(int id, const char *background, char *buffer, size_t buffer_size) {
+    static const char *const majors[] = {
+        "cs", "software", "ai", "game", "math", "physics",
+        "stats", "design", "ee", "business", "english", "biology"
+    };
+    static const char *const incumbent_roles[] = {
+        "backend", "frontend", "data", "infra", "qa", "game_client", "game_server"
+    };
+    static const char *const switcher_roles[] = {
+        "designer", "teacher", "marketer", "pm", "sales", "mechanical", "accounting"
+    };
+    static const char *const selftaught_routes[] = {
+        "selftaught", "bootcamp", "indie", "academy"
+    };
+    int major_idx = ((id - 1) / 3) % (int)(sizeof(majors) / sizeof(majors[0]));
+
+    if (strcmp(background, "student") == 0) {
+        int grade = ((id - 1) / 7) % 4 + 1;
+        snprintf(buffer, buffer_size, "major_%s_grade_%d", majors[major_idx], grade);
+        return;
+    }
+
+    if (strcmp(background, "newgrad") == 0) {
+        snprintf(buffer, buffer_size, "major_%s_graduate", majors[major_idx]);
+        return;
+    }
+
+    if (strcmp(background, "incumbent") == 0) {
+        int role_idx = ((id - 1) / 5) % (int)(sizeof(incumbent_roles) / sizeof(incumbent_roles[0]));
+        int years = ((id - 1) / 11) % 6 + 1;
+        snprintf(buffer, buffer_size, "%s_%dy", incumbent_roles[role_idx], years);
+        return;
+    }
+
+    if (strcmp(background, "switcher") == 0) {
+        int role_idx = ((id - 1) / 9) % (int)(sizeof(switcher_roles) / sizeof(switcher_roles[0]));
+        int years = ((id - 1) / 13) % 8 + 1;
+        snprintf(buffer, buffer_size, "%s_%dy", switcher_roles[role_idx], years);
+        return;
+    }
+
+    {
+        int route_idx = ((id - 1) / 17) % (int)(sizeof(selftaught_routes) / sizeof(selftaught_routes[0]));
+        int months = ((((id - 1) / 19) % 9) + 1) * 6;
+        snprintf(buffer, buffer_size, "%s_%dm", selftaught_routes[route_idx], months);
+    }
+}
+
+static void build_jungle_github(int id, const char *background, char *buffer, size_t buffer_size) {
+    int bucket = (int)(((long long)id * 29LL + 7LL) % 100LL);
+
+    if ((strcmp(background, "student") == 0 && bucket < 18) ||
+        (strcmp(background, "newgrad") == 0 && bucket < 8) ||
+        (strcmp(background, "switcher") == 0 && bucket < 10) ||
+        (strcmp(background, "selftaught") == 0 && bucket < 6)) {
+        snprintf(buffer, buffer_size, "none");
+        return;
+    }
+
+    snprintf(buffer, buffer_size, "gh_%07d", id);
+}
+
+static const char *jungle_status_for_id(int id, int pretest) {
+    if (id % 113 == 0) return "withdrawn";
+    if (pretest >= 98) return "final_pass";
+    if (pretest >= 90) return "final_wait";
+    if (pretest >= 80) return "interview_wait";
+    if (pretest >= 65) return "pretest_pass";
+    if (pretest >= 50) return "submitted";
+    return "rejected";
+}
+
+static void build_jungle_email(int id, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "jungle%07d@apply.kr", id);
+}
+
+static void build_jungle_phone(int id, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "010-%04d-%04d", id / 10000, id % 10000);
+}
+
+static void build_jungle_name(int id, char *buffer, size_t buffer_size) {
+    static const char *const surnames[] = {
+        "김", "이", "박", "최", "정", "강", "조", "윤", "장", "임",
+        "한", "오", "서", "신", "권", "황", "안", "송", "전", "홍"
+    };
+    static const char *const first_syllables[] = {
+        "민", "서", "지", "도", "하", "수", "예", "시",
+        "현", "준", "유", "주", "다", "윤", "태", "선",
+        "건", "채", "승", "정", "호", "은", "재", "가",
+        "나", "라", "마", "소", "아", "연", "원", "진",
+        "혜", "규", "한", "슬", "보", "새", "강", "온",
+        "루", "단", "류", "리", "해", "별", "솔", "율"
+    };
+    static const char *const second_syllables[] = {
+        "준", "연", "후", "윤", "린", "민", "아", "우",
+        "서", "진", "수", "영", "원", "호", "혜", "현",
+        "지", "인", "온", "별", "율", "나", "리", "빈",
+        "솔", "람", "훈", "석", "비", "담", "새", "균",
+        "채", "한", "태", "경", "슬", "주", "재", "강",
+        "선", "도", "희", "휘", "록", "봄", "혁", "화"
+    };
+    int surname_count = (int)(sizeof(surnames) / sizeof(surnames[0]));
+    int first_count = (int)(sizeof(first_syllables) / sizeof(first_syllables[0]));
+    int second_count = (int)(sizeof(second_syllables) / sizeof(second_syllables[0]));
+    int surname_idx = (id - 1) % surname_count;
+    int given_combo = ((id - 1) / surname_count) % (first_count * second_count);
+    int first_idx = given_combo / second_count;
+    int second_idx = given_combo % second_count;
+
+    snprintf(buffer, buffer_size, "%s%s%s",
+             surnames[surname_idx], first_syllables[first_idx], second_syllables[second_idx]);
+}
+
+static void build_jungle_row_data(int id, char *buffer, size_t buffer_size) {
+    const char *track = jungle_track_for_id(id);
+    const char *background = jungle_background_for_id(id);
+    int pretest = jungle_pretest_for_id(id);
+    const char *status = jungle_status_for_id(id, pretest);
+    char email[64];
+    char phone[32];
+    char name[64];
+    char history[64];
+    char github[32];
+
+    build_jungle_email(id, email, sizeof(email));
+    build_jungle_phone(id, phone, sizeof(phone));
+    build_jungle_name(id, name, sizeof(name));
+    build_jungle_history(id, background, history, sizeof(history));
+    build_jungle_github(id, background, github, sizeof(github));
+    snprintf(buffer, buffer_size, "%s,%s,%s,%s,%s,%s,%d,%s,%s,2026_spring",
+             email, phone, name, track, background, history, pretest, github, status);
+}
+
+static void build_jungle_csv_record(int id, char *buffer, size_t buffer_size) {
+    const char *track = jungle_track_for_id(id);
+    const char *background = jungle_background_for_id(id);
+    int pretest = jungle_pretest_for_id(id);
+    const char *status = jungle_status_for_id(id, pretest);
+    char email[64];
+    char phone[32];
+    char name[64];
+    char history[64];
+    char github[32];
+
+    build_jungle_email(id, email, sizeof(email));
+    build_jungle_phone(id, phone, sizeof(phone));
+    build_jungle_name(id, name, sizeof(name));
+    build_jungle_history(id, background, history, sizeof(history));
+    build_jungle_github(id, background, github, sizeof(github));
+    snprintf(buffer, buffer_size, "%d,%s,%s,%s,%s,%s,%s,%d,%s,%s,2026_spring",
+             id, email, phone, name, track, background, history, pretest, github, status);
+}
+
+void generate_jungle_dataset(int record_count, const char *filename) {
+    FILE *f;
+    int i;
+    const char *output = (filename && filename[0]) ? filename : JUNGLE_BENCHMARK_CSV;
+
+    record_count = clamp_record_count(record_count <= 0 ? 1000000 : record_count, 1);
+    if (path_exists(output)) {
+        printf("[safe-stop] dataset file already exists: %s\n", output);
+        printf("[notice] No CSV files were overwritten. Choose a new filename or remove it manually.\n");
+        return;
+    }
+
+    f = fopen(output, "wb");
+    if (!f) {
+        printf("[error] dataset file could not be created: %s\n", output);
+        return;
+    }
+    if (fputs(JUNGLE_BENCHMARK_HEADER, f) == EOF) {
+        fclose(f);
+        printf("[error] dataset header could not be written: %s\n", output);
+        return;
+    }
+
+    for (i = 1; i <= record_count; i++) {
+        char row[512];
+        build_jungle_csv_record(i, row, sizeof(row));
+        if (fputs(row, f) == EOF || fputc('\n', f) == EOF) {
+            fclose(f);
+            printf("[error] dataset write failed at row %d.\n", i);
+            return;
+        }
+    }
+
+    if (fclose(f) != 0) {
+        printf("[error] dataset file close failed: %s\n", output);
+        return;
+    }
+
+    printf("[ok] jungle applicant dataset generated: %s (%d rows)\n", output, record_count);
 }
 
 static int unique_index_insert(TableCache *tc, UniqueIndex *index, const char *key, int row_index) {
@@ -1529,6 +1764,66 @@ fail:
     return 0;
 }
 
+static int compact_table_file_for_shutdown(TableCache *tc) {
+    char filename[300];
+    char temp_filename[320];
+    char delta_filename[300];
+    FILE *out;
+    int i;
+
+    if (!tc || !tc->file) return 1;
+    snprintf(filename, sizeof(filename), "%s.csv", tc->table_name);
+    snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", filename);
+    get_delta_filename(tc, delta_filename, sizeof(delta_filename));
+
+    out = fopen(temp_filename, "wb");
+    if (!out) return 0;
+    if (!write_table_header(out, tc)) goto fail;
+    for (i = 0; i < tc->record_count; i++) {
+        char *row;
+
+        if (!slot_is_active(tc, i)) continue;
+        row = slot_row(tc, i);
+        if (!row || fprintf(out, "%s\n", row) < 0) goto fail;
+    }
+    if (fflush(out) != 0 || ferror(out)) goto fail;
+    if (fclose(out) != 0) {
+        remove(temp_filename);
+        return 0;
+    }
+    out = NULL;
+
+    if (tc->delta_file) {
+        if (!close_delta_batch(tc)) {
+            remove(temp_filename);
+            return 0;
+        }
+        fclose(tc->delta_file);
+        tc->delta_file = NULL;
+    }
+    if (fflush(tc->file) != 0) {
+        remove(temp_filename);
+        return 0;
+    }
+    fclose(tc->file);
+    tc->file = NULL;
+    if (!replace_table_file(temp_filename, filename)) {
+        remove(temp_filename);
+        return 0;
+    }
+    remove(delta_filename);
+    remove_index_snapshot(tc);
+    tc->delta_batch_open = 0;
+    tc->delta_ops_since_compact_check = 0;
+    tc->delta_bytes_since_compact = 0;
+    return 1;
+
+fail:
+    if (out) fclose(out);
+    remove(temp_filename);
+    return 0;
+}
+
 static int rebuild_id_index(TableCache *tc) {
     BPlusTree *new_index;
     BPlusPair *pairs = NULL;
@@ -2399,12 +2694,14 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
     char line[RECORD_SIZE];
     long line_number = 1;
     long file_next_auto_id = 1;
+    int has_delta_log;
 
     reset_table_cache(tc);
     if (!tc->id_index) return 0;
     strncpy(tc->table_name, name, sizeof(tc->table_name) - 1);
     tc->file = f;
     touch_table(tc);
+    has_delta_log = delta_log_exists(tc);
 
     if (fgets(header, sizeof(header), f)) {
         if ((unsigned char)header[0] == 0xEF &&
@@ -2488,10 +2785,12 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
                 printf("[error] failed to load row into memory.\n");
                 return 0;
             }
-            if (bptree_insert(tc->id_index, tc->pk_idx != -1 ? id_value : row_id, loaded_slot) != 1 ||
-                !index_record_uks_from_row(tc, line, loaded_slot)) {
-                printf("[error] failed to build indexes while loading '%s'.\n", name);
-                return 0;
+            if (!has_delta_log) {
+                if (bptree_insert(tc->id_index, tc->pk_idx != -1 ? id_value : row_id, loaded_slot) != 1 ||
+                    !index_record_uks_from_row(tc, line, loaded_slot)) {
+                    printf("[error] failed to build indexes while loading '%s'.\n", name);
+                    return 0;
+                }
             }
         } else {
             if (!tc->cache_truncated) tc->uncached_start_offset = row_offset;
@@ -2502,7 +2801,16 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
             tc->cache_truncated = 1;
         }
     }
-    if (!delta_log_exists(tc)) {
+    if (has_delta_log && tc->active_count == 0 && tc->tail_count == 0) {
+        if (!clear_delta_log(tc)) {
+            printf("[error] failed to clear stale delta log for empty table '%s'.\n", name);
+            return 0;
+        }
+        remove_index_snapshot(tc);
+        has_delta_log = 0;
+    }
+
+    if (!has_delta_log) {
         if (tc->active_count == 0) {
             remove_index_snapshot(tc);
         } else if (!load_index_snapshot(tc)) {
@@ -2808,45 +3116,41 @@ void execute_insert(Statement *stmt) {
     INFO_PRINTF("[ok] INSERT completed. id=%ld\n", id_value);
 }
 
-static void print_selected_row(const char *row, int select_idx[MAX_COLS], int select_count, int select_all) {
-    char row_buf[RECORD_SIZE];
-    char *fields[MAX_COLS] = {0};
-    int j;
-
-    if (select_all) {
-        printf("%s\n", row);
-        return;
-    }
-    parse_csv_row(row, fields, row_buf);
-    for (j = 0; j < select_count; j++) {
-        if (j > 0) printf(",");
-        printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
-    }
-    printf("\n");
-}
-
-static void print_selected_fields(const char *row, char *fields[MAX_COLS],
-                                  int select_idx[MAX_COLS], int select_count, int select_all) {
-    int j;
-
-    if (select_all) {
-        printf("%s\n", row);
-        return;
-    }
-    for (j = 0; j < select_count; j++) {
-        if (j > 0) printf(",");
-        printf("%s", fields[select_idx[j]] ? fields[select_idx[j]] : "");
-    }
-    printf("\n");
-}
+typedef struct {
+    int select_idx[MAX_COLS];
+    int select_count;
+    int select_all;
+    int emit_results;
+    int emit_traces;
+    int matched_rows;
+} SelectExecContext;
 
 typedef struct {
     TableCache *tc;
     Statement *stmt;
-    int select_idx[MAX_COLS];
-    int select_count;
-    int select_all;
+    SelectExecContext *exec;
 } RangePrintContext;
+
+static void emit_selected_row(const char *row, SelectExecContext *exec) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    int j;
+
+    if (!row || !exec) return;
+    exec->matched_rows++;
+    if (!exec->emit_results) return;
+
+    if (exec->select_all) {
+        printf("%s\n", row);
+        return;
+    }
+    parse_csv_row(row, fields, row_buf);
+    for (j = 0; j < exec->select_count; j++) {
+        if (j > 0) printf(",");
+        printf("%s", fields[exec->select_idx[j]] ? fields[exec->select_idx[j]] : "");
+    }
+    printf("\n");
+}
 
 static int condition_column_index(TableCache *tc, const WhereCondition *cond) {
     if (!cond || cond->type == WHERE_NONE) return -1;
@@ -2954,23 +3258,16 @@ static int choose_index_condition(TableCache *tc, Statement *stmt, int allow_ran
     if (where_idx) *where_idx = best_col;
     return 1;
 }
-
 static int print_range_row_visitor(long key, int row_index, void *ctx) {
     RangePrintContext *range_ctx = (RangePrintContext *)ctx;
     (void)key;
 
-    if (!range_ctx || !range_ctx->tc) return 0;
+    if (!range_ctx || !range_ctx->tc || !range_ctx->exec) return 0;
     if (!slot_is_active(range_ctx->tc, row_index)) return 1;
     {
         char *row = slot_row(range_ctx->tc, row_index);
-        if (row) {
-            char row_buf[RECORD_SIZE];
-            char *fields[MAX_COLS] = {0};
-            parse_csv_row(row, fields, row_buf);
-            if (row_fields_match_statement(range_ctx->tc, range_ctx->stmt, fields)) {
-                print_selected_fields(row, fields, range_ctx->select_idx,
-                                      range_ctx->select_count, range_ctx->select_all);
-            }
+        if (row && row_matches_statement(range_ctx->tc, range_ctx->stmt, row)) {
+            emit_selected_row(row, range_ctx->exec);
         }
     }
     return 1;
@@ -2980,29 +3277,22 @@ static int print_string_range_row_visitor(const char *key, int row_index, void *
     RangePrintContext *range_ctx = (RangePrintContext *)ctx;
     (void)key;
 
-    if (!range_ctx || !range_ctx->tc) return 0;
+    if (!range_ctx || !range_ctx->tc || !range_ctx->exec) return 0;
     if (!slot_is_active(range_ctx->tc, row_index)) return 1;
     {
         char *row = slot_row(range_ctx->tc, row_index);
-        if (row) {
-            char row_buf[RECORD_SIZE];
-            char *fields[MAX_COLS] = {0};
-            parse_csv_row(row, fields, row_buf);
-            if (row_fields_match_statement(range_ctx->tc, range_ctx->stmt, fields)) {
-                print_selected_fields(row, fields, range_ctx->select_idx,
-                                      range_ctx->select_count, range_ctx->select_all);
-            }
+        if (row && row_matches_statement(range_ctx->tc, range_ctx->stmt, row)) {
+            emit_selected_row(row, range_ctx->exec);
         }
     }
     return 1;
 }
 
-static void execute_select_file_scan_filtered(TableCache *tc, long start_offset, Statement *stmt,
-                                              int select_idx[MAX_COLS], int select_count,
-                                              int select_all) {
+static void execute_select_file_scan(TableCache *tc, long start_offset, Statement *stmt,
+                                     SelectExecContext *exec) {
     char line[RECORD_SIZE];
 
-    if (!tc || !tc->file || !stmt) return;
+    if (!tc || !tc->file || !stmt || !exec) return;
     if (fflush(tc->file) != 0) {
         printf("[error] SELECT failed: could not scan table file.\n");
         return;
@@ -3012,7 +3302,7 @@ static void execute_select_file_scan_filtered(TableCache *tc, long start_offset,
             printf("[error] SELECT failed: could not scan uncached table rows.\n");
             return;
         }
-        printf("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
+        if (exec->emit_traces) printf("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
     } else {
         if (fseek(tc->file, 0, SEEK_SET) != 0) {
             printf("[error] SELECT failed: could not scan table file.\n");
@@ -3022,7 +3312,7 @@ static void execute_select_file_scan_filtered(TableCache *tc, long start_offset,
             fseek(tc->file, 0, SEEK_END);
             return;
         }
-        printf("[scan] full CSV scan\n");
+        if (exec->emit_traces) printf("[scan] full CSV scan\n");
     }
 
     while (fgets(line, sizeof(line), tc->file)) {
@@ -3037,78 +3327,20 @@ static void execute_select_file_scan_filtered(TableCache *tc, long start_offset,
         }
         if (nl) *nl = '\0';
         if (strlen(line) == 0) continue;
-        {
-            char row_buf[RECORD_SIZE];
-            char *fields[MAX_COLS] = {0};
-            parse_csv_row(line, fields, row_buf);
-            if (!row_fields_match_statement(tc, stmt, fields)) continue;
-            print_selected_fields(line, fields, select_idx, select_count, select_all);
-        }
-    }
-    fseek(tc->file, 0, SEEK_END);
-}
-
-static void execute_select_file_scan(TableCache *tc, long start_offset, int where_idx,
-                                     int select_idx[MAX_COLS], int select_count,
-                                     int select_all, const char *where_val) {
-    char line[RECORD_SIZE];
-
-    if (!tc || !tc->file) return;
-    if (fflush(tc->file) != 0) {
-        printf("[error] SELECT failed: could not scan table file.\n");
-        return;
-    }
-    if (start_offset > 0) {
-        if (fseek(tc->file, start_offset, SEEK_SET) != 0) {
-            printf("[error] SELECT failed: could not scan uncached table rows.\n");
-            return;
-        }
-        printf("[scan] uncached CSV tail scan from offset %ld\n", start_offset);
-    } else {
-        if (fseek(tc->file, 0, SEEK_SET) != 0) {
-            printf("[error] SELECT failed: could not scan table file.\n");
-            return;
-        }
-        if (!fgets(line, sizeof(line), tc->file)) {
-            fseek(tc->file, 0, SEEK_END);
-            return;
-        }
-        printf("[scan] full CSV scan\n");
-    }
-
-    while (fgets(line, sizeof(line), tc->file)) {
-        char *nl = strpbrk(line, "\r\n");
-        size_t line_len = strlen(line);
-
-        if (!nl && line_len == sizeof(line) - 1 && !feof(tc->file)) {
-            printf("[error] row too long while scanning '%s' (max %d bytes).\n",
-                   tc->table_name, RECORD_SIZE - 1);
-            fseek(tc->file, 0, SEEK_END);
-            return;
-        }
-        if (nl) *nl = '\0';
-        if (strlen(line) == 0) continue;
-        if (where_idx != -1) {
-            char row_buf[RECORD_SIZE];
-            char *fields[MAX_COLS] = {0};
-            parse_csv_row(line, fields, row_buf);
-            if (!compare_value(fields[where_idx], where_val)) continue;
-        }
-        print_selected_row(line, select_idx, select_count, select_all);
+        if (!row_matches_statement(tc, stmt, line)) continue;
+        emit_selected_row(line, exec);
     }
     fseek(tc->file, 0, SEEK_END);
 }
 
 static int print_tail_pk_offset_row(TableCache *tc, long offset, long key,
-                                    Statement *stmt,
-                                    int select_idx[MAX_COLS], int select_count,
-                                    int select_all) {
+                                    Statement *stmt, SelectExecContext *exec) {
     char line[RECORD_SIZE];
     char *nl;
     size_t line_len;
     long row_id;
 
-    if (!tc || !tc->file || offset < 0) return 0;
+    if (!tc || !tc->file || offset < 0 || !exec) return 0;
     if (fflush(tc->file) != 0 || fseek(tc->file, offset, SEEK_SET) != 0) return 0;
     if (!fgets(line, sizeof(line), tc->file)) {
         fseek(tc->file, 0, SEEK_END);
@@ -3129,18 +3361,18 @@ static int print_tail_pk_offset_row(TableCache *tc, long offset, long key,
         fseek(tc->file, 0, SEEK_END);
         return 0;
     }
-    INFO_PRINTF("[index] tail PK offset lookup\n");
-    print_selected_row(line, select_idx, select_count, select_all);
+    if (exec->emit_traces) INFO_PRINTF("[index] tail PK offset lookup\n");
+    emit_selected_row(line, exec);
     fseek(tc->file, 0, SEEK_END);
     return 1;
 }
 
-static void execute_select_file_range_scan(TableCache *tc, long start_offset, int where_idx,
-                                           int select_idx[MAX_COLS], int select_count,
-                                           int select_all, long start_key, long end_key) {
+static void execute_select_file_range_scan(TableCache *tc, long start_offset, Statement *stmt,
+                                           int where_idx, SelectExecContext *exec,
+                                           long start_key, long end_key) {
     char line[RECORD_SIZE];
 
-    if (!tc || !tc->file || start_key > end_key) return;
+    if (!tc || !tc->file || !stmt || !exec || start_key > end_key) return;
     if (fflush(tc->file) != 0) {
         printf("[error] SELECT failed: could not scan table file.\n");
         return;
@@ -3150,7 +3382,7 @@ static void execute_select_file_range_scan(TableCache *tc, long start_offset, in
             printf("[error] SELECT failed: could not seek uncached CSV tail.\n");
             return;
         }
-        printf("[scan] uncached CSV tail range scan from offset %ld\n", start_offset);
+        if (exec->emit_traces) printf("[scan] uncached CSV tail range scan from offset %ld\n", start_offset);
     } else {
         if (fseek(tc->file, 0, SEEK_SET) != 0) {
             printf("[error] SELECT failed: could not scan table file.\n");
@@ -3160,7 +3392,7 @@ static void execute_select_file_range_scan(TableCache *tc, long start_offset, in
             fseek(tc->file, 0, SEEK_END);
             return;
         }
-        printf("[scan] full CSV range scan\n");
+        if (exec->emit_traces) printf("[scan] full CSV range scan\n");
     }
 
     while (fgets(line, sizeof(line), tc->file)) {
@@ -3180,20 +3412,23 @@ static void execute_select_file_range_scan(TableCache *tc, long start_offset, in
         if (strlen(line) == 0) continue;
         parse_csv_row(line, fields, row_buf);
         if (!parse_long_value(fields[where_idx], &row_key)) continue;
-        if (row_key >= start_key && row_key <= end_key) {
-            print_selected_row(line, select_idx, select_count, select_all);
+        if (row_key >= start_key && row_key <= end_key &&
+            row_fields_match_statement(tc, stmt, fields)) {
+            emit_selected_row(line, exec);
         }
     }
     fseek(tc->file, 0, SEEK_END);
 }
 
-static void execute_select_file_string_range_scan(TableCache *tc, long start_offset, int where_idx,
-                                                  int select_idx[MAX_COLS], int select_count,
-                                                  int select_all, const char *start_key,
-                                                  const char *end_key) {
+static void execute_select_file_string_range_scan(TableCache *tc, long start_offset, Statement *stmt,
+                                                  int where_idx, SelectExecContext *exec,
+                                                  const char *start_key, const char *end_key) {
     char line[RECORD_SIZE];
 
-    if (!tc || !tc->file || !start_key || !end_key || strcmp(start_key, end_key) > 0) return;
+    if (!tc || !tc->file || !stmt || !exec || !start_key || !end_key ||
+        strcmp(start_key, end_key) > 0) {
+        return;
+    }
     if (fflush(tc->file) != 0) {
         printf("[error] SELECT failed: could not scan table file.\n");
         return;
@@ -3203,7 +3438,7 @@ static void execute_select_file_string_range_scan(TableCache *tc, long start_off
             printf("[error] SELECT failed: could not seek uncached CSV tail.\n");
             return;
         }
-        printf("[scan] uncached CSV tail string range scan from offset %ld\n", start_offset);
+        if (exec->emit_traces) printf("[scan] uncached CSV tail string range scan from offset %ld\n", start_offset);
     } else {
         if (fseek(tc->file, 0, SEEK_SET) != 0) {
             printf("[error] SELECT failed: could not scan table file.\n");
@@ -3213,7 +3448,7 @@ static void execute_select_file_string_range_scan(TableCache *tc, long start_off
             fseek(tc->file, 0, SEEK_END);
             return;
         }
-        printf("[scan] full CSV string range scan\n");
+        if (exec->emit_traces) printf("[scan] full CSV string range scan\n");
     }
 
     while (fgets(line, sizeof(line), tc->file)) {
@@ -3233,38 +3468,44 @@ static void execute_select_file_string_range_scan(TableCache *tc, long start_off
         if (strlen(line) == 0) continue;
         parse_csv_row(line, fields, row_buf);
         normalize_value(fields[where_idx], key, sizeof(key));
-        if (strcmp(key, start_key) >= 0 && strcmp(key, end_key) <= 0) {
-            print_selected_row(line, select_idx, select_count, select_all);
+        if (strcmp(key, start_key) >= 0 && strcmp(key, end_key) <= 0 &&
+            row_fields_match_statement(tc, stmt, fields)) {
+            emit_selected_row(line, exec);
         }
     }
     fseek(tc->file, 0, SEEK_END);
 }
 
-void execute_select(Statement *stmt) {
+static int execute_select_internal(Statement *stmt, int emit_results, int emit_traces, int *matched_rows) {
     TableCache *tc = get_table(stmt->table_name);
-    int select_idx[MAX_COLS];
-    int select_count = 0;
     int index_cond = -1;
     int index_col = -1;
+    SelectExecContext exec;
     int i;
 
-    if (!tc) return;
-    if (!validate_where_columns(tc, stmt, "SELECT")) return;
+    if (matched_rows) *matched_rows = 0;
+    if (!tc) return 0;
+    if (!validate_where_columns(tc, stmt, "SELECT")) return 0;
+    memset(&exec, 0, sizeof(exec));
+    exec.select_all = stmt->select_all;
+    exec.emit_results = emit_results;
+    exec.emit_traces = emit_traces;
 
     if (!stmt->select_all) {
         for (i = 0; i < stmt->select_col_count; i++) {
             int idx = get_col_idx(tc, stmt->select_cols[i]);
             if (idx == -1) {
                 printf("[error] SELECT failed: unknown column '%s'.\n", stmt->select_cols[i]);
-                return;
+                return 0;
             }
-            select_idx[i] = idx;
+            exec.select_idx[i] = idx;
         }
-        select_count = stmt->select_col_count;
+        exec.select_count = stmt->select_col_count;
     }
 
-    printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
+    if (exec.emit_results) printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
     choose_index_condition(tc, stmt, 1, &index_cond, &index_col);
+
     if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_BETWEEN) {
         WhereCondition *cond = &stmt->where_conditions[index_cond];
         long start_key;
@@ -3273,54 +3514,54 @@ void execute_select(Statement *stmt) {
 
         range_ctx.tc = tc;
         range_ctx.stmt = stmt;
-        memcpy(range_ctx.select_idx, select_idx, sizeof(range_ctx.select_idx));
-        range_ctx.select_count = select_count;
-        range_ctx.select_all = stmt->select_all;
+        range_ctx.exec = &exec;
 
         if (index_col == tc->pk_idx) {
             if (!parse_long_value(cond->val, &start_key) ||
                 !parse_long_value(cond->end_val, &end_key)) {
                 printf("[error] SELECT failed: BETWEEN bounds must be integers for PK range search.\n");
-                return;
+                return 0;
             }
-            INFO_PRINTF("[index] B+ tree id range lookup\n");
+            if (exec.emit_traces) INFO_PRINTF("[index] B+ tree id range lookup\n");
             if (!bptree_range_search(tc->id_index, start_key, end_key, print_range_row_visitor, &range_ctx)) {
                 printf("[error] SELECT failed: B+ tree range scan failed.\n");
-                return;
+                return 0;
             }
             if (tc->cache_truncated) {
-                execute_select_file_scan_filtered(tc, tc->uncached_start_offset, stmt, select_idx,
-                                                  select_count, stmt->select_all);
+                execute_select_file_range_scan(tc, tc->uncached_start_offset, stmt, index_col, &exec,
+                                               start_key, end_key);
             }
-            return;
+            if (matched_rows) *matched_rows = exec.matched_rows;
+            return 1;
         }
 
-        if (tc->cols[index_col].type == COL_UK) {
+        if (get_uk_slot(tc, index_col) != -1) {
             int uk_slot = get_uk_slot(tc, index_col);
             char start_text[RECORD_SIZE];
             char end_text[RECORD_SIZE];
 
             if (uk_slot == -1 || !ensure_uk_indexes(tc)) {
                 printf("[error] SELECT failed: UK index is not available.\n");
-                return;
+                return 0;
             }
             normalize_value(cond->val, start_text, sizeof(start_text));
             normalize_value(cond->end_val, end_text, sizeof(end_text));
-            INFO_PRINTF("[index] UK B+ tree range lookup on column '%s'\n", cond->col);
+            if (exec.emit_traces) INFO_PRINTF("[index] UK B+ tree range lookup on column '%s'\n", cond->col);
             if (!bptree_string_range_search(tc->uk_indexes[uk_slot]->tree, start_text, end_text,
                                             print_string_range_row_visitor, &range_ctx)) {
                 printf("[error] SELECT failed: UK B+ tree range scan failed.\n");
-                return;
+                return 0;
             }
             if (tc->cache_truncated) {
-                execute_select_file_scan_filtered(tc, tc->uncached_start_offset, stmt, select_idx,
-                                                  select_count, stmt->select_all);
+                execute_select_file_string_range_scan(tc, tc->uncached_start_offset, stmt, index_col, &exec,
+                                                      start_text, end_text);
             }
-            return;
+            if (matched_rows) *matched_rows = exec.matched_rows;
+            return 1;
         }
 
         printf("[error] SELECT failed: BETWEEN uses PK or UK B+ tree indexes only.\n");
-        return;
+        return 0;
     }
 
     if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_EQ &&
@@ -3330,56 +3571,51 @@ void execute_select(Statement *stmt) {
         int row_index;
         if (!parse_long_value(cond->val, &key)) {
             printf("[error] SELECT failed: id condition must be an integer.\n");
-            return;
+            return 0;
         }
-        INFO_PRINTF("[index] B+ tree id lookup\n");
+        if (exec.emit_traces) INFO_PRINTF("[index] B+ tree id lookup\n");
         if (bptree_search(tc->id_index, key, &row_index)) {
             char *row = slot_row(tc, row_index);
-            if (row) {
-                char row_buf[RECORD_SIZE];
-                char *fields[MAX_COLS] = {0};
-                parse_csv_row(row, fields, row_buf);
-                if (row_fields_match_statement(tc, stmt, fields)) {
-                    print_selected_fields(row, fields, select_idx, select_count, stmt->select_all);
-                }
-            }
-            return;
+            if (row && row_matches_statement(tc, stmt, row)) emit_selected_row(row, &exec);
+            if (matched_rows) *matched_rows = exec.matched_rows;
+            return 1;
         }
         if (tc->cache_truncated) {
             long tail_offset;
             if (find_tail_pk_offset(tc, key, &tail_offset) &&
-                print_tail_pk_offset_row(tc, tail_offset, key, stmt, select_idx, select_count, stmt->select_all)) {
-                return;
+                print_tail_pk_offset_row(tc, tail_offset, key, stmt, &exec)) {
+                if (matched_rows) *matched_rows = exec.matched_rows;
+                return 1;
             }
+            execute_select_file_scan(tc, tc->uncached_start_offset, stmt, &exec);
         }
-        return;
+        if (matched_rows) *matched_rows = exec.matched_rows;
+        return 1;
     }
 
     if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_EQ &&
-        index_col != -1 && tc->cols[index_col].type == COL_UK) {
+        index_col != -1 && get_uk_slot(tc, index_col) != -1) {
         WhereCondition *cond = &stmt->where_conditions[index_cond];
         int row_index;
-        INFO_PRINTF("[index] UK B+ tree lookup on column '%s'\n", cond->col);
+        if (exec.emit_traces) INFO_PRINTF("[index] UK B+ tree lookup on column '%s'\n", cond->col);
         if (find_uk_row(tc, index_col, cond->val, &row_index)) {
             char *row = slot_row(tc, row_index);
-            if (row) {
-                char row_buf[RECORD_SIZE];
-                char *fields[MAX_COLS] = {0};
-                parse_csv_row(row, fields, row_buf);
-                if (row_fields_match_statement(tc, stmt, fields)) {
-                    print_selected_fields(row, fields, select_idx, select_count, stmt->select_all);
-                }
-            }
-            return;
+            if (row && row_matches_statement(tc, stmt, row)) emit_selected_row(row, &exec);
+            if (matched_rows) *matched_rows = exec.matched_rows;
+            return 1;
         }
         if (tc->cache_truncated) {
-            execute_select_file_scan_filtered(tc, tc->uncached_start_offset, stmt, select_idx,
-                                              select_count, stmt->select_all);
+            execute_select_file_scan(tc, tc->uncached_start_offset, stmt, &exec);
         }
-        return;
+        if (matched_rows) *matched_rows = exec.matched_rows;
+        return 1;
     }
 
-    if (stmt->where_count > 0) printf("[scan] linear scan with %d WHERE condition(s)\n", stmt->where_count);
+    if (stmt->where_count == 1 && exec.emit_traces) {
+        printf("[scan] linear scan on column '%s'\n", stmt->where_conditions[0].col);
+    } else if (stmt->where_count > 1 && exec.emit_traces) {
+        printf("[scan] linear scan with %d WHERE condition(s)\n", stmt->where_count);
+    }
     for (i = 0; i < tc->record_count; i++) {
         int owned = 0;
         char *row = slot_row_scan(tc, i, &owned);
@@ -3392,14 +3628,19 @@ void execute_select(Statement *stmt) {
                 if (owned) free(row);
                 continue;
             }
-            print_selected_fields(row, fields, select_idx, select_count, stmt->select_all);
         }
+        emit_selected_row(row, &exec);
         if (owned) free(row);
     }
     if (tc->cache_truncated) {
-        execute_select_file_scan_filtered(tc, tc->uncached_start_offset, stmt, select_idx,
-                                          select_count, stmt->select_all);
+        execute_select_file_scan(tc, tc->uncached_start_offset, stmt, &exec);
     }
+    if (matched_rows) *matched_rows = exec.matched_rows;
+    return 1;
+}
+
+void execute_select(Statement *stmt) {
+    (void)execute_select_internal(stmt, 1, 1, NULL);
 }
 
 static int rewrite_truncated_update(TableCache *tc, Statement *stmt,
@@ -4062,6 +4303,208 @@ static double current_seconds(void) {
 #endif
 }
 
+static void init_eq_select_statement(Statement *stmt, const char *table_name, const char *where_col) {
+    if (!stmt) return;
+    memset(stmt, 0, sizeof(*stmt));
+    stmt->type = STMT_SELECT;
+    stmt->select_all = 1;
+    stmt->where_count = 1;
+    stmt->where_type = WHERE_EQ;
+    strncpy(stmt->table_name, table_name ? table_name : "", sizeof(stmt->table_name) - 1);
+    stmt->table_name[sizeof(stmt->table_name) - 1] = '\0';
+    strncpy(stmt->where_col, where_col ? where_col : "", sizeof(stmt->where_col) - 1);
+    stmt->where_col[sizeof(stmt->where_col) - 1] = '\0';
+    stmt->where_conditions[0].type = WHERE_EQ;
+    strncpy(stmt->where_conditions[0].col, stmt->where_col, sizeof(stmt->where_conditions[0].col) - 1);
+    stmt->where_conditions[0].col[sizeof(stmt->where_conditions[0].col) - 1] = '\0';
+}
+
+static void set_eq_select_value(Statement *stmt, const char *value) {
+    if (!stmt) return;
+    strncpy(stmt->where_val, value ? value : "", sizeof(stmt->where_val) - 1);
+    stmt->where_val[sizeof(stmt->where_val) - 1] = '\0';
+    if (stmt->where_count > 0) {
+        strncpy(stmt->where_conditions[0].val, stmt->where_val,
+                sizeof(stmt->where_conditions[0].val) - 1);
+        stmt->where_conditions[0].val[sizeof(stmt->where_conditions[0].val) - 1] = '\0';
+        stmt->where_conditions[0].end_val[0] = '\0';
+    }
+}
+
+static int ensure_jungle_benchmark_artifacts_absent(void) {
+    const char *artifacts[] = {
+        JUNGLE_BENCHMARK_CSV,
+        "jungle_benchmark_users.delta",
+        "jungle_benchmark_users.idx"
+    };
+    int i;
+
+    for (i = 0; i < (int)(sizeof(artifacts) / sizeof(artifacts[0])); i++) {
+        if (!path_exists(artifacts[i])) continue;
+        printf("[safe-stop] jungle benchmark artifact already exists: %s\n", artifacts[i]);
+        printf("[notice] No files were deleted. Remove or rename the artifact manually, then rerun --benchmark-jungle.\n");
+        return 0;
+    }
+    return 1;
+}
+
+void run_jungle_benchmark(int record_count) {
+    FILE *f;
+    TableCache *tc;
+    Statement stmt;
+    int i;
+    int matched_rows;
+    int matched_checks = 0;
+    const int id_query_count = 100000;
+    const int email_query_count = 100000;
+    const int phone_query_count = 100000;
+    const int linear_query_count = 30;
+    double start;
+    double end;
+    double insert_time;
+    double id_time;
+    double email_time;
+    double phone_time;
+    double linear_time;
+
+    record_count = clamp_record_count(record_count <= 0 ? 1000000 : record_count, 1000000);
+    close_all_tables();
+    open_table_count = 0;
+
+    if (!ensure_jungle_benchmark_artifacts_absent()) return;
+
+    f = fopen(JUNGLE_BENCHMARK_CSV, "wb");
+    if (!f) {
+        printf("[error] jungle benchmark table file could not be created.\n");
+        return;
+    }
+    if (fputs(JUNGLE_BENCHMARK_HEADER, f) == EOF || fclose(f) != 0) {
+        printf("[error] jungle benchmark table header could not be written.\n");
+        return;
+    }
+
+    tc = get_table(JUNGLE_BENCHMARK_TABLE);
+    if (!tc) return;
+
+    start = current_seconds();
+    for (i = 1; i <= record_count; i++) {
+        char row_data[512];
+
+        build_jungle_row_data(i, row_data, sizeof(row_data));
+        if (!insert_row_data(tc, row_data, 0, NULL)) {
+            printf("[error] jungle benchmark insert failed at row %d.\n", i);
+            return;
+        }
+    }
+    if (fflush(tc->file) != 0 || ferror(tc->file)) {
+        printf("[error] jungle benchmark insert flush failed.\n");
+        return;
+    }
+    end = current_seconds();
+    insert_time = end - start;
+
+    printf("\n--- [JUNGLE SQL-PATH BENCHMARK] ---\n");
+    printf("dataset theme: jungle applicants 2026 spring\n");
+    printf("table file: %s\n", JUNGLE_BENCHMARK_CSV);
+    printf("inserted records through INSERT path: %d (%.6f sec)\n", record_count, insert_time);
+
+    init_eq_select_statement(&stmt, JUNGLE_BENCHMARK_TABLE, "id");
+    start = current_seconds();
+    for (i = 0; i < id_query_count; i++) {
+        long key = (long)((i * 7919) % record_count) + 1;
+        char target[32];
+
+        snprintf(target, sizeof(target), "%ld", key);
+        set_eq_select_value(&stmt, target);
+        if (!execute_select_internal(&stmt, 0, 0, &matched_rows)) return;
+        if (matched_rows <= 0) {
+            printf("[error] jungle benchmark ID lookup returned no rows for key %ld.\n", key);
+            return;
+        }
+        matched_checks++;
+    }
+    end = current_seconds();
+    id_time = end - start;
+
+    init_eq_select_statement(&stmt, JUNGLE_BENCHMARK_TABLE, "email");
+    start = current_seconds();
+    for (i = 0; i < email_query_count; i++) {
+        char target[64];
+
+        build_jungle_email(((i * 7919) % record_count) + 1, target, sizeof(target));
+        set_eq_select_value(&stmt, target);
+        if (!execute_select_internal(&stmt, 0, 0, &matched_rows)) return;
+        if (matched_rows <= 0) {
+            printf("[error] jungle benchmark email lookup returned no rows for '%s'.\n", target);
+            return;
+        }
+        matched_checks++;
+    }
+    end = current_seconds();
+    email_time = end - start;
+
+    init_eq_select_statement(&stmt, JUNGLE_BENCHMARK_TABLE, "phone");
+    start = current_seconds();
+    for (i = 0; i < phone_query_count; i++) {
+        char target[32];
+
+        build_jungle_phone(((i * 7919) % record_count) + 1, target, sizeof(target));
+        set_eq_select_value(&stmt, target);
+        if (!execute_select_internal(&stmt, 0, 0, &matched_rows)) return;
+        if (matched_rows <= 0) {
+            printf("[error] jungle benchmark phone lookup returned no rows for '%s'.\n", target);
+            return;
+        }
+        matched_checks++;
+    }
+    end = current_seconds();
+    phone_time = end - start;
+
+    init_eq_select_statement(&stmt, JUNGLE_BENCHMARK_TABLE, "name");
+    start = current_seconds();
+    for (i = 0; i < linear_query_count; i++) {
+        char target[64];
+
+        build_jungle_name(((i * 7919) % record_count) + 1, target, sizeof(target));
+        set_eq_select_value(&stmt, target);
+        if (!execute_select_internal(&stmt, 0, 0, &matched_rows)) return;
+        if (matched_rows <= 0) {
+            printf("[error] jungle benchmark name lookup returned no rows for '%s'.\n", target);
+            return;
+        }
+        matched_checks++;
+    }
+    end = current_seconds();
+    linear_time = end - start;
+
+    printf("records: %d\n", record_count);
+    printf("id SELECT via SQL path using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
+           id_time, id_query_count, id_time / id_query_count);
+    printf("email(UK) SELECT via SQL path using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
+           email_time, email_query_count, email_time / email_query_count);
+    printf("phone(UK) SELECT via SQL path using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
+           phone_time, phone_query_count, phone_time / phone_query_count);
+    printf("name SELECT via SQL path using linear scan: %.6f sec total (%d queries, %.9f sec/query)\n",
+           linear_time, linear_query_count, linear_time / linear_query_count);
+    if (id_time > 0.0) {
+        double index_avg = id_time / id_query_count;
+        double linear_avg = linear_time / linear_query_count;
+        printf("linear/id-index average speed ratio: %.2fx\n", linear_avg / index_avg);
+    }
+    if (email_time > 0.0) {
+        double email_avg = email_time / email_query_count;
+        double linear_avg = linear_time / linear_query_count;
+        printf("linear/email-index average speed ratio: %.2fx\n", linear_avg / email_avg);
+    }
+    if (phone_time > 0.0) {
+        double phone_avg = phone_time / phone_query_count;
+        double linear_avg = linear_time / linear_query_count;
+        printf("linear/phone-index average speed ratio: %.2fx\n", linear_avg / phone_avg);
+    }
+    printf("matched checks: %d\n", matched_checks);
+    fflush(stdout);
+}
+
 void run_bplus_benchmark(int record_count) {
     FILE *f;
     TableCache *tc;
@@ -4343,6 +4786,16 @@ void run_bplus_benchmark(int record_count) {
 
 void close_all_tables(void) {
     int i;
-    for (i = 0; i < open_table_count; i++) free_table_storage(&open_tables[i]);
+    for (i = 0; i < open_table_count; i++) {
+        TableCache *tc = &open_tables[i];
+
+        if (tc->file && !tc->cache_truncated && tc->active_count <= ROW_CACHE_LIMIT && delta_log_exists(tc)) {
+            if (!compact_table_file_for_shutdown(tc)) {
+                INFO_PRINTF("[warning] failed to compact delta-backed table '%s' during shutdown.\n",
+                            tc->table_name);
+            }
+        }
+        free_table_storage(tc);
+    }
     open_table_count = 0;
 }
