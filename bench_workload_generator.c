@@ -16,6 +16,8 @@
 typedef struct {
     const char *profile;
     int rows;
+    int update_rows;
+    int delete_rows;
     int mixed_ops;
     unsigned int seed;
     const char *output_dir;
@@ -29,6 +31,16 @@ static int profile_rows(const char *profile) {
     if (strcmp(profile, "smoke") == 0) return 10000;
     if (strcmp(profile, "regression") == 0) return 100000;
     return 1000000;
+}
+
+static int profile_update_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 100000;
+    return profile_rows(profile);
+}
+
+static int profile_delete_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 100000;
+    return profile_rows(profile);
 }
 
 static int profile_ops(const char *profile) {
@@ -232,12 +244,14 @@ static int write_meta_files(const GeneratorOptions *opt, int generated_rows) {
             "  \"profile\": \"%s\",\n"
             "  \"seed\": %u,\n"
             "  \"row_count\": %d,\n"
+            "  \"update_row_count\": %d,\n"
+            "  \"delete_row_count\": %d,\n"
             "  \"preload\": %d,\n"
             "  \"op_count\": %d,\n"
             "  \"crud_ratio\": {\"select\": 60, \"insert\": 20, \"update\": 15, \"delete\": 5},\n"
             "  \"created_at_epoch\": %ld\n"
             "}\n",
-            opt->profile, opt->seed, generated_rows, opt->rows, opt->mixed_ops, (long)now);
+            opt->profile, opt->seed, generated_rows, opt->update_rows, opt->delete_rows, opt->rows, opt->mixed_ops, (long)now);
     fclose(meta_f);
 
     oracle_f = fopen(oracle_path, "w");
@@ -267,6 +281,8 @@ static int generate_sqls(const GeneratorOptions *opt) {
     char mixed_path[512];
     int *ids = NULL;
     int rows = 0;
+    int update_rows = 0;
+    int delete_rows = 0;
     FILE *mixed_f = NULL;
 
     if (!src) {
@@ -314,8 +330,6 @@ static int generate_sqls(const GeneratorOptions *opt) {
     }
 
     fprintf(insert_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, opt->rows, opt->seed);
-    fprintf(update_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, opt->rows, opt->seed);
-    fprintf(delete_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, opt->rows, opt->seed);
 
     while (rows < opt->rows && fgets(line, sizeof(line), src)) {
         char row_copy[LINE_MAX_LEN];
@@ -343,9 +357,16 @@ static int generate_sqls(const GeneratorOptions *opt) {
         rows++;
     }
 
+    update_rows = opt->update_rows <= rows ? opt->update_rows : rows;
+    delete_rows = opt->delete_rows <= rows ? opt->delete_rows : rows;
+    fprintf(update_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, update_rows, opt->seed);
+    fprintf(delete_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, delete_rows, opt->seed);
+
     shuffle_ids(ids, rows, opt->seed);
-    for (int i = 0; i < rows; i++) {
+    for (int i = 0; i < update_rows; i++) {
         fprintf(update_f, "UPDATE %s SET status = 'final_wait' WHERE id = %d;\n", TABLE_NAME, ids[i]);
+    }
+    for (int i = 0; i < delete_rows; i++) {
         fprintf(delete_f, "DELETE FROM %s WHERE id = %d;\n", TABLE_NAME, ids[i]);
     }
 
@@ -386,7 +407,8 @@ static int generate_sqls(const GeneratorOptions *opt) {
     if (!write_correctness_sql(opt)) return 0;
     if (!write_meta_files(opt, rows)) return 0;
 
-    printf("[ok] profile=%s rows=%d seed=%u\n", opt->profile, rows, opt->seed);
+    printf("[ok] profile=%s rows=%d update_rows=%d delete_rows=%d seed=%u\n",
+           opt->profile, rows, update_rows, delete_rows, opt->seed);
     printf("[ok] wrote %s\n", insert_path);
     printf("[ok] wrote %s\n", update_path);
     printf("[ok] wrote %s\n", delete_path);
@@ -404,6 +426,10 @@ static void parse_args(int argc, char **argv, GeneratorOptions *opt) {
             opt->rows = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--preload") == 0 && i + 1 < argc) {
             opt->rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--update-rows") == 0 && i + 1 < argc) {
+            opt->update_rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--delete-rows") == 0 && i + 1 < argc) {
+            opt->delete_rows = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ops") == 0 && i + 1 < argc) {
             opt->mixed_ops = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--output-dir") == 0 && i + 1 < argc) {
@@ -412,6 +438,10 @@ static void parse_args(int argc, char **argv, GeneratorOptions *opt) {
     }
 
     if (opt->rows <= 0) opt->rows = profile_rows(opt->profile);
+    if (opt->update_rows <= 0) opt->update_rows = profile_update_rows(opt->profile);
+    if (opt->delete_rows <= 0) opt->delete_rows = profile_delete_rows(opt->profile);
+    if (opt->update_rows > opt->rows) opt->update_rows = opt->rows;
+    if (opt->delete_rows > opt->rows) opt->delete_rows = opt->rows;
     if (opt->mixed_ops <= 0) opt->mixed_ops = profile_ops(opt->profile);
 }
 
@@ -420,6 +450,8 @@ int main(int argc, char **argv) {
 
     opt.profile = "score";
     opt.rows = 0;
+    opt.update_rows = 0;
+    opt.delete_rows = 0;
     opt.mixed_ops = 0;
     opt.seed = 20260415u;
     opt.output_dir = "generated_sql";

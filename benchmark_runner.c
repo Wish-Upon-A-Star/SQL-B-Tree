@@ -26,6 +26,8 @@
 typedef struct {
     const char *profile;
     int rows;
+    int update_rows;
+    int delete_rows;
     int mixed_ops;
     unsigned int seed;
     int repeat;
@@ -53,6 +55,16 @@ static int profile_rows(const char *profile) {
     if (strcmp(profile, "smoke") == 0) return 10000;
     if (strcmp(profile, "regression") == 0) return 100000;
     return 1000000;
+}
+
+static int profile_update_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 100000;
+    return profile_rows(profile);
+}
+
+static int profile_delete_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 100000;
+    return profile_rows(profile);
 }
 
 static int profile_ops(const char *profile) {
@@ -282,6 +294,20 @@ static double normalize(double value, double ref) {
     return value / ref;
 }
 
+static void stage_begin(const char *label) {
+    printf("[progress] %s ...\n", label);
+    fflush(stdout);
+}
+
+static void stage_end(const char *label, int ok, double elapsed_sec) {
+    if (elapsed_sec > 0.0) {
+        printf("[progress] %s %s (%.2f sec)\n", label, ok ? "done" : "failed", elapsed_sec);
+    } else {
+        printf("[progress] %s %s\n", label, ok ? "done" : "failed");
+    }
+    fflush(stdout);
+}
+
 static void parse_args(int argc, char **argv, RunnerOptions *opt) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) opt->profile = argv[++i];
@@ -289,12 +315,18 @@ static void parse_args(int argc, char **argv, RunnerOptions *opt) {
         else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) opt->repeat = atoi(argv[++i]);
         else if (strcmp(argv[i], "--rows") == 0 && i + 1 < argc) opt->rows = atoi(argv[++i]);
         else if (strcmp(argv[i], "--preload") == 0 && i + 1 < argc) opt->rows = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--update-rows") == 0 && i + 1 < argc) opt->update_rows = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--delete-rows") == 0 && i + 1 < argc) opt->delete_rows = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ops") == 0 && i + 1 < argc) opt->mixed_ops = atoi(argv[++i]);
         else if (strcmp(argv[i], "--memtrack") == 0) opt->memtrack = 1;
         else if (strcmp(argv[i], "--report-only") == 0) opt->report_only = 1;
     }
 
     if (opt->rows <= 0) opt->rows = profile_rows(opt->profile);
+    if (opt->update_rows <= 0) opt->update_rows = profile_update_rows(opt->profile);
+    if (opt->delete_rows <= 0) opt->delete_rows = profile_delete_rows(opt->profile);
+    if (opt->update_rows > opt->rows) opt->update_rows = opt->rows;
+    if (opt->delete_rows > opt->rows) opt->delete_rows = opt->rows;
     if (opt->mixed_ops <= 0) opt->mixed_ops = profile_ops(opt->profile);
     if (opt->repeat <= 0) opt->repeat = DEFAULT_REPEAT;
 }
@@ -359,6 +391,8 @@ int main(int argc, char **argv) {
 
     opt.profile = "score";
     opt.rows = 0;
+    opt.update_rows = 0;
+    opt.delete_rows = 0;
     opt.mixed_ops = 0;
     opt.seed = DEFAULT_SEED;
     opt.repeat = DEFAULT_REPEAT;
@@ -388,8 +422,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    snprintf(cmd, sizeof(cmd), "./bench_workload_generator --profile %s --seed %u --preload %d --ops %d --output-dir generated_sql",
-             opt.profile, opt.seed, opt.rows, opt.mixed_ops);
+    snprintf(cmd, sizeof(cmd),
+             "./bench_workload_generator --profile %s --seed %u --preload %d --update-rows %d --delete-rows %d --ops %d --output-dir generated_sql",
+             opt.profile, opt.seed, opt.rows, opt.update_rows, opt.delete_rows, opt.mixed_ops);
     if (system(cmd) != 0) {
         fprintf(stderr, "[error] workload generation failed\n");
         return 1;
@@ -401,15 +436,34 @@ int main(int argc, char **argv) {
     }
 
     snprintf(cmd, sizeof(cmd), "generated_sql/jungle_correctness_success_%s.sql", opt.profile);
-    if (!run_sql_file(cmd, opt.memtrack, NULL, &rc, output, sizeof(output)) || rc != 0 || contains_token(output, "[error]") || contains_token(output, "[오류]")) {
-        correctness_pass = 0;
-        snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness success script failed");
+    {
+        double elapsed = 0.0;
+        int ok = 0;
+        stage_begin("correctness success");
+        ok = run_sql_file(cmd, opt.memtrack, &elapsed, &rc, output, sizeof(output)) &&
+             rc == 0 &&
+             !contains_token(output, "[error]") &&
+             !contains_token(output, "[오류]");
+        stage_end("correctness success", ok, elapsed);
+        if (!ok) {
+            correctness_pass = 0;
+            snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness success script failed");
+        }
     }
 
     snprintf(cmd, sizeof(cmd), "generated_sql/jungle_correctness_failure_%s.sql", opt.profile);
-    if (!run_sql_file(cmd, opt.memtrack, NULL, &rc, output, sizeof(output)) || rc != 0 || count_token(output, "[error]") < EXPECTED_FAILURE_ERRORS) {
-        correctness_pass = 0;
-        snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness failure script did not emit expected constraint errors");
+    {
+        double elapsed = 0.0;
+        int ok = 0;
+        stage_begin("correctness failure");
+        ok = run_sql_file(cmd, opt.memtrack, &elapsed, &rc, output, sizeof(output)) &&
+             rc == 0 &&
+             count_token(output, "[error]") >= EXPECTED_FAILURE_ERRORS;
+        stage_end("correctness failure", ok, elapsed);
+        if (!ok) {
+            correctness_pass = 0;
+            snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness failure script did not emit expected constraint errors");
+        }
     }
 
     iters = (IterationResult *)calloc((size_t)opt.repeat, sizeof(IterationResult));
@@ -432,15 +486,20 @@ int main(int argc, char **argv) {
             double elapsed = 0.0;
             int cmd_exit = 0;
             double peak;
+            char stage_label[128];
 
             if (opt.memtrack) snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 ./sqlsprocessor --benchmark %d 2>&1", opt.rows);
             else snprintf(cmd, sizeof(cmd), "./sqlsprocessor --benchmark %d 2>&1", opt.rows);
 
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d benchmark", i + 1, opt.repeat);
+            stage_begin(stage_label);
             if (!run_command_capture(cmd, output, sizeof(output), &elapsed, &cmd_exit) || cmd_exit != 0 || !parse_benchmark_output(output, &bench)) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "benchmark command parse failed");
                 break;
             }
+            stage_end(stage_label, 1, elapsed);
             peak = parse_memtrack_peak(output);
             if (peak > peak_heap) peak_heap = peak;
 
@@ -451,32 +510,44 @@ int main(int argc, char **argv) {
             }
 
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_insert_%s.sql", opt.profile);
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d insert", i + 1, opt.repeat);
+            stage_begin(stage_label);
             if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, sizeof(output)) || cmd_exit != 0) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "insert workload failed");
                 break;
             }
+            stage_end(stage_label, 1, elapsed);
             iters[i].throughput.insert = elapsed > 0.0 ? (double)opt.rows / elapsed : 0.0;
             peak = parse_memtrack_peak(output);
             if (peak > peak_heap) peak_heap = peak;
 
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_update_%s.sql", opt.profile);
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d update", i + 1, opt.repeat);
+            stage_begin(stage_label);
             if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, sizeof(output)) || cmd_exit != 0) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "update workload failed");
                 break;
             }
-            iters[i].throughput.update = elapsed > 0.0 ? (double)opt.rows / elapsed : 0.0;
+            stage_end(stage_label, 1, elapsed);
+            iters[i].throughput.update = elapsed > 0.0 ? (double)opt.update_rows / elapsed : 0.0;
             peak = parse_memtrack_peak(output);
             if (peak > peak_heap) peak_heap = peak;
 
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_delete_%s.sql", opt.profile);
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d delete", i + 1, opt.repeat);
+            stage_begin(stage_label);
             if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, sizeof(output))) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "delete workload failed to execute");
                 break;
             }
-            iters[i].throughput.delete_op = elapsed > 0.0 ? (double)opt.rows / elapsed : 0.0;
+            stage_end(stage_label, cmd_exit == 0, elapsed);
+            iters[i].throughput.delete_op = elapsed > 0.0 ? (double)opt.delete_rows / elapsed : 0.0;
             iters[i].delete_measured = (cmd_exit == 0 && !contains_token(output, "[error]"));
             if (!iters[i].delete_measured) strcpy(delete_mode, "estimated");
             peak = parse_memtrack_peak(output);

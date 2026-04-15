@@ -9,6 +9,8 @@ SRC_DEPS = main.c lexer.c parser.c bptree.c executor.c lexer.h parser.h bptree.h
 SQL ?= demo_bptree.sql
 JUNGLE_DATASET ?= bptree_benchmark_users.csv
 JUNGLE_RECORDS ?= 1000000
+BENCH_SCORE_UPDATE_ROWS ?= 100000
+BENCH_SCORE_DELETE_ROWS ?= 100000
 
 .PHONY: all build bench-tools bench-test run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark bench-smoke bench-score bench-report bench-clean clean
 
@@ -66,7 +68,7 @@ bench-smoke: build bench-tools
 	./$(BENCH_RUNNER) --profile smoke --seed 20260415 --repeat 3
 
 bench-score: build bench-tools
-	./$(BENCH_RUNNER) --profile score --seed 20260415 --repeat 1
+	./$(BENCH_RUNNER) --profile score --seed 20260415 --repeat 1 --update-rows $(BENCH_SCORE_UPDATE_ROWS) --delete-rows $(BENCH_SCORE_DELETE_ROWS)
 
 bench-report: $(BENCH_RUNNER)
 	./$(BENCH_RUNNER) --report-only
