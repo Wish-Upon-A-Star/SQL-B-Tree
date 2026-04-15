@@ -137,13 +137,13 @@ linear/uk-index average speed ratio: ...
 
 ## Memory Cache Limit
 
-This implementation keeps the first 2,000,000 rows in `TableCache.records` and builds B+ Tree indexes only for that cached region. If a CSV has more rows, the first uncached row offset is remembered.
+This implementation keeps the first 2,000,000 rows in `TableCache.records` and builds B+ Tree indexes for that cached region. If a CSV has more rows, the first uncached row offset is remembered and tail PK offsets are indexed in memory.
 
-- PK/UK SELECT first checks the B+ Tree index. If the key is not cached, it scans only the uncached CSV tail.
+- PK/UK SELECT first checks the B+ Tree index. If a PK key is not cached, exact lookup uses the tail PK offset index before falling back to scan.
 - Non-indexed SELECT scans cached rows in memory first, then scans only the uncached CSV tail.
 - INSERT beyond the memory limit appends to CSV only and keeps the uncached tail scan path active.
 - UPDATE/DELETE on over-limit tables rewrites the CSV through a full-file fallback, then reloads the cache and recomputes the uncached offset.
-- UPDATE on cached tables skips UK B+ Tree rebuild when the SET column is not a UK column.
+- UPDATE on cached tables updates only the changed UK B+ Tree entry when the SET column is a UK column.
 - UPDATE/DELETE with `WHERE id = ...` uses the PK B+ Tree to locate the target row before applying the change.
 - `--benchmark` requests above 2,000,000 rows are capped to 2,000,000 rows to avoid memory blowups.
 
@@ -152,10 +152,11 @@ This implementation keeps the first 2,000,000 rows in `TableCache.records` and b
 Cached tables with a PK no longer rewrite the whole CSV for every UPDATE or DELETE. The executor keeps B+ Tree indexes in memory and persists row changes to `<table>.delta`.
 
 - UPDATE writes committed `U` records to the delta log after memory and B+ Tree checks succeed.
-- DELETE writes committed `D` tombstone records to the delta log after memory and B+ Tree rebuild succeed.
+- DELETE writes committed `D` tombstone records to the delta log after removing only the deleted PK/UK entries from B+ Tree indexes.
 - On table open, the CSV is loaded first, then committed delta batches are replayed, then PK/UK B+ Tree indexes are bulk-built from the current rows.
 - Incomplete delta batches are ignored because only records between `B` and `E` markers are replayed.
 - If the table later crosses the memory cache limit, pending delta changes are compacted back into the CSV before new tail rows are appended.
+- Large delta logs are compacted back into the CSV once they cross `DELTA_COMPACT_BYTES`.
 - Over-limit tables still use the slower full-file fallback because rows outside the cached prefix are not indexed in memory.
 
 ## Stable Slot IDs
@@ -163,7 +164,7 @@ Cached tables with a PK no longer rewrite the whole CSV for every UPDATE or DELE
 The cached prefix no longer treats `record_count` as the number of live rows. It is now the number of allocated slots. Live rows are tracked by `record_active[slot_id]`, and free deleted slots are kept in `free_slots`.
 
 - B+ Tree values store a stable `slot_id`, not a compacting array position.
-- DELETE marks matching slots inactive, rebuilds PK/UK B+ Tree indexes from active slots, then writes a delta tombstone.
+- DELETE removes matching PK/UK entries from B+ Tree indexes, marks slots inactive, then writes a delta tombstone.
 - INSERT first reuses an inactive slot when one exists, then appends the new row to the CSV for persistence.
 - SELECT, UPDATE, DELETE, PK range scans, and UK range scans all skip inactive slots.
 - CSV rewrite/compaction writes only active slots, but the in-memory slot layout remains stable while the table is open.

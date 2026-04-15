@@ -10,6 +10,7 @@
 #define MAX_TABLES 1
 #define MAX_UKS 5
 #define MAX_SQL_LEN 4096
+#define DELTA_COMPACT_BYTES (64 * 1024 * 1024)
 
 /* 실행할 Statement 종류입니다. */
 typedef enum {
@@ -63,6 +64,7 @@ typedef struct UniqueIndex UniqueIndex;
 typedef struct {
     char table_name[256];         /* users 형태 이름 */
     FILE *file;                   /* 현재 열려 있는 CSV 파일 포인터 */
+    FILE *delta_file;             /* append-only delta log writer */
     ColumnInfo cols[MAX_COLS];    /* 헤더 파싱 결과 */
     int col_count;                /* 컬럼 개수 */
     int pk_idx;                   /* PK 컬럼 인덱스, 없으면 -1 */
@@ -80,6 +82,10 @@ typedef struct {
     int free_capacity;             /* free_slots 배열 용량 */
     int cache_truncated;           /* MAX_RECORDS를 넘어 파일 스캔 fallback이 필요한지 여부 */
     long uncached_start_offset;     /* 캐시되지 않은 첫 CSV row의 파일 offset */
+    long *tail_pk_ids;              /* 캐시 밖 PK row의 id 목록 */
+    long *tail_offsets;             /* tail_pk_ids와 대응되는 CSV 파일 offset */
+    int tail_count;                 /* 캐시 밖 PK offset 개수 */
+    int tail_capacity;              /* tail offset 배열 용량 */
     long next_auto_id;             /* INSERT 시 자동 부여할 다음 ID */
     unsigned long long last_used_seq; /* LRU 계산용 사용 순번 */
 } TableCache;

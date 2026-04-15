@@ -361,6 +361,32 @@ int bptree_insert(BPlusTree *tree, long key, int row_index) {
     return 1;
 }
 
+int bptree_delete(BPlusTree *tree, long key) {
+    BPlusNode *node;
+    int i;
+
+    if (!tree || !tree->root) return 0;
+    node = tree->root;
+    while (!node->is_leaf) {
+        i = 0;
+        while (i < node->key_count && key >= node->keys[i]) i++;
+        node = node->children[i];
+    }
+
+    for (i = 0; i < node->key_count; i++) {
+        if (node->keys[i] == key) {
+            memmove(&node->keys[i], &node->keys[i + 1],
+                    (size_t)(node->key_count - i - 1) * sizeof(long));
+            memmove(&node->values[i], &node->values[i + 1],
+                    (size_t)(node->key_count - i - 1) * sizeof(int));
+            node->key_count--;
+            return 1;
+        }
+        if (node->keys[i] > key) break;
+    }
+    return 0;
+}
+
 typedef struct BPlusStringNode {
     int is_leaf;
     int key_count;
@@ -758,4 +784,33 @@ int bptree_string_insert(BPlusStringTree *tree, const char *key, int row_index) 
     tree->root = new_root;
     release_unused_string_pool_nodes(&pool);
     return 1;
+}
+
+int bptree_string_delete(BPlusStringTree *tree, const char *key) {
+    BPlusStringNode *node;
+    int i;
+
+    if (!tree || !tree->root || !key || strlen(key) == 0) return 0;
+    node = tree->root;
+    while (!node->is_leaf) {
+        i = 0;
+        while (i < node->key_count && strcmp(key, node->keys[i]) >= 0) i++;
+        node = node->children[i];
+    }
+
+    for (i = 0; i < node->key_count; i++) {
+        int cmp = strcmp(key, node->keys[i]);
+        if (cmp == 0) {
+            free(node->keys[i]);
+            memmove(&node->keys[i], &node->keys[i + 1],
+                    (size_t)(node->key_count - i - 1) * sizeof(char *));
+            memmove(&node->values[i], &node->values[i + 1],
+                    (size_t)(node->key_count - i - 1) * sizeof(int));
+            node->keys[node->key_count - 1] = NULL;
+            node->key_count--;
+            return 1;
+        }
+        if (cmp < 0) break;
+    }
+    return 0;
 }

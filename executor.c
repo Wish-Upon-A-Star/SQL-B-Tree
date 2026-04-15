@@ -24,6 +24,8 @@ static int index_record_uks(TableCache *tc, int row_index);
 static int get_uk_slot(TableCache *tc, int col_idx);
 static int ensure_uk_indexes(TableCache *tc);
 static void rollback_updated_records(TableCache *tc, char **old_records);
+static int remove_record_indexes(TableCache *tc, const char *row);
+static int restore_record_indexes(TableCache *tc, int slot_id);
 static int parse_long_value(const char *value, long *out);
 static int slot_is_active(TableCache *tc, int slot_id);
 static char *slot_row(TableCache *tc, int slot_id);
@@ -33,6 +35,8 @@ static int for_each_file_row_from(TableCache *tc, long start_offset,
                                   void *ctx);
 static int replay_delta_log(TableCache *tc);
 static int clear_delta_log(TableCache *tc);
+static int maybe_compact_delta_log(TableCache *tc);
+int rewrite_file(TableCache *tc);
 
 static char *dup_string(const char *src) {
     size_t len = strlen(src) + 1;
@@ -268,6 +272,62 @@ static int take_record_slot(TableCache *tc, int allow_reuse, int *slot_id) {
     return 1;
 }
 
+static int ensure_tail_index_capacity(TableCache *tc, int required) {
+    int new_capacity;
+    long *new_ids;
+    long *new_offsets;
+
+    if (required <= tc->tail_capacity) return 1;
+    new_capacity = tc->tail_capacity > 0 ? tc->tail_capacity : INITIAL_RECORD_CAPACITY;
+    while (new_capacity < required) new_capacity *= 2;
+    new_ids = (long *)realloc(tc->tail_pk_ids, (size_t)new_capacity * sizeof(long));
+    if (!new_ids) return 0;
+    new_offsets = (long *)realloc(tc->tail_offsets, (size_t)new_capacity * sizeof(long));
+    if (!new_offsets) {
+        tc->tail_pk_ids = new_ids;
+        return 0;
+    }
+    tc->tail_pk_ids = new_ids;
+    tc->tail_offsets = new_offsets;
+    tc->tail_capacity = new_capacity;
+    return 1;
+}
+
+static int append_tail_pk_offset(TableCache *tc, long id_value, long offset) {
+    int pos;
+
+    if (!tc || tc->pk_idx == -1) return 1;
+    if (!ensure_tail_index_capacity(tc, tc->tail_count + 1)) return 0;
+    pos = tc->tail_count;
+    while (pos > 0 && tc->tail_pk_ids[pos - 1] > id_value) {
+        tc->tail_pk_ids[pos] = tc->tail_pk_ids[pos - 1];
+        tc->tail_offsets[pos] = tc->tail_offsets[pos - 1];
+        pos--;
+    }
+    tc->tail_pk_ids[pos] = id_value;
+    tc->tail_offsets[pos] = offset;
+    tc->tail_count++;
+    return 1;
+}
+
+static int find_tail_pk_offset(TableCache *tc, long id_value, long *offset) {
+    int lo = 0;
+    int hi;
+
+    if (!tc || !offset || tc->tail_count <= 0) return 0;
+    hi = tc->tail_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (tc->tail_pk_ids[mid] == id_value) {
+            *offset = tc->tail_offsets[mid];
+            return 1;
+        }
+        if (tc->tail_pk_ids[mid] < id_value) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return 0;
+}
+
 static int slot_is_active(TableCache *tc, int slot_id) {
     return tc && slot_id >= 0 && slot_id < tc->record_count &&
            tc->record_active && tc->record_active[slot_id] && tc->records[slot_id];
@@ -354,18 +414,28 @@ static void free_table_storage(TableCache *tc) {
         fclose(tc->file);
         tc->file = NULL;
     }
+    if (tc->delta_file) {
+        fclose(tc->delta_file);
+        tc->delta_file = NULL;
+    }
     for (i = 0; i < tc->record_count; i++) free(tc->records[i]);
     free(tc->records);
     free(tc->record_active);
     free(tc->free_slots);
+    free(tc->tail_pk_ids);
+    free(tc->tail_offsets);
     tc->records = NULL;
     tc->record_active = NULL;
     tc->free_slots = NULL;
+    tc->tail_pk_ids = NULL;
+    tc->tail_offsets = NULL;
     tc->record_capacity = 0;
     tc->record_count = 0;
     tc->active_count = 0;
     tc->free_count = 0;
     tc->free_capacity = 0;
+    tc->tail_count = 0;
+    tc->tail_capacity = 0;
     bptree_destroy(tc->id_index);
     tc->id_index = NULL;
     for (i = 0; i < tc->uk_count; i++) {
@@ -378,6 +448,7 @@ static void free_table_storage(TableCache *tc) {
 static void reset_table_cache(TableCache *tc) {
     memset(tc, 0, sizeof(TableCache));
     tc->file = NULL;
+    tc->delta_file = NULL;
     tc->pk_idx = -1;
     tc->next_auto_id = 1;
     tc->id_index = bptree_create();
@@ -540,9 +611,52 @@ static int clear_delta_log(TableCache *tc) {
     char filename[300];
 
     if (!tc) return 0;
+    if (tc->delta_file) {
+        fclose(tc->delta_file);
+        tc->delta_file = NULL;
+    }
     get_delta_filename(tc, filename, sizeof(filename));
     remove(filename);
     return 1;
+}
+
+static FILE *get_delta_writer(TableCache *tc) {
+    char filename[300];
+
+    if (!tc) return NULL;
+    if (tc->delta_file) return tc->delta_file;
+    get_delta_filename(tc, filename, sizeof(filename));
+    tc->delta_file = fopen(filename, "a");
+    return tc->delta_file;
+}
+
+static long delta_log_size(TableCache *tc) {
+    char filename[300];
+    FILE *f;
+    long size;
+
+    if (!tc) return 0;
+    if (tc->delta_file) fflush(tc->delta_file);
+    get_delta_filename(tc, filename, sizeof(filename));
+    f = fopen(filename, "rb");
+    if (!f) return 0;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0;
+    }
+    size = ftell(f);
+    fclose(f);
+    return size > 0 ? size : 0;
+}
+
+static int maybe_compact_delta_log(TableCache *tc) {
+    long size;
+
+    if (!tc || tc->cache_truncated || tc->pk_idx == -1) return 1;
+    size = delta_log_size(tc);
+    if (size < DELTA_COMPACT_BYTES) return 1;
+    printf("[delta] compacting %ld-byte delta log into CSV.\n", size);
+    return rewrite_file(tc);
 }
 
 static int get_row_pk_value(TableCache *tc, const char *row, long *id_value) {
@@ -708,13 +822,11 @@ static int replay_delta_log(TableCache *tc) {
 }
 
 static int append_delta_updates(TableCache *tc, char **old_records) {
-    char filename[300];
     FILE *f;
     int i;
 
     if (!tc || tc->pk_idx == -1 || !old_records) return 0;
-    get_delta_filename(tc, filename, sizeof(filename));
-    f = fopen(filename, "a");
+    f = get_delta_writer(tc);
     if (!f) return 0;
     if (fprintf(f, "B\n") < 0) goto fail;
     for (i = 0; i < tc->record_count; i++) {
@@ -725,23 +837,19 @@ static int append_delta_updates(TableCache *tc, char **old_records) {
         if (fprintf(f, "U\t%ld\t%s\n", id_value, tc->records[i]) < 0) goto fail;
     }
     if (fprintf(f, "E\n") < 0) goto fail;
-    if (fflush(f) != 0 || ferror(f)) goto fail;
-    if (fclose(f) != 0) return 0;
+    if (ferror(f)) goto fail;
     return 1;
 
 fail:
-    fclose(f);
     return 0;
 }
 
 static int append_delta_deletes(TableCache *tc, char **old_records, int *delete_flags, int old_count) {
-    char filename[300];
     FILE *f;
     int i;
 
     if (!tc || tc->pk_idx == -1 || !old_records || !delete_flags) return 0;
-    get_delta_filename(tc, filename, sizeof(filename));
-    f = fopen(filename, "a");
+    f = get_delta_writer(tc);
     if (!f) return 0;
     if (fprintf(f, "B\n") < 0) goto fail;
     for (i = 0; i < old_count; i++) {
@@ -751,13 +859,23 @@ static int append_delta_deletes(TableCache *tc, char **old_records, int *delete_
         if (fprintf(f, "D\t%ld\n", id_value) < 0) goto fail;
     }
     if (fprintf(f, "E\n") < 0) goto fail;
-    if (fflush(f) != 0 || ferror(f)) goto fail;
-    if (fclose(f) != 0) return 0;
+    if (ferror(f)) goto fail;
     return 1;
 
 fail:
-    fclose(f);
     return 0;
+}
+
+static int append_delta_delete_one(TableCache *tc, const char *old_record) {
+    FILE *f;
+    long id_value;
+
+    if (!tc || tc->pk_idx == -1 || !old_record) return 0;
+    if (!get_row_pk_value(tc, old_record, &id_value)) return 0;
+    f = get_delta_writer(tc);
+    if (!f) return 0;
+    if (fprintf(f, "B\nD\t%ld\nE\n", id_value) < 0) return 0;
+    return ferror(f) ? 0 : 1;
 }
 
 int rewrite_file(TableCache *tc) {
@@ -895,6 +1013,80 @@ static int index_record_uks(TableCache *tc, int row_index) {
         if (result != 1) return 0;
     }
     return 1;
+}
+
+static int index_record_single_uk(TableCache *tc, int row_index, int col_idx) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    char key[RECORD_SIZE];
+    int uk_slot;
+    char *row;
+
+    if (!tc || get_uk_slot(tc, col_idx) == -1) return 1;
+    if (!ensure_uk_indexes(tc)) return 0;
+    row = slot_row(tc, row_index);
+    if (!row) return 0;
+    parse_csv_row(row, fields, row_buf);
+    normalize_value(fields[col_idx], key, sizeof(key));
+    uk_slot = get_uk_slot(tc, col_idx);
+    if (uk_slot == -1) return 0;
+    return unique_index_insert(tc, tc->uk_indexes[uk_slot], key, row_index);
+}
+
+static int remove_record_single_uk(TableCache *tc, const char *row, int col_idx) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    char key[RECORD_SIZE];
+    int uk_slot;
+
+    if (!tc || !row || get_uk_slot(tc, col_idx) == -1) return 1;
+    if (!ensure_uk_indexes(tc)) return 0;
+    parse_csv_row(row, fields, row_buf);
+    normalize_value(fields[col_idx], key, sizeof(key));
+    if (strlen(key) == 0) return 1;
+    uk_slot = get_uk_slot(tc, col_idx);
+    if (uk_slot == -1) return 0;
+    return bptree_string_delete(tc->uk_indexes[uk_slot]->tree, key);
+}
+
+static int remove_record_indexes(TableCache *tc, const char *row) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    int i;
+
+    if (!tc || !row) return 0;
+    parse_csv_row(row, fields, row_buf);
+    if (tc->pk_idx != -1) {
+        long id_value;
+        if (!parse_long_value(fields[tc->pk_idx], &id_value)) return 0;
+        if (!bptree_delete(tc->id_index, id_value)) return 0;
+    }
+    if (tc->uk_count == 0) return 1;
+    if (!ensure_uk_indexes(tc)) return 0;
+    for (i = 0; i < tc->uk_count; i++) {
+        char key[RECORD_SIZE];
+        int col_idx = tc->uk_indices[i];
+        int uk_slot = get_uk_slot(tc, col_idx);
+
+        if (uk_slot == -1) return 0;
+        normalize_value(fields[col_idx], key, sizeof(key));
+        if (strlen(key) == 0) continue;
+        if (!bptree_string_delete(tc->uk_indexes[uk_slot]->tree, key)) return 0;
+    }
+    return 1;
+}
+
+static int restore_record_indexes(TableCache *tc, int slot_id) {
+    char *row;
+    long id_value;
+
+    if (!tc || !slot_is_active(tc, slot_id)) return 0;
+    row = tc->records[slot_id];
+    if (tc->pk_idx != -1) {
+        if (!get_row_pk_value(tc, row, &id_value)) return 0;
+        if (bptree_insert(tc->id_index, id_value, slot_id) != 1) return 0;
+    }
+    return index_record_uks(tc, slot_id);
 }
 
 static int rebuild_uk_indexes(TableCache *tc) {
@@ -1048,6 +1240,10 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
             }
         } else {
             if (!tc->cache_truncated) tc->uncached_start_offset = row_offset;
+            if (tc->pk_idx != -1 && !append_tail_pk_offset(tc, id_value, row_offset)) {
+                printf("[error] failed to build tail PK offset index while loading '%s'.\n", name);
+                return 0;
+            }
             tc->cache_truncated = 1;
         }
     }
@@ -1061,7 +1257,7 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
     }
     if (file_next_auto_id > tc->next_auto_id) tc->next_auto_id = file_next_auto_id;
     if (tc->cache_truncated) {
-        printf("[notice] table '%s' exceeded memory cache limit (%d rows). Extra rows stay on disk and use slower CSV scans.\n",
+        printf("[notice] table '%s' exceeded memory cache limit (%d rows). Extra rows stay on disk; PK equality can use tail offset index, other predicates scan the tail.\n",
                name, MAX_RECORDS);
     }
     return 1;
@@ -1284,11 +1480,19 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
             printf("[error] INSERT failed: could not find append position.\n");
             return 0;
         }
+        if (tc->pk_idx != -1 && !ensure_tail_index_capacity(tc, tc->tail_count + 1)) {
+            printf("[error] INSERT failed: could not grow tail PK offset index.\n");
+            return 0;
+        }
         if (!append_record_file(tc, new_line, flush_now)) {
             printf("[error] INSERT failed: could not append to table file.\n");
             return 0;
         }
         if (!tc->cache_truncated) tc->uncached_start_offset = append_offset;
+        if (tc->pk_idx != -1 && !append_tail_pk_offset(tc, id_value, append_offset)) {
+            printf("[error] INSERT failed: could not update tail PK offset index.\n");
+            return 0;
+        }
         tc->cache_truncated = 1;
         if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
         printf("[notice] INSERT appended to CSV only; memory cache limit is %d rows, so later lookup may use slower file scan.\n",
@@ -1303,7 +1507,7 @@ void execute_insert(Statement *stmt) {
     long id_value = 0;
 
     if (!tc) return;
-    if (!insert_row_data(tc, stmt->row_data, 1, &id_value)) return;
+    if (!insert_row_data(tc, stmt->row_data, 0, &id_value)) return;
     printf("[ok] INSERT completed. id=%ld\n", id_value);
 }
 
@@ -1402,6 +1606,37 @@ static void execute_select_file_scan(TableCache *tc, long start_offset, int wher
         print_selected_row(line, select_idx, select_count, select_all);
     }
     fseek(tc->file, 0, SEEK_END);
+}
+
+static int print_tail_pk_offset_row(TableCache *tc, long offset, long key,
+                                    int select_idx[MAX_COLS], int select_count,
+                                    int select_all) {
+    char line[RECORD_SIZE];
+    char *nl;
+    size_t line_len;
+    long row_id;
+
+    if (!tc || !tc->file || offset < 0) return 0;
+    if (fflush(tc->file) != 0 || fseek(tc->file, offset, SEEK_SET) != 0) return 0;
+    if (!fgets(line, sizeof(line), tc->file)) {
+        fseek(tc->file, 0, SEEK_END);
+        return 0;
+    }
+    nl = strpbrk(line, "\r\n");
+    line_len = strlen(line);
+    if (!nl && line_len == sizeof(line) - 1 && !feof(tc->file)) {
+        fseek(tc->file, 0, SEEK_END);
+        return 0;
+    }
+    if (nl) *nl = '\0';
+    if (!get_row_pk_value(tc, line, &row_id) || row_id != key) {
+        fseek(tc->file, 0, SEEK_END);
+        return 0;
+    }
+    printf("[index] tail PK offset lookup\n");
+    print_selected_row(line, select_idx, select_count, select_all);
+    fseek(tc->file, 0, SEEK_END);
+    return 1;
 }
 
 static void execute_select_file_range_scan(TableCache *tc, long start_offset, int where_idx,
@@ -1606,6 +1841,11 @@ void execute_select(Statement *stmt) {
             return;
         }
         if (tc->cache_truncated) {
+            long tail_offset;
+            if (find_tail_pk_offset(tc, key, &tail_offset) &&
+                print_tail_pk_offset_row(tc, tail_offset, key, select_idx, select_count, stmt->select_all)) {
+                return;
+            }
             execute_select_file_scan(tc, tc->uncached_start_offset, where_idx, select_idx, select_count,
                                      stmt->select_all, stmt->where_val);
         }
@@ -1963,11 +2203,18 @@ void execute_update(Statement *stmt) {
 
     free(match_flags);
     if (count > 0) {
-        if (rebuild_uk_needed && !rebuild_uk_indexes(tc)) {
-            rollback_updated_records(tc, old_records);
-            free(old_records);
-            printf("[error] UPDATE failed: UK index rebuild failed; memory restored.\n");
-            return;
+        if (rebuild_uk_needed) {
+            for (i = 0; i < tc->record_count; i++) {
+                if (!old_records[i]) continue;
+                if (!remove_record_single_uk(tc, old_records[i], set_idx) ||
+                    !index_record_single_uk(tc, i, set_idx)) {
+                    rollback_updated_records(tc, old_records);
+                    rebuild_uk_indexes(tc);
+                    free(old_records);
+                    printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
+                    return;
+                }
+            }
         }
         if (tc->pk_idx != -1) {
             if (!append_delta_updates(tc, old_records)) {
@@ -1978,6 +2225,9 @@ void execute_update(Statement *stmt) {
                 return;
             }
             printf("[delta] UPDATE persisted through append-only delta log.\n");
+            if (!maybe_compact_delta_log(tc)) {
+                printf("[warning] UPDATE completed, but delta compaction failed.\n");
+            }
         } else if (!rewrite_file(tc)) {
             rollback_updated_records(tc, old_records);
             if (rebuild_uk_needed) rebuild_uk_indexes(tc);
@@ -2002,6 +2252,7 @@ void execute_delete(Statement *stmt) {
     int old_count;
     char **old_records;
     int *delete_flags;
+    int *removed_index_flags;
     int uses_pk_lookup = 0;
     int uses_uk_lookup = 0;
     int target_row = -1;
@@ -2030,11 +2281,67 @@ void execute_delete(Statement *stmt) {
         printf("[notice] no rows matched DELETE condition.\n");
         return;
     }
+    if (uses_pk_lookup || uses_uk_lookup) {
+        char *old_record;
+
+        if (uses_pk_lookup) {
+            printf("[index] B+ tree id lookup for DELETE\n");
+            if (!find_pk_row(tc, stmt->where_val, &target_row)) {
+                printf("[notice] no rows matched DELETE condition.\n");
+                return;
+            }
+        } else {
+            printf("[index] UK B+ tree lookup for DELETE on column '%s'\n", stmt->where_col);
+            if (!find_uk_row(tc, where_idx, stmt->where_val, &target_row)) {
+                printf("[notice] no rows matched DELETE condition.\n");
+                return;
+            }
+        }
+        old_record = tc->records[target_row];
+        if (!remove_record_indexes(tc, old_record)) {
+            rebuild_id_index(tc);
+            rebuild_uk_indexes(tc);
+            printf("[error] DELETE failed: index entry delete failed; indexes rebuilt.\n");
+            return;
+        }
+        tc->record_active[target_row] = 0;
+        tc->active_count--;
+        if (tc->pk_idx != -1) {
+            if (!append_delta_delete_one(tc, old_record)) {
+                tc->record_active[target_row] = 1;
+                tc->active_count++;
+                restore_record_indexes(tc, target_row);
+                rebuild_id_index(tc);
+                rebuild_uk_indexes(tc);
+                printf("[error] DELETE failed: delta log append failed; memory restored.\n");
+                return;
+            }
+            printf("[delta] DELETE persisted through append-only delta log.\n");
+            if (!maybe_compact_delta_log(tc)) {
+                printf("[warning] DELETE completed, but delta compaction failed.\n");
+            }
+        } else if (!rewrite_file(tc)) {
+            tc->record_active[target_row] = 1;
+            tc->active_count++;
+            restore_record_indexes(tc, target_row);
+            rebuild_id_index(tc);
+            rebuild_uk_indexes(tc);
+            printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
+            return;
+        }
+        free(tc->records[target_row]);
+        tc->records[target_row] = NULL;
+        push_free_slot(tc, target_row);
+        printf("[ok] DELETE completed. rows=1\n");
+        return;
+    }
     old_records = (char **)malloc((size_t)old_count * sizeof(char *));
     delete_flags = (int *)calloc((size_t)old_count, sizeof(int));
-    if (!old_records || !delete_flags) {
+    removed_index_flags = (int *)calloc((size_t)old_count, sizeof(int));
+    if (!old_records || !delete_flags || !removed_index_flags) {
         free(old_records);
         free(delete_flags);
+        free(removed_index_flags);
         printf("[error] DELETE failed: out of memory.\n");
         return;
     }
@@ -2072,45 +2379,61 @@ void execute_delete(Statement *stmt) {
     if (count > 0) {
         for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
             if (delete_flags[read_idx] && tc->record_active[read_idx]) {
+                if (!remove_record_indexes(tc, tc->records[read_idx])) {
+                    int rollback_idx;
+                    for (rollback_idx = 0; rollback_idx < read_idx; rollback_idx++) {
+                        if (removed_index_flags[rollback_idx]) {
+                            tc->record_active[rollback_idx] = 1;
+                            tc->active_count++;
+                        }
+                    }
+                    rebuild_id_index(tc);
+                    rebuild_uk_indexes(tc);
+                    free(old_records);
+                    free(delete_flags);
+                    free(removed_index_flags);
+                    printf("[error] DELETE failed: index entry delete failed; indexes rebuilt.\n");
+                    return;
+                }
+                removed_index_flags[read_idx] = 1;
                 tc->record_active[read_idx] = 0;
                 tc->active_count--;
             }
         }
-        if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
-            for (read_idx = 0; read_idx < old_count; read_idx++) {
-                if (delete_flags[read_idx]) tc->record_active[read_idx] = 1;
-            }
-            tc->active_count += count;
-            rebuild_id_index(tc);
-            rebuild_uk_indexes(tc);
-            free(old_records);
-            free(delete_flags);
-            printf("[error] DELETE failed: index rebuild failed; memory restored.\n");
-            return;
-        }
         if (tc->pk_idx != -1) {
             if (!append_delta_deletes(tc, old_records, delete_flags, old_count)) {
                 for (read_idx = 0; read_idx < old_count; read_idx++) {
-                    if (delete_flags[read_idx]) tc->record_active[read_idx] = 1;
+                    if (delete_flags[read_idx]) {
+                        tc->record_active[read_idx] = 1;
+                        if (removed_index_flags[read_idx]) restore_record_indexes(tc, read_idx);
+                    }
                 }
                 tc->active_count += count;
                 rebuild_id_index(tc);
                 rebuild_uk_indexes(tc);
                 free(old_records);
                 free(delete_flags);
+                free(removed_index_flags);
                 printf("[error] DELETE failed: delta log append failed; memory restored.\n");
                 return;
             }
             printf("[delta] DELETE persisted through append-only delta log.\n");
+            if (!maybe_compact_delta_log(tc)) {
+                printf("[warning] DELETE completed, but delta compaction failed.\n");
+            }
         } else if (!rewrite_file(tc)) {
             for (read_idx = 0; read_idx < old_count; read_idx++) {
-                if (delete_flags[read_idx]) tc->record_active[read_idx] = 1;
+                if (delete_flags[read_idx]) {
+                    tc->record_active[read_idx] = 1;
+                    if (removed_index_flags[read_idx]) restore_record_indexes(tc, read_idx);
+                }
             }
             tc->active_count += count;
             rebuild_id_index(tc);
             rebuild_uk_indexes(tc);
             free(old_records);
             free(delete_flags);
+            free(removed_index_flags);
             printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
             return;
         }
@@ -2123,10 +2446,12 @@ void execute_delete(Statement *stmt) {
         }
         free(old_records);
         free(delete_flags);
+        free(removed_index_flags);
         printf("[ok] DELETE completed. rows=%d\n", count);
     } else {
         free(old_records);
         free(delete_flags);
+        free(removed_index_flags);
         printf("[notice] no rows matched DELETE condition.\n");
     }
 }
