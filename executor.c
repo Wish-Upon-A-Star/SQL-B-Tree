@@ -33,6 +33,7 @@ void parse_csv_row(const char *row, char *fields[MAX_COLS], char *buffer);
 static void normalize_value(const char *src, char *dest, size_t dest_size);
 static int rebuild_id_index(TableCache *tc);
 static int rebuild_uk_indexes(TableCache *tc);
+static int maybe_rebuild_indexes_for_order(TableCache *tc);
 static int index_record_uks(TableCache *tc, int row_index);
 static int index_record_uks_from_row(TableCache *tc, const char *row, int row_index);
 static int get_uk_slot(TableCache *tc, int col_idx);
@@ -1134,6 +1135,13 @@ static int append_record_memory(TableCache *tc, const char *row, long id_value, 
         if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
     }
     if (!index_record_uks(tc, slot_id)) {
+        deactivate_slot(tc, slot_id, 1);
+        if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
+            printf("[error] INSERT rollback failed: indexes may be stale.\n");
+        }
+        return 0;
+    }
+    if (!maybe_rebuild_indexes_for_order(tc)) {
         deactivate_slot(tc, slot_id, 1);
         if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
             printf("[error] INSERT rollback failed: indexes may be stale.\n");
@@ -2265,6 +2273,30 @@ fail:
     return 0;
 }
 
+static int maybe_rebuild_indexes_for_order(TableCache *tc) {
+    int desired_order;
+    int i;
+    int needs_rebuild = 0;
+
+    if (!tc || tc->active_count <= 0 || tc->cache_truncated) return 1;
+    desired_order = bptree_recommended_order(tc->active_count);
+    if (tc->id_index && bptree_order(tc->id_index) < desired_order) {
+        needs_rebuild = 1;
+    }
+    for (i = 0; !needs_rebuild && i < tc->uk_count; i++) {
+        if (tc->uk_indexes[i] &&
+            bptree_string_order(tc->uk_indexes[i]->tree) < desired_order) {
+            needs_rebuild = 1;
+        }
+    }
+    if (!needs_rebuild) return 1;
+    if (g_executor_quiet == 0) {
+        INFO_PRINTF("[index] rebuilding PK/UK B+ trees for order %d at %d active rows.\n",
+                    desired_order, tc->active_count);
+    }
+    return rebuild_id_index(tc) && rebuild_uk_indexes(tc);
+}
+
 typedef struct {
     long size;
     long mtime;
@@ -3251,6 +3283,9 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
             }
             printf("[error] INSERT failed: could not append to table file.\n");
             return 0;
+        }
+        if (!maybe_rebuild_indexes_for_order(tc)) {
+            printf("[warning] INSERT completed, but dynamic B+ tree order rebuild failed.\n");
         }
     } else {
         long append_offset;

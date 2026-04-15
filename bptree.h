@@ -20,6 +20,7 @@ typedef int (*BPlusStringRangeVisitor)(const char *key, int row_index, void *ctx
 BPlusTree *bptree_create(void);
 BPlusTree *bptree_create_with_order(int order);
 int bptree_order(const BPlusTree *tree);
+int bptree_recommended_order(int count);
 void bptree_destroy(BPlusTree *tree);
 int bptree_insert(BPlusTree *tree, long key, int row_index);
 int bptree_delete(BPlusTree *tree, long key);

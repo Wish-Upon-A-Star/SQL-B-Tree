@@ -4,7 +4,7 @@
 #include "bptree.h"
 
 #define BPTREE_MIN_ORDER 8
-#define BPTREE_DEFAULT_ORDER 32
+#define BPTREE_DEFAULT_ORDER 8
 #define BPTREE_MAX_ORDER 64
 #define BPTREE_MAX_KEYS (BPTREE_MAX_ORDER - 1)
 
@@ -47,6 +47,10 @@ static int choose_order_for_count(int count) {
     if (count < 65536) return 16;
     if (count < 262144) return 32;
     return 64;
+}
+
+int bptree_recommended_order(int count) {
+    return choose_order_for_count(count);
 }
 
 static int tree_order(const BPlusTree *tree) {
