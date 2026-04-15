@@ -1,0 +1,7 @@
+-- Checkpoint queries after generated_sql/jungle_delete_1000000.sql
+-- No rows should be returned for these lookups.
+
+SELECT id, email, phone, name, status FROM jungle_workload_users WHERE id = 1;
+SELECT id, email, phone, name, status FROM jungle_workload_users WHERE email = 'jungle0777777@apply.kr';
+SELECT id, email, phone, name, status FROM jungle_workload_users WHERE phone = '010-0077-7777';
+SELECT id, email, phone, name, status FROM jungle_workload_users WHERE id = 1000000;

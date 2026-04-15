@@ -51,6 +51,13 @@ int main(int argc, char *argv[]) {
         argi++;
     }
 
+    if (argi < argc && strcmp(argv[argi], "--generate-jungle") == 0) {
+        int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
+        const char *output = (argi + 2 < argc) ? argv[argi + 2] : NULL;
+        generate_jungle_dataset(count, output);
+        return 0;
+    }
+
     if (argi < argc && strcmp(argv[argi], "--benchmark") == 0) {
         int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
         run_bplus_benchmark(count);

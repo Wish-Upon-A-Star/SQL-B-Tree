@@ -13,3 +13,6 @@ uk_*_users.csv
 uk_*_test.sql
 uk_test_users.csv
 uk_test.sql
+generated_sql/
+*.delta
+bptree_benchmark_users.csv

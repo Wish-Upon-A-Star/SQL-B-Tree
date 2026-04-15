@@ -50,6 +50,11 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
                                      int uses_uk_lookup, int rebuild_uk_needed);
 int rewrite_file(TableCache *tc);
 
+static const char *const JUNGLE_DATASET_FILE = "bptree_benchmark_users.csv";
+static const char *const JUNGLE_DATASET_TABLE = "bptree_benchmark_users";
+static const char *const JUNGLE_DATASET_HEADER =
+    "id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round\n";
+
 static char *dup_string(const char *src) {
     size_t len = strlen(src) + 1;
     char *copy = (char *)malloc(len);
@@ -2625,48 +2630,276 @@ static double current_seconds(void) {
 #endif
 }
 
+static int clamp_record_count(int record_count, int minimum) {
+    if (record_count < minimum) record_count = minimum;
+    if (record_count > MAX_RECORDS) {
+        printf("[notice] record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
+        record_count = MAX_RECORDS;
+    }
+    return record_count;
+}
+
+static const char *jungle_track_for_id(int id) {
+    static const char *const tracks[] = {
+        "sw_ai_lab", "game_lab", "game_tech_lab"
+    };
+    return tracks[(id - 1) % 3];
+}
+
+static const char *jungle_background_for_id(int id) {
+    int bucket = (id - 1) % 100;
+
+    if (bucket < 62) return "student";
+    if (bucket < 74) return "newgrad";
+    if (bucket < 86) return "incumbent";
+    if (bucket < 95) return "switcher";
+    return "selftaught";
+}
+
+static int jungle_pretest_for_id(int id) {
+    long long mixed = (long long)id * 73LL + (long long)((id - 1) % 97) * 19LL + 17LL;
+    return 35 + (int)(mixed % 66LL);
+}
+
+static void build_jungle_history(int id, const char *background, char *buffer, size_t buffer_size) {
+    static const char *const majors[] = {
+        "cs", "software", "ai", "game", "math", "physics",
+        "stats", "design", "ee", "business", "english", "biology"
+    };
+    static const char *const incumbent_roles[] = {
+        "backend", "frontend", "data", "infra", "qa", "game_client", "game_server"
+    };
+    static const char *const switcher_roles[] = {
+        "designer", "teacher", "marketer", "pm", "sales", "mechanical", "accounting"
+    };
+    static const char *const selftaught_routes[] = {
+        "selftaught", "bootcamp", "indie", "academy"
+    };
+    int major_idx = ((id - 1) / 3) % (int)(sizeof(majors) / sizeof(majors[0]));
+
+    if (strcmp(background, "student") == 0) {
+        int grade = ((id - 1) / 7) % 4 + 1;
+        snprintf(buffer, buffer_size, "major_%s_grade_%d", majors[major_idx], grade);
+        return;
+    }
+
+    if (strcmp(background, "newgrad") == 0) {
+        snprintf(buffer, buffer_size, "major_%s_graduate", majors[major_idx]);
+        return;
+    }
+
+    if (strcmp(background, "incumbent") == 0) {
+        int role_idx = ((id - 1) / 5) % (int)(sizeof(incumbent_roles) / sizeof(incumbent_roles[0]));
+        int years = ((id - 1) / 11) % 6 + 1;
+        snprintf(buffer, buffer_size, "%s_%dy", incumbent_roles[role_idx], years);
+        return;
+    }
+
+    if (strcmp(background, "switcher") == 0) {
+        int role_idx = ((id - 1) / 9) % (int)(sizeof(switcher_roles) / sizeof(switcher_roles[0]));
+        int years = ((id - 1) / 13) % 8 + 1;
+        snprintf(buffer, buffer_size, "%s_%dy", switcher_roles[role_idx], years);
+        return;
+    }
+
+    {
+        int route_idx = ((id - 1) / 17) % (int)(sizeof(selftaught_routes) / sizeof(selftaught_routes[0]));
+        int months = ((((id - 1) / 19) % 9) + 1) * 6;
+        snprintf(buffer, buffer_size, "%s_%dm", selftaught_routes[route_idx], months);
+    }
+}
+
+static void build_jungle_github(int id, const char *background, char *buffer, size_t buffer_size) {
+    int bucket = (int)(((long long)id * 29LL + 7LL) % 100LL);
+
+    if ((strcmp(background, "student") == 0 && bucket < 18) ||
+        (strcmp(background, "newgrad") == 0 && bucket < 8) ||
+        (strcmp(background, "switcher") == 0 && bucket < 10) ||
+        (strcmp(background, "selftaught") == 0 && bucket < 6)) {
+        snprintf(buffer, buffer_size, "none");
+        return;
+    }
+
+    snprintf(buffer, buffer_size, "gh_%07d", id);
+}
+
+static const char *jungle_status_for_id(int id, int pretest) {
+    if (id % 113 == 0) return "withdrawn";
+    if (pretest >= 98) return "final_pass";
+    if (pretest >= 90) return "final_wait";
+    if (pretest >= 80) return "interview_wait";
+    if (pretest >= 65) return "pretest_pass";
+    if (pretest >= 50) return "submitted";
+    return "rejected";
+}
+
+static void build_jungle_email(int id, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "jungle%07d@apply.kr", id);
+}
+
+static void build_jungle_phone(int id, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "010-%04d-%04d", id / 10000, id % 10000);
+}
+
+static void build_jungle_name(int id, char *buffer, size_t buffer_size) {
+    static const char *const surnames[] = {
+        "김", "이", "박", "최", "정", "강", "조", "윤", "장", "임",
+        "한", "오", "서", "신", "권", "황", "안", "송", "전", "홍"
+    };
+    static const char *const first_syllables[] = {
+        "민", "서", "지", "도", "하", "수", "예", "시",
+        "현", "준", "유", "주", "다", "윤", "태", "선",
+        "건", "채", "승", "정", "호", "은", "재", "가",
+        "나", "라", "마", "소", "아", "연", "원", "진",
+        "혜", "규", "한", "슬", "보", "새", "강", "온",
+        "루", "단", "류", "리", "해", "별", "솔", "율"
+    };
+    static const char *const second_syllables[] = {
+        "준", "연", "후", "윤", "린", "민", "아", "우",
+        "서", "진", "수", "영", "원", "호", "혜", "현",
+        "지", "인", "온", "별", "율", "나", "리", "빈",
+        "솔", "람", "훈", "석", "비", "담", "새", "균",
+        "채", "한", "태", "경", "슬", "주", "재", "강",
+        "선", "도", "희", "휘", "록", "봄", "혁", "화"
+    };
+    int surname_count = (int)(sizeof(surnames) / sizeof(surnames[0]));
+    int first_count = (int)(sizeof(first_syllables) / sizeof(first_syllables[0]));
+    int second_count = (int)(sizeof(second_syllables) / sizeof(second_syllables[0]));
+    int surname_idx = (id - 1) % surname_count;
+    int given_combo = ((id - 1) / surname_count) % (first_count * second_count);
+    int first_idx = given_combo / second_count;
+    int second_idx = given_combo % second_count;
+
+    snprintf(buffer, buffer_size, "%s%s%s",
+             surnames[surname_idx], first_syllables[first_idx], second_syllables[second_idx]);
+}
+
+static void build_jungle_row_data(int id, char *buffer, size_t buffer_size) {
+    const char *track = jungle_track_for_id(id);
+    const char *background = jungle_background_for_id(id);
+    int pretest = jungle_pretest_for_id(id);
+    const char *status = jungle_status_for_id(id, pretest);
+    char email[64];
+    char phone[32];
+    char name[64];
+    char history[64];
+    char github[32];
+
+    build_jungle_email(id, email, sizeof(email));
+    build_jungle_phone(id, phone, sizeof(phone));
+    build_jungle_name(id, name, sizeof(name));
+    build_jungle_history(id, background, history, sizeof(history));
+    build_jungle_github(id, background, github, sizeof(github));
+    snprintf(buffer, buffer_size, "%s,%s,%s,%s,%s,%s,%d,%s,%s,2026_spring",
+             email, phone, name, track, background, history, pretest, github, status);
+}
+
+static void build_jungle_csv_record(int id, char *buffer, size_t buffer_size) {
+    const char *track = jungle_track_for_id(id);
+    const char *background = jungle_background_for_id(id);
+    int pretest = jungle_pretest_for_id(id);
+    const char *status = jungle_status_for_id(id, pretest);
+    char email[64];
+    char phone[32];
+    char name[64];
+    char history[64];
+    char github[32];
+
+    build_jungle_email(id, email, sizeof(email));
+    build_jungle_phone(id, phone, sizeof(phone));
+    build_jungle_name(id, name, sizeof(name));
+    build_jungle_history(id, background, history, sizeof(history));
+    build_jungle_github(id, background, github, sizeof(github));
+    snprintf(buffer, buffer_size, "%d,%s,%s,%s,%s,%s,%s,%d,%s,%s,2026_spring",
+             id, email, phone, name, track, background, history, pretest, github, status);
+}
+
+void generate_jungle_dataset(int record_count, const char *filename) {
+    FILE *f;
+    int i;
+    const char *output = (filename && filename[0]) ? filename : JUNGLE_DATASET_FILE;
+
+    record_count = clamp_record_count(record_count <= 0 ? 1000000 : record_count, 1);
+
+    f = fopen(output, "w");
+    if (!f) {
+        printf("[error] dataset file could not be created: %s\n", output);
+        return;
+    }
+    if (fputs(JUNGLE_DATASET_HEADER, f) == EOF) {
+        fclose(f);
+        printf("[error] dataset header could not be written: %s\n", output);
+        return;
+    }
+
+    for (i = 1; i <= record_count; i++) {
+        char row[512];
+        build_jungle_csv_record(i, row, sizeof(row));
+        if (fputs(row, f) == EOF || fputc('\n', f) == EOF) {
+            fclose(f);
+            printf("[error] dataset write failed at row %d.\n", i);
+            return;
+        }
+    }
+
+    if (fclose(f) != 0) {
+        printf("[error] dataset file close failed: %s\n", output);
+        return;
+    }
+
+    printf("[ok] jungle applicant dataset generated: %s (%d rows)\n", output, record_count);
+}
+
 void run_bplus_benchmark(int record_count) {
     FILE *f;
     TableCache *tc;
-    const char *table_name = "bptree_benchmark_users";
+    const char *table_name = JUNGLE_DATASET_TABLE;
+    int email_idx;
+    int phone_idx;
+    int name_idx;
     int i;
     int index_query_count = 100000;
     int uk_query_count = 100000;
+    int phone_query_count = 100000;
     int linear_query_count = 30;
     int found = 0;
     double start;
     double end;
     double id_indexed_time;
     double uk_indexed_time;
+    double phone_indexed_time;
     double linear_time;
 
-    if (record_count < 1000000) record_count = 1000000;
-    if (record_count > MAX_RECORDS) {
-        INFO_PRINTF("[notice] benchmark record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
-        record_count = MAX_RECORDS;
-    }
+    record_count = clamp_record_count(record_count, 1000000);
 
     close_all_tables();
     open_table_count = 0;
     remove("bptree_benchmark_users.delta");
 
-    f = fopen("bptree_benchmark_users.csv", "w");
+    f = fopen(JUNGLE_DATASET_FILE, "w");
     if (!f) {
         printf("[error] benchmark table file could not be created.\n");
         return;
     }
-    if (fprintf(f, "id(PK),email(UK),payload(NN),name\n") < 0 || fclose(f) != 0) {
+    if (fputs(JUNGLE_DATASET_HEADER, f) == EOF || fclose(f) != 0) {
         printf("[error] benchmark table header could not be written.\n");
         return;
     }
 
     tc = get_table(table_name);
     if (!tc) return;
+    email_idx = get_col_idx(tc, "email");
+    phone_idx = get_col_idx(tc, "phone");
+    name_idx = get_col_idx(tc, "name");
+    if (email_idx == -1 || phone_idx == -1 || name_idx == -1) {
+        printf("[error] benchmark columns could not be resolved.\n");
+        return;
+    }
 
     start = current_seconds();
     for (i = 1; i <= record_count; i++) {
-        char row_data[128];
-        snprintf(row_data, sizeof(row_data), "user%d@test.com,payload%d,User%d", i, i, i);
+        char row_data[512];
+        build_jungle_row_data(i, row_data, sizeof(row_data));
         if (!insert_row_data(tc, row_data, 0, NULL)) {
             printf("[error] benchmark insert failed at row %d.\n", i);
             return;
@@ -2679,6 +2912,7 @@ void run_bplus_benchmark(int record_count) {
     end = current_seconds();
 
     printf("\n--- [B+ TREE BENCHMARK] ---\n");
+    printf("dataset theme: jungle applicants 2026 spring\n");
     printf("inserted records through INSERT path: %d (%.6f sec)\n", record_count, end - start);
 
     start = current_seconds();
@@ -2694,24 +2928,34 @@ void run_bplus_benchmark(int record_count) {
     for (i = 0; i < uk_query_count; i++) {
         char target[64];
         int row_index;
-        snprintf(target, sizeof(target), "user%d@test.com", ((i * 7919) % record_count) + 1);
-        if (find_uk_row(tc, 1, target, &row_index)) found += row_index >= 0;
+        build_jungle_email(((i * 7919) % record_count) + 1, target, sizeof(target));
+        if (find_uk_row(tc, email_idx, target, &row_index)) found += row_index >= 0;
     }
     end = current_seconds();
     uk_indexed_time = end - start;
 
     start = current_seconds();
+    for (i = 0; i < phone_query_count; i++) {
+        char target[32];
+        int row_index;
+        build_jungle_phone(((i * 7919) % record_count) + 1, target, sizeof(target));
+        if (find_uk_row(tc, phone_idx, target, &row_index)) found += row_index >= 0;
+    }
+    end = current_seconds();
+    phone_indexed_time = end - start;
+
+    start = current_seconds();
     for (i = 0; i < linear_query_count; i++) {
         char target[64];
         int r;
-        snprintf(target, sizeof(target), "User%d", ((i * 7919) % record_count) + 1);
+        build_jungle_name(((i * 7919) % record_count) + 1, target, sizeof(target));
         for (r = 0; r < tc->record_count; r++) {
             char row_buf[RECORD_SIZE];
             char *fields[MAX_COLS] = {0};
             char *row = slot_row(tc, r);
             if (!row) continue;
             parse_csv_row(row, fields, row_buf);
-            if (compare_value(fields[3], target)) {
+            if (compare_value(fields[name_idx], target)) {
                 found++;
                 break;
             }
@@ -2725,6 +2969,8 @@ void run_bplus_benchmark(int record_count) {
            id_indexed_time, index_query_count, id_indexed_time / index_query_count);
     printf("email(UK) SELECT using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
            uk_indexed_time, uk_query_count, uk_indexed_time / uk_query_count);
+    printf("phone(UK) SELECT using B+ tree: %.6f sec total (%d queries, %.9f sec/query)\n",
+           phone_indexed_time, phone_query_count, phone_indexed_time / phone_query_count);
     printf("name SELECT using linear scan: %.6f sec total (%d queries, %.9f sec/query)\n",
            linear_time, linear_query_count, linear_time / linear_query_count);
     if (id_indexed_time > 0.0) {
@@ -2736,6 +2982,11 @@ void run_bplus_benchmark(int record_count) {
         double uk_avg = uk_indexed_time / uk_query_count;
         double linear_avg = linear_time / linear_query_count;
         printf("linear/uk-index average speed ratio: %.2fx\n", linear_avg / uk_avg);
+    }
+    if (phone_indexed_time > 0.0) {
+        double phone_avg = phone_indexed_time / phone_query_count;
+        double linear_avg = linear_time / linear_query_count;
+        printf("linear/phone-index average speed ratio: %.2fx\n", linear_avg / phone_avg);
     }
     printf("matched checks: %d\n", found);
 }
