@@ -151,6 +151,68 @@ static const char *skip_sql_spaces(const char *s) {
     return s;
 }
 
+static const char *read_sql_identifier(const char *s, char *dest, size_t dest_size) {
+    const char *start;
+    size_t len;
+
+    s = skip_sql_spaces(s);
+    start = s;
+    if (!isalpha((unsigned char)*s) && *s != '_') return NULL;
+    while (isalnum((unsigned char)*s) || *s == '_') s++;
+    len = (size_t)(s - start);
+    if (len == 0 || len >= dest_size) return NULL;
+    memcpy(dest, start, len);
+    dest[len] = '\0';
+    return s;
+}
+
+static const char *read_sql_literal(const char *s, char *dest, size_t dest_size) {
+    const char *start;
+    size_t len;
+
+    s = skip_sql_spaces(s);
+    if (*s == '\'') {
+        s++;
+        start = s;
+        while (*s && *s != '\'') s++;
+        if (*s != '\'') return NULL;
+        len = (size_t)(s - start);
+        if (len >= dest_size) return NULL;
+        memcpy(dest, start, len);
+        dest[len] = '\0';
+        return s + 1;
+    }
+
+    start = s;
+    while (*s && !isspace((unsigned char)*s)) s++;
+    len = (size_t)(s - start);
+    if (len == 0 || len >= dest_size) return NULL;
+    memcpy(dest, start, len);
+    dest[len] = '\0';
+    return s;
+}
+
+static int finish_single_eq_where(Statement *stmt, const char *where_col, const char *where_val) {
+    WhereCondition *cond;
+
+    stmt->where_count = 1;
+    stmt->where_type = WHERE_EQ;
+    strncpy(stmt->where_col, where_col, sizeof(stmt->where_col) - 1);
+    stmt->where_col[sizeof(stmt->where_col) - 1] = '\0';
+    strncpy(stmt->where_val, where_val, sizeof(stmt->where_val) - 1);
+    stmt->where_val[sizeof(stmt->where_val) - 1] = '\0';
+    stmt->where_end_val[0] = '\0';
+
+    cond = &stmt->where_conditions[0];
+    memset(cond, 0, sizeof(*cond));
+    cond->type = WHERE_EQ;
+    strncpy(cond->col, where_col, sizeof(cond->col) - 1);
+    cond->col[sizeof(cond->col) - 1] = '\0';
+    strncpy(cond->val, where_val, sizeof(cond->val) - 1);
+    cond->val[sizeof(cond->val) - 1] = '\0';
+    return 1;
+}
+
 static int try_execute_insert_fast(const char *sql) {
     Statement stmt;
     const char *p;
@@ -203,6 +265,86 @@ static int try_execute_insert_fast(const char *sql) {
     return 1;
 }
 
+static int try_execute_update_fast(const char *sql) {
+    Statement stmt;
+    char where_col[50];
+    char where_val[256];
+    const char *p;
+
+    p = skip_sql_spaces(sql);
+    if (!keyword_match_ci(p, "update")) return 0;
+    p = skip_sql_spaces(p + 6);
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.type = STMT_UPDATE;
+    p = read_sql_identifier(p, stmt.table_name, sizeof(stmt.table_name));
+    if (!p) return 0;
+
+    p = skip_sql_spaces(p);
+    if (!keyword_match_ci(p, "set")) return 0;
+    p = skip_sql_spaces(p + 3);
+
+    p = read_sql_identifier(p, stmt.set_col, sizeof(stmt.set_col));
+    if (!p) return 0;
+    p = skip_sql_spaces(p);
+    if (*p != '=') return 0;
+    p++;
+    p = read_sql_literal(p, stmt.set_val, sizeof(stmt.set_val));
+    if (!p) return 0;
+
+    p = skip_sql_spaces(p);
+    if (!keyword_match_ci(p, "where")) return 0;
+    p = skip_sql_spaces(p + 5);
+    p = read_sql_identifier(p, where_col, sizeof(where_col));
+    if (!p) return 0;
+    p = skip_sql_spaces(p);
+    if (*p != '=') return 0;
+    p++;
+    p = read_sql_literal(p, where_val, sizeof(where_val));
+    if (!p) return 0;
+    p = skip_sql_spaces(p);
+    if (*p != '\0') return 0;
+
+    finish_single_eq_where(&stmt, where_col, where_val);
+    execute_update(&stmt);
+    return 1;
+}
+
+static int try_execute_delete_fast(const char *sql) {
+    Statement stmt;
+    char where_col[50];
+    char where_val[256];
+    const char *p;
+
+    p = skip_sql_spaces(sql);
+    if (!keyword_match_ci(p, "delete")) return 0;
+    p = skip_sql_spaces(p + 6);
+    if (!keyword_match_ci(p, "from")) return 0;
+    p = skip_sql_spaces(p + 4);
+
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.type = STMT_DELETE;
+    p = read_sql_identifier(p, stmt.table_name, sizeof(stmt.table_name));
+    if (!p) return 0;
+
+    p = skip_sql_spaces(p);
+    if (!keyword_match_ci(p, "where")) return 0;
+    p = skip_sql_spaces(p + 5);
+    p = read_sql_identifier(p, where_col, sizeof(where_col));
+    if (!p) return 0;
+    p = skip_sql_spaces(p);
+    if (*p != '=') return 0;
+    p++;
+    p = read_sql_literal(p, where_val, sizeof(where_val));
+    if (!p) return 0;
+    p = skip_sql_spaces(p);
+    if (*p != '\0') return 0;
+
+    finish_single_eq_where(&stmt, where_col, where_val);
+    execute_delete(&stmt);
+    return 1;
+}
+
 static int execute_sql_line_fast(char *line) {
     char *s = line;
     int q = 0;
@@ -224,7 +366,11 @@ static int execute_sql_line_fast(char *line) {
         if (!isspace((unsigned char)*p)) return 0;
     }
     *semicolon = '\0';
-    execute_sql_text(s);
+    if (!try_execute_insert_fast(s) &&
+        !try_execute_update_fast(s) &&
+        !try_execute_delete_fast(s)) {
+        execute_sql_text(s);
+    }
     return 1;
 }
 

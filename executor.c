@@ -4294,11 +4294,19 @@ void execute_delete(Statement *stmt) {
             printf("[error] DELETE failed: target row could not be loaded.\n");
             return;
         }
-        if (uses_pk_lookup && stmt->where_count == 1 && has_pk_key &&
-            tc->row_ids && tc->row_ids[target_row] != pk_key) {
-            bptree_delete(tc->id_index, pk_key);
-            INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
-            return;
+        if (uses_pk_lookup && stmt->where_count == 1 && has_pk_key) {
+            int pk_matches = 1;
+            if (tc->pk_idx != -1) {
+                pk_matches = row_field_equals(tc, old_record, tc->pk_idx,
+                                              stmt->where_conditions[index_cond].val);
+            } else if (tc->row_ids && tc->row_ids[target_row] != pk_key) {
+                pk_matches = 0;
+            }
+            if (!pk_matches) {
+                bptree_delete(tc->id_index, pk_key);
+                INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
+                return;
+            }
         }
         if (!(uses_pk_lookup && stmt->where_count == 1 && has_pk_key) &&
             !row_matches_statement(tc, stmt, old_record)) {

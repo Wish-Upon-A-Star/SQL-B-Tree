@@ -12,6 +12,7 @@ JUNGLE_DATASET ?= jungle_benchmark_users.csv
 JUNGLE_RECORDS ?= 1000000
 BENCH_SCORE_UPDATE_ROWS ?= 1000000
 BENCH_SCORE_DELETE_ROWS ?= 1000000
+BENCH_SCORE_IN_TMP ?= 1
 
 .PHONY: all build bench-tools bench-test run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 
@@ -72,7 +73,11 @@ bench-smoke: build bench-tools
 	./$(BENCH_RUNNER) --profile smoke --seed 20260415 --repeat 3 --memtrack
 
 bench-score: build bench-tools
+ifeq ($(BENCH_SCORE_IN_TMP),1)
+	sh scripts/run_bench_score_tmp.sh "$(CURDIR)" "$(BENCH_SCORE_UPDATE_ROWS)" "$(BENCH_SCORE_DELETE_ROWS)"
+else
 	./$(BENCH_RUNNER) --profile score --seed 20260415 --repeat 1 --update-rows $(BENCH_SCORE_UPDATE_ROWS) --delete-rows $(BENCH_SCORE_DELETE_ROWS) --memtrack
+endif
 
 bench-report: $(BENCH_RUNNER)
 	./$(BENCH_RUNNER) --report-only
