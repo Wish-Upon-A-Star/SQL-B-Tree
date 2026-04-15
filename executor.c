@@ -23,6 +23,7 @@ static int get_uk_slot(TableCache *tc, int col_idx);
 static int ensure_uk_indexes(TableCache *tc);
 static int rollback_last_record_memory(TableCache *tc);
 static void rollback_updated_records(TableCache *tc, char **old_records);
+static int parse_long_value(const char *value, long *out);
 static int table_file_has_value(TableCache *tc, int col_idx, const char *value);
 static int for_each_file_row_from(TableCache *tc, long start_offset,
                                   int (*visitor)(TableCache *, const char *, void *),
@@ -100,6 +101,14 @@ static int find_uk_row(TableCache *tc, int col_idx, const char *value, int *row_
     normalize_value(value, key, sizeof(key));
     if (strlen(key) == 0) return 0;
     return unique_index_find(tc, tc->uk_indexes[uk_slot], key, row_index);
+}
+
+static int find_pk_row(TableCache *tc, const char *value, int *row_index) {
+    long key;
+
+    if (!tc || tc->pk_idx == -1 || !value) return 0;
+    if (!parse_long_value(value, &key)) return 0;
+    return bptree_search(tc->id_index, key, row_index);
 }
 
 static int unique_index_insert(TableCache *tc, UniqueIndex *index, const char *key, int row_index) {
@@ -1269,6 +1278,9 @@ void execute_update(Statement *stmt) {
     int *match_flags;
     char **old_records;
     int target_count = 0;
+    int uses_pk_lookup = 0;
+    int target_row = -1;
+    int rebuild_uk_needed;
     int i;
 
     if (!tc) return;
@@ -1296,6 +1308,8 @@ void execute_update(Statement *stmt) {
         }
         return;
     }
+    rebuild_uk_needed = (tc->cols[set_idx].type == COL_UK);
+    uses_pk_lookup = (where_idx == tc->pk_idx);
 
     match_flags = (int *)calloc((size_t)tc->record_count, sizeof(int));
     if (!match_flags) {
@@ -1309,13 +1323,21 @@ void execute_update(Statement *stmt) {
         return;
     }
 
-    for (i = 0; i < tc->record_count; i++) {
-        char row_buf[RECORD_SIZE];
-        char *f[MAX_COLS] = {0};
-        parse_csv_row(tc->records[i], f, row_buf);
-        if (compare_value(f[where_idx], stmt->where_val)) {
-            match_flags[i] = 1;
-            target_count++;
+    if (uses_pk_lookup) {
+        printf("[index] B+ tree id lookup for UPDATE\n");
+        if (find_pk_row(tc, stmt->where_val, &target_row)) {
+            match_flags[target_row] = 1;
+            target_count = 1;
+        }
+    } else {
+        for (i = 0; i < tc->record_count; i++) {
+            char row_buf[RECORD_SIZE];
+            char *f[MAX_COLS] = {0};
+            parse_csv_row(tc->records[i], f, row_buf);
+            if (compare_value(f[where_idx], stmt->where_val)) {
+                match_flags[i] = 1;
+                target_count++;
+            }
         }
     }
     if (target_count == 0) {
@@ -1325,7 +1347,7 @@ void execute_update(Statement *stmt) {
         return;
     }
 
-    if (tc->cols[set_idx].type == COL_UK) {
+    if (rebuild_uk_needed) {
         int found_row = -1;
         int uk_slot = get_uk_slot(tc, set_idx);
         if (target_count > 1) {
@@ -1386,7 +1408,7 @@ void execute_update(Statement *stmt) {
 
     free(match_flags);
     if (count > 0) {
-        if (!rebuild_uk_indexes(tc)) {
+        if (rebuild_uk_needed && !rebuild_uk_indexes(tc)) {
             rollback_updated_records(tc, old_records);
             free(old_records);
             printf("[error] UPDATE failed: UK index rebuild failed; memory restored.\n");
@@ -1394,7 +1416,7 @@ void execute_update(Statement *stmt) {
         }
         if (!rewrite_file(tc)) {
             rollback_updated_records(tc, old_records);
-            rebuild_uk_indexes(tc);
+            if (rebuild_uk_needed) rebuild_uk_indexes(tc);
             free(old_records);
             printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
             return;
@@ -1417,6 +1439,8 @@ void execute_delete(Statement *stmt) {
     int old_count;
     char **old_records;
     int *delete_flags;
+    int uses_pk_lookup = 0;
+    int target_row = -1;
 
     if (!tc) return;
     where_idx = get_col_idx(tc, stmt->where_col);
@@ -1432,6 +1456,7 @@ void execute_delete(Statement *stmt) {
     }
 
     old_count = tc->record_count;
+    uses_pk_lookup = (where_idx == tc->pk_idx);
     if (old_count == 0) {
         printf("[notice] no rows matched DELETE condition.\n");
         return;
@@ -1446,19 +1471,29 @@ void execute_delete(Statement *stmt) {
     }
     memcpy(old_records, tc->records, (size_t)old_count * sizeof(char *));
 
-    for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
-        char row_buf[RECORD_SIZE];
-        char *fields[MAX_COLS] = {0};
-        int matched;
-
-        parse_csv_row(tc->records[read_idx], fields, row_buf);
-        matched = compare_value(fields[where_idx], stmt->where_val);
-        if (matched) {
-            delete_flags[read_idx] = 1;
-            count++;
-            continue;
+    if (uses_pk_lookup) {
+        printf("[index] B+ tree id lookup for DELETE\n");
+        if (find_pk_row(tc, stmt->where_val, &target_row)) {
+            delete_flags[target_row] = 1;
+            count = 1;
         }
-        tc->records[write_idx++] = tc->records[read_idx];
+    } else {
+        for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
+            char row_buf[RECORD_SIZE];
+            char *fields[MAX_COLS] = {0};
+            int matched;
+
+            parse_csv_row(tc->records[read_idx], fields, row_buf);
+            matched = compare_value(fields[where_idx], stmt->where_val);
+            if (matched) {
+                delete_flags[read_idx] = 1;
+                count++;
+            }
+        }
+    }
+
+    for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
+        if (!delete_flags[read_idx]) tc->records[write_idx++] = tc->records[read_idx];
     }
     tc->record_count = write_idx;
 
