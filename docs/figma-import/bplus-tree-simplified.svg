@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1300" viewBox="0 0 2200 1300">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #1f2933; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #52606d; }
+      .label { font: 700 18px Arial, sans-serif; fill: #102a43; }
+      .body { font: 400 15px Arial, sans-serif; fill: #334e68; }
+      .note-title { font: 700 17px Arial, sans-serif; fill: #5c4300; }
+      .note-body { font: 400 14px Arial, sans-serif; fill: #5c4300; }
+      .arrow { stroke: #5b6570; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .internal { fill: #f4effc; stroke: #7d5ab5; stroke-width: 3; }
+      .leaf { fill: #edf9ef; stroke: #4e9a59; stroke-width: 3; }
+      .next-link { font: 700 15px Arial, sans-serif; fill: #a16f1e; }
+      .note { fill: #fff7bf; stroke: #c9ab2b; stroke-width: 2; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#5b6570"/>
+    </marker>
+  </defs>
+
+  <rect x="24" y="24" width="2152" height="1252" rx="28" fill="#f1f8fb" stroke="#c2d5dd" stroke-width="3"/>
+  <text x="70" y="80" class="title">Simplified Current B+ Tree Structure</text>
+  <text x="70" y="115" class="subtitle">Internal nodes choose direction. Leaf nodes store the actual key -> row_index mapping.</text>
+
+  <rect x="940" y="170" width="320" height="120" rx="18" class="internal"/>
+  <text x="975" y="210" class="label">Root / Internal</text>
+  <text x="975" y="242" class="body">[40 | 80]</text>
+  <text x="975" y="268" class="body">Stores only boundaries</text>
+
+  <rect x="420" y="390" width="240" height="100" rx="18" class="internal"/>
+  <text x="455" y="428" class="label">Internal A</text>
+  <text x="455" y="458" class="body">[20]</text>
+
+  <rect x="980" y="390" width="240" height="100" rx="18" class="internal"/>
+  <text x="1015" y="428" class="label">Internal B</text>
+  <text x="1015" y="458" class="body">[60]</text>
+
+  <rect x="1540" y="390" width="240" height="100" rx="18" class="internal"/>
+  <text x="1575" y="428" class="label">Internal C</text>
+  <text x="1575" y="458" class="body">[100]</text>
+
+  <rect x="110" y="680" width="240" height="140" rx="18" class="leaf"/>
+  <text x="145" y="718" class="label">Leaf 1</text>
+  <text x="145" y="748" class="body">[5, 12, 18]</text>
+  <text x="145" y="774" class="body">value = row_index</text>
+
+  <rect x="390" y="680" width="240" height="140" rx="18" class="leaf"/>
+  <text x="425" y="718" class="label">Leaf 2</text>
+  <text x="425" y="748" class="body">[20, 25, 34]</text>
+  <text x="425" y="774" class="body">value = row_index</text>
+
+  <rect x="710" y="680" width="240" height="140" rx="18" class="leaf"/>
+  <text x="745" y="718" class="label">Leaf 3</text>
+  <text x="745" y="748" class="body">[40, 44, 55]</text>
+  <text x="745" y="774" class="body">value = row_index</text>
+
+  <rect x="990" y="680" width="240" height="140" rx="18" class="leaf"/>
+  <text x="1025" y="718" class="label">Leaf 4</text>
+  <text x="1025" y="748" class="body">[60, 72, 79]</text>
+  <text x="1025" y="774" class="body">value = row_index</text>
+
+  <rect x="1310" y="680" width="240" height="140" rx="18" class="leaf"/>
+  <text x="1345" y="718" class="label">Leaf 5</text>
+  <text x="1345" y="748" class="body">[80, 91, 99]</text>
+  <text x="1345" y="774" class="body">value = row_index</text>
+
+  <rect x="1590" y="680" width="240" height="140" rx="18" class="leaf"/>
+  <text x="1625" y="718" class="label">Leaf 6</text>
+  <text x="1625" y="748" class="body">[100, 120]</text>
+  <text x="1625" y="774" class="body">value = row_index</text>
+
+  <path d="M1100 290 L540 390" class="arrow"/>
+  <path d="M1100 290 L1100 390" class="arrow"/>
+  <path d="M1100 290 L1660 390" class="arrow"/>
+
+  <text x="740" y="320" class="body">&lt; 40</text>
+  <text x="1140" y="335" class="body">40 ~ 79</text>
+  <text x="1490" y="320" class="body">&gt;= 80</text>
+
+  <path d="M540 490 L230 680" class="arrow"/>
+  <path d="M540 490 L510 680" class="arrow"/>
+  <path d="M1100 490 L830 680" class="arrow"/>
+  <path d="M1100 490 L1110 680" class="arrow"/>
+  <path d="M1660 490 L1430 680" class="arrow"/>
+  <path d="M1660 490 L1710 680" class="arrow"/>
+
+  <text x="310" y="560" class="body">&lt; 20</text>
+  <text x="575" y="560" class="body">&gt;= 20</text>
+  <text x="895" y="560" class="body">&lt; 60</text>
+  <text x="1160" y="560" class="body">&gt;= 60</text>
+  <text x="1465" y="560" class="body">&lt; 100</text>
+  <text x="1735" y="560" class="body">&gt;= 100</text>
+
+  <path d="M350 750 L390 750" class="arrow"/>
+  <path d="M630 750 L710 750" class="arrow"/>
+  <path d="M950 750 L990 750" class="arrow"/>
+  <path d="M1230 750 L1310 750" class="arrow"/>
+  <path d="M1550 750 L1590 750" class="arrow"/>
+
+  <text x="358" y="735" class="next-link">next</text>
+  <text x="642" y="735" class="next-link">next</text>
+  <text x="958" y="735" class="next-link">next</text>
+  <text x="1242" y="735" class="next-link">next</text>
+  <text x="1558" y="735" class="next-link">next</text>
+
+  <rect x="1870" y="220" width="250" height="120" rx="16" class="note"/>
+  <text x="1900" y="255" class="note-title">Purple = internal nodes</text>
+  <text x="1900" y="285" class="note-body">They store only boundary keys</text>
+  <text x="1900" y="308" class="note-body">and choose the next child.</text>
+
+  <rect x="1870" y="430" width="250" height="120" rx="16" class="note"/>
+  <text x="1900" y="465" class="note-title">Green = leaf nodes</text>
+  <text x="1900" y="495" class="note-body">They store real keys and</text>
+  <text x="1900" y="518" class="note-body">their row_index values.</text>
+
+  <rect x="1870" y="640" width="250" height="140" rx="16" class="note"/>
+  <text x="1900" y="675" class="note-title">Insertion idea</text>
+  <text x="1900" y="705" class="note-body">Insert into leaf.</text>
+  <text x="1900" y="728" class="note-body">If overflow happens, split.</text>
+  <text x="1900" y="751" class="note-body">Promote a separator upward.</text>
+
+  <rect x="1870" y="880" width="250" height="160" rx="16" class="note"/>
+  <text x="1900" y="915" class="note-title">Search idea</text>
+  <text x="1900" y="945" class="note-body">Start at root, follow range</text>
+  <text x="1900" y="968" class="note-body">boundaries, stop at a leaf,</text>
+  <text x="1900" y="991" class="note-body">then return row_index.</text>
+  <text x="1900" y="1014" class="note-body">Leaves are linked by next.</text>
+</svg>

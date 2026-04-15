@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1300" viewBox="0 0 2200 1300">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #1f2933; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #52606d; }
+      .section { font: 700 22px Arial, sans-serif; fill: #243b53; }
+      .label { font: 700 18px Arial, sans-serif; fill: #102a43; }
+      .body { font: 400 15px Arial, sans-serif; fill: #334e68; }
+      .note-title { font: 700 17px Arial, sans-serif; fill: #5c4300; }
+      .note-body { font: 400 14px Arial, sans-serif; fill: #5c4300; }
+      .arrow { stroke: #5b6570; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .lane-blue { fill: #eef6fc; stroke: #5f84b8; stroke-width: 3; }
+      .lane-purple { fill: #f4effc; stroke: #8a63b8; stroke-width: 3; }
+      .lane-green { fill: #edf9ef; stroke: #4f9a61; stroke-width: 3; }
+      .lane-orange { fill: #fef2ea; stroke: #c07a3a; stroke-width: 3; }
+      .box-blue { fill: #ffffff; stroke: #5f84b8; stroke-width: 2; }
+      .box-purple { fill: #ffffff; stroke: #8a63b8; stroke-width: 2; }
+      .box-green { fill: #ffffff; stroke: #4f9a61; stroke-width: 2; }
+      .box-orange { fill: #ffffff; stroke: #c07a3a; stroke-width: 2; }
+      .box-cache { fill: #f6fff7; stroke: #4f9a61; stroke-width: 2; }
+      .note { fill: #fff7bf; stroke: #c9ab2b; stroke-width: 2; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#5b6570"/>
+    </marker>
+  </defs>
+
+  <rect x="24" y="24" width="2152" height="1252" rx="28" fill="#fbfaf5" stroke="#ded7c6" stroke-width="3"/>
+  <text x="70" y="80" class="title">SQL-B-Tree Overall Program Diagram</text>
+  <text x="70" y="115" class="subtitle">SQL is parsed into Statement objects, then executed through an in-memory table cache and B+ tree indexes.</text>
+
+  <rect x="60" y="160" width="440" height="980" rx="24" class="lane-blue"/>
+  <rect x="540" y="160" width="420" height="980" rx="24" class="lane-purple"/>
+  <rect x="1000" y="160" width="520" height="980" rx="24" class="lane-green"/>
+  <rect x="1560" y="160" width="560" height="980" rx="24" class="lane-orange"/>
+
+  <text x="92" y="200" class="section">Input and Orchestration</text>
+  <text x="572" y="200" class="section">SQL Interpretation</text>
+  <text x="1032" y="200" class="section">Execution and Cache</text>
+  <text x="1592" y="200" class="section">Index and Storage Strategy</text>
+
+  <rect x="110" y="250" width="340" height="100" rx="16" class="box-blue"/>
+  <text x="140" y="285" class="label">SQL file</text>
+  <text x="140" y="315" class="body">Split by ';' outside quotes</text>
+  <text x="140" y="338" class="body">Remove '--' comments</text>
+
+  <rect x="110" y="420" width="340" height="110" rx="16" class="box-blue"/>
+  <text x="140" y="455" class="label">main.c / execute_sql_text()</text>
+  <text x="140" y="485" class="body">Route each statement to parse + execute</text>
+  <text x="140" y="508" class="body">Also starts --benchmark mode</text>
+
+  <rect x="110" y="600" width="340" height="100" rx="16" class="box-blue"/>
+  <text x="140" y="635" class="label">Benchmark path</text>
+  <text x="140" y="665" class="body">Large inserts, then compare</text>
+  <text x="140" y="688" class="body">index path vs scan path</text>
+
+  <rect x="580" y="290" width="340" height="100" rx="16" class="box-purple"/>
+  <text x="610" y="325" class="label">lexer.c</text>
+  <text x="610" y="355" class="body">SQL string -> Tokens</text>
+
+  <rect x="580" y="470" width="340" height="100" rx="16" class="box-purple"/>
+  <text x="610" y="505" class="label">parser.c</text>
+  <text x="610" y="535" class="body">Tokens -> Statement</text>
+
+  <rect x="560" y="650" width="380" height="150" rx="16" class="box-purple"/>
+  <text x="590" y="685" class="label">Statement</text>
+  <text x="590" y="715" class="body">type, table_name, row_data,</text>
+  <text x="590" y="738" class="body">select columns, set column,</text>
+  <text x="590" y="761" class="body">where column, where value</text>
+
+  <rect x="1060" y="250" width="400" height="110" rx="16" class="box-green"/>
+  <text x="1090" y="285" class="label">get_table()</text>
+  <text x="1090" y="315" class="body">Reuse cache on hit</text>
+  <text x="1090" y="338" class="body">Load CSV on miss</text>
+
+  <rect x="1040" y="430" width="440" height="130" rx="16" class="box-green"/>
+  <text x="1070" y="465" class="label">load_table_contents()</text>
+  <text x="1070" y="495" class="body">Parse header -> load records[]</text>
+  <text x="1070" y="518" class="body">Bulk-build PK and UK indexes</text>
+
+  <rect x="1020" y="640" width="480" height="130" rx="16" class="box-green"/>
+  <text x="1050" y="675" class="label">execute_select / insert / update / delete</text>
+  <text x="1050" y="705" class="body">Map Statement objects to actual</text>
+  <text x="1050" y="728" class="body">table reads and writes</text>
+
+  <rect x="1040" y="860" width="440" height="150" rx="16" class="box-cache"/>
+  <text x="1070" y="895" class="label">TableCache</text>
+  <text x="1070" y="925" class="body">records[] + id_index + uk_indexes[]</text>
+  <text x="1070" y="948" class="body">Currently caches only one table</text>
+  <text x="1070" y="971" class="body">Uses row_index as the lookup target</text>
+
+  <rect x="1610" y="250" width="220" height="110" rx="16" class="box-orange"/>
+  <text x="1640" y="285" class="label">PK(id) lookup</text>
+  <text x="1640" y="315" class="body">Numeric B+ tree</text>
+  <text x="1640" y="338" class="body">key -> row_index</text>
+
+  <rect x="1860" y="250" width="220" height="110" rx="16" class="box-orange"/>
+  <text x="1890" y="285" class="label">UK lookup</text>
+  <text x="1890" y="315" class="body">String B+ tree</text>
+  <text x="1890" y="338" class="body">email etc.</text>
+
+  <rect x="1735" y="430" width="220" height="100" rx="16" class="box-orange"/>
+  <text x="1765" y="465" class="label">Non-index columns</text>
+  <text x="1765" y="495" class="body">Linear scan</text>
+
+  <rect x="1610" y="640" width="220" height="120" rx="16" class="box-orange"/>
+  <text x="1640" y="675" class="label">INSERT strategy</text>
+  <text x="1640" y="705" class="body">Memory + index update</text>
+  <text x="1640" y="728" class="body">then CSV append</text>
+
+  <rect x="1860" y="640" width="240" height="120" rx="16" class="box-orange"/>
+  <text x="1890" y="675" class="label">UPDATE / DELETE</text>
+  <text x="1890" y="705" class="body">Rebuild indexes and</text>
+  <text x="1890" y="728" class="body">rewrite the whole CSV</text>
+
+  <rect x="1735" y="860" width="220" height="100" rx="16" class="box-orange"/>
+  <text x="1765" y="895" class="label">CSV file</text>
+  <text x="1765" y="925" class="body">Original storage</text>
+
+  <rect x="110" y="1030" width="420" height="90" rx="16" class="note"/>
+  <text x="140" y="1065" class="note-title">Key design message</text>
+  <text x="140" y="1095" class="note-body">Storage stays simple as CSV, but lookup becomes fast by adding an in-memory index layer.</text>
+
+  <rect x="1560" y="1010" width="520" height="110" rx="16" class="note"/>
+  <text x="1590" y="1045" class="note-title">What this makes visible</text>
+  <text x="1590" y="1075" class="note-body">1) Bulk-build on load  2) B+ tree for PK/UK  3) Linear scan elsewhere  4) Rebuild strategy for UPDATE/DELETE</text>
+
+  <path d="M280 350 L280 420" class="arrow"/>
+  <path d="M280 530 L280 600" class="arrow"/>
+  <path d="M450 475 L580 340" class="arrow"/>
+  <path d="M750 390 L750 470" class="arrow"/>
+  <path d="M750 570 L750 650" class="arrow"/>
+  <path d="M940 725 L1060 305" class="arrow"/>
+  <path d="M1260 360 L1260 430" class="arrow"/>
+  <path d="M1260 560 L1260 640" class="arrow"/>
+  <path d="M1260 770 L1260 860" class="arrow"/>
+  <path d="M1500 700 L1610 305" class="arrow"/>
+  <path d="M1500 700 L1860 305" class="arrow"/>
+  <path d="M1500 700 L1735 480" class="arrow"/>
+  <path d="M1500 770 L1610 700" class="arrow"/>
+  <path d="M1500 770 L1860 700" class="arrow"/>
+  <path d="M1720 360 L1260 860" class="arrow"/>
+  <path d="M1970 360 L1260 860" class="arrow"/>
+  <path d="M1845 530 L1260 860" class="arrow"/>
+  <path d="M1830 760 L1845 860" class="arrow"/>
+  <path d="M1980 760 L1845 860" class="arrow"/>
+</svg>
