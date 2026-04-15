@@ -379,9 +379,9 @@ int main(int argc, char **argv) {
     }
 
     if (opt.memtrack) {
-        rc = system("make -B build CFLAGS='-fdiagnostics-color=always -g -DBENCH_MEMTRACK'");
+        rc = system("make -B build CFLAGS='-O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK'");
     } else {
-        rc = system("make -B build CFLAGS='-fdiagnostics-color=always -g'");
+        rc = system("make -B build CFLAGS='-O2 -fdiagnostics-color=always -g'");
     }
     if (rc != 0) {
         fprintf(stderr, "[error] build failed\n");

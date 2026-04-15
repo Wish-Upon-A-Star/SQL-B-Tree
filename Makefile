@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -fdiagnostics-color=always -g
+CFLAGS ?= -O2 -fdiagnostics-color=always -g
 TARGET ?= sqlsprocessor
 BENCH_GEN ?= bench_workload_generator
 BENCH_RUNNER ?= benchmark_runner

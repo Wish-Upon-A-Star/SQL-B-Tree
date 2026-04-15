@@ -4237,6 +4237,9 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
         printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
         return -1;
     }
+    if (tc->row_cached[target_row] && tc->cached_record_count > 0) {
+        tc->cached_record_count--;
+    }
     tc->records[target_row] = new_copy;
     tc->row_store[target_row] = ROW_STORE_MEMORY;
     tc->row_offsets[target_row] = -1;
@@ -4450,6 +4453,9 @@ void execute_update(Statement *stmt) {
             return;
         }
         old_records[i] = tc->records[i];
+        if (tc->row_cached[i] && tc->cached_record_count > 0) {
+            tc->cached_record_count--;
+        }
         tc->records[i] = new_copy;
         tc->row_store[i] = ROW_STORE_MEMORY;
         tc->row_offsets[i] = -1;
