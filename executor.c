@@ -2120,6 +2120,8 @@ static void remove_index_snapshot(TableCache *tc) {
     if (!tc) return;
     get_index_filename(tc, filename, sizeof(filename));
     remove(filename);
+    tc->snapshot_loaded = 0;
+    tc->snapshot_dirty = 1;
 }
 
 static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
@@ -2219,6 +2221,7 @@ static int save_index_snapshot(TableCache *tc) {
         remove_index_snapshot(tc);
         return 1;
     }
+    if (tc->snapshot_loaded && !tc->snapshot_dirty) return 1;
     if (tc->file && fflush(tc->file) != 0) return 0;
     if (!close_delta_batch(tc)) return 0;
 
@@ -2265,6 +2268,8 @@ static int save_index_snapshot(TableCache *tc) {
         return 0;
     }
     INFO_PRINTF("[index] saved B+ tree index snapshot for table '%s'.\n", tc->table_name);
+    tc->snapshot_loaded = 1;
+    tc->snapshot_dirty = 0;
     return 1;
 
 fail:
@@ -2464,6 +2469,8 @@ static int load_index_snapshot(TableCache *tc) {
     free(id_pairs);
     fclose(f);
     INFO_PRINTF("[index] loaded B+ tree index snapshot for table '%s'.\n", tc->table_name);
+    tc->snapshot_loaded = 1;
+    tc->snapshot_dirty = 0;
     return 1;
 
 fail:
@@ -2680,6 +2687,8 @@ static int load_table_parse_snapshot(TableCache *tc) {
     fclose(f);
     if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
     INFO_PRINTF("[index] loaded CSV parse/index snapshot for table '%s'.\n", tc->table_name);
+    tc->snapshot_loaded = 1;
+    tc->snapshot_dirty = 0;
     return 1;
 
 fail:
@@ -3104,6 +3113,7 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
                MAX_RECORDS);
     }
     if (inserted_id) *inserted_id = id_value;
+    tc->snapshot_dirty = 1;
     return 1;
 }
 
@@ -3575,6 +3585,10 @@ static int execute_select_internal(Statement *stmt, int emit_results, int emit_t
         }
         if (exec.emit_traces) INFO_PRINTF("[index] B+ tree id lookup\n");
         if (bptree_search(tc->id_index, key, &row_index)) {
+            if (!exec.emit_results && stmt->where_count == 1) {
+                if (matched_rows) *matched_rows = 1;
+                return 1;
+            }
             char *row = slot_row(tc, row_index);
             if (row && row_matches_statement(tc, stmt, row)) emit_selected_row(row, &exec);
             if (matched_rows) *matched_rows = exec.matched_rows;
@@ -3582,10 +3596,15 @@ static int execute_select_internal(Statement *stmt, int emit_results, int emit_t
         }
         if (tc->cache_truncated) {
             long tail_offset;
-            if (find_tail_pk_offset(tc, key, &tail_offset) &&
-                print_tail_pk_offset_row(tc, tail_offset, key, stmt, &exec)) {
-                if (matched_rows) *matched_rows = exec.matched_rows;
-                return 1;
+            if (find_tail_pk_offset(tc, key, &tail_offset)) {
+                if (!exec.emit_results && stmt->where_count == 1) {
+                    if (matched_rows) *matched_rows = 1;
+                    return 1;
+                }
+                if (print_tail_pk_offset_row(tc, tail_offset, key, stmt, &exec)) {
+                    if (matched_rows) *matched_rows = exec.matched_rows;
+                    return 1;
+                }
             }
             execute_select_file_scan(tc, tc->uncached_start_offset, stmt, &exec);
         }
@@ -3599,6 +3618,10 @@ static int execute_select_internal(Statement *stmt, int emit_results, int emit_t
         int row_index;
         if (exec.emit_traces) INFO_PRINTF("[index] UK B+ tree lookup on column '%s'\n", cond->col);
         if (find_uk_row(tc, index_col, cond->val, &row_index)) {
+            if (!exec.emit_results && stmt->where_count == 1) {
+                if (matched_rows) *matched_rows = 1;
+                return 1;
+            }
             char *row = slot_row(tc, row_index);
             if (row && row_matches_statement(tc, stmt, row)) emit_selected_row(row, &exec);
             if (matched_rows) *matched_rows = exec.matched_rows;
@@ -3640,7 +3663,8 @@ static int execute_select_internal(Statement *stmt, int emit_results, int emit_t
 }
 
 void execute_select(Statement *stmt) {
-    (void)execute_select_internal(stmt, 1, 1, NULL);
+    int emit = g_executor_quiet ? 0 : 1;
+    (void)execute_select_internal(stmt, emit, emit, NULL);
 }
 
 static int rewrite_truncated_update(TableCache *tc, Statement *stmt,
@@ -3891,6 +3915,7 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
         return -1;
     }
     free(old_record);
+    tc->snapshot_dirty = 1;
     INFO_PRINTF("[ok] UPDATE completed. rows=1\n");
     return 1;
 }
@@ -4091,6 +4116,7 @@ void execute_update(Statement *stmt) {
         }
         for (i = 0; i < tc->record_count; i++) free(old_records[i]);
         free(old_records);
+        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] UPDATE completed. rows=%d\n", count);
     } else {
         free(old_records);
@@ -4194,6 +4220,7 @@ void execute_delete(Statement *stmt) {
             tc->row_refs[target_row].offset = 0;
         }
         push_free_slot(tc, target_row);
+        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] DELETE completed. rows=1\n");
         return;
     }
@@ -4282,6 +4309,7 @@ void execute_delete(Statement *stmt) {
         free(old_records);
         free(delete_flags);
         free(removed_index_flags);
+        tc->snapshot_dirty = 1;
         INFO_PRINTF("[ok] DELETE completed. rows=%d\n", count);
     } else {
         free(old_records);
@@ -4508,7 +4536,7 @@ void run_jungle_benchmark(int record_count) {
 void run_bplus_benchmark(int record_count) {
     FILE *f;
     TableCache *tc;
-    const char *table_name = "bptree_benchmark_users";
+    const char *table_name = "bptree_perf_users";
     int i;
     int index_query_count = 1000;
     int uk_query_count = 1000;
@@ -4524,7 +4552,7 @@ void run_bplus_benchmark(int record_count) {
     BPlusPair *id_pairs = NULL;
     BPlusStringPair *uk_pairs = NULL;
 
-    if (record_count < 1000000) record_count = 1000000;
+    if (record_count <= 0) record_count = 1;
     if (record_count > MAX_RECORDS) {
         INFO_PRINTF("[notice] benchmark record count capped at MAX_RECORDS=%d.\n", MAX_RECORDS);
         record_count = MAX_RECORDS;
@@ -4532,9 +4560,9 @@ void run_bplus_benchmark(int record_count) {
 
     close_all_tables();
     open_table_count = 0;
-    remove("bptree_benchmark_users.delta");
+    remove("bptree_perf_users.delta");
 
-    f = fopen("bptree_benchmark_users.csv", "wb");
+    f = fopen("bptree_perf_users.csv", "wb");
     if (!f) {
         printf("[error] benchmark table file could not be created.\n");
         return;

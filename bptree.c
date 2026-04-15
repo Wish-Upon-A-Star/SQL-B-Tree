@@ -327,7 +327,7 @@ int bptree_range_search(BPlusTree *tree, long start_key, long end_key,
 }
 
 static int insert_recursive(BPlusTree *tree, BPlusNode *node, long key, int row_index,
-                            long *promoted_key, BPlusNode **new_child, NodePool *pool) {
+                            long *promoted_key, BPlusNode **new_child) {
     int i;
     int max_keys = tree_max_keys(tree);
     int min_leaf_keys = tree_min_leaf_keys(tree);
@@ -339,7 +339,7 @@ static int insert_recursive(BPlusTree *tree, BPlusNode *node, long key, int row_
         i = lower_bound_long(node->keys, node->key_count, key);
         if (i < node->key_count && node->keys[i] == key) return 0;
         if (node->key_count == max_keys) {
-            right = take_reserved_node(pool, 1);
+            right = create_node(1);
             if (!right) return -1;
         }
 
@@ -368,14 +368,14 @@ static int insert_recursive(BPlusTree *tree, BPlusNode *node, long key, int row_
 
     long child_key = 0;
     BPlusNode *child = NULL;
-    int result = insert_recursive(tree, node->children[i], key, row_index, &child_key, &child, pool);
+    int result = insert_recursive(tree, node->children[i], key, row_index, &child_key, &child);
     if (result != 2) return result;
 
     BPlusNode *right = NULL;
     int split;
     int right_keys;
     if (node->key_count == max_keys) {
-        right = take_reserved_node(pool, 0);
+        right = create_node(0);
         if (!right) return -1;
     }
 
@@ -402,21 +402,15 @@ int bptree_insert(BPlusTree *tree, long key, int row_index) {
     long promoted_key = 0;
     BPlusNode *new_child = NULL;
     BPlusNode *new_root = NULL;
-    NodePool pool = {0};
     int result;
 
     if (!tree || !tree->root) return -1;
-    if (!prepare_node_pool(&pool, tree_height(tree->root) + 2)) return -1;
 
-    result = insert_recursive(tree, tree->root, key, row_index, &promoted_key, &new_child, &pool);
-    if (result != 2) {
-        release_unused_pool_nodes(&pool);
-        return result;
-    }
+    result = insert_recursive(tree, tree->root, key, row_index, &promoted_key, &new_child);
+    if (result != 2) return result;
 
-    new_root = take_reserved_node(&pool, 0);
+    new_root = create_node(0);
     if (!new_root) {
-        release_unused_pool_nodes(&pool);
         return -1;
     }
     new_root->keys[0] = promoted_key;
@@ -424,7 +418,6 @@ int bptree_insert(BPlusTree *tree, long key, int row_index) {
     new_root->children[1] = new_child;
     new_root->key_count = 1;
     tree->root = new_root;
-    release_unused_pool_nodes(&pool);
     return 1;
 }
 
@@ -776,8 +769,7 @@ int bptree_string_range_search(BPlusStringTree *tree, const char *start_key, con
 
 static int string_insert_recursive(BPlusStringTree *tree, BPlusStringNode *node,
                                    const char *key, int row_index,
-                                   char **promoted_key, BPlusStringNode **new_child,
-                                   StringNodePool *pool) {
+                                   char **promoted_key, BPlusStringNode **new_child) {
     int i;
     int max_keys = string_tree_max_keys(tree);
     int min_leaf_keys = string_tree_min_leaf_keys(tree);
@@ -791,7 +783,7 @@ static int string_insert_recursive(BPlusStringTree *tree, BPlusStringNode *node,
         i = lower_bound_string(node->keys, node->key_count, key);
         if (i < node->key_count && strcmp(node->keys[i], key) == 0) return 0;
         if (node->key_count == max_keys) {
-            right = take_reserved_string_node(pool, 1);
+            right = create_string_node(1);
             if (!right) return -1;
         }
         key_copy = dup_key(key);
@@ -834,14 +826,14 @@ static int string_insert_recursive(BPlusStringTree *tree, BPlusStringNode *node,
 
     char *child_key = NULL;
     BPlusStringNode *child = NULL;
-    int result = string_insert_recursive(tree, node->children[i], key, row_index, &child_key, &child, pool);
+    int result = string_insert_recursive(tree, node->children[i], key, row_index, &child_key, &child);
     if (result != 2) return result;
 
     BPlusStringNode *right = NULL;
     int split;
     int right_keys;
     if (node->key_count == max_keys) {
-        right = take_reserved_string_node(pool, 0);
+        right = create_string_node(0);
         if (!right) {
             free(child_key);
             return -1;
@@ -873,22 +865,16 @@ int bptree_string_insert(BPlusStringTree *tree, const char *key, int row_index) 
     char *promoted_key = NULL;
     BPlusStringNode *new_child = NULL;
     BPlusStringNode *new_root = NULL;
-    StringNodePool pool = {0};
     int result;
 
     if (!tree || !tree->root || !key || strlen(key) == 0) return -1;
-    if (!prepare_string_node_pool(&pool, string_tree_height(tree->root) + 2)) return -1;
 
-    result = string_insert_recursive(tree, tree->root, key, row_index, &promoted_key, &new_child, &pool);
-    if (result != 2) {
-        release_unused_string_pool_nodes(&pool);
-        return result;
-    }
+    result = string_insert_recursive(tree, tree->root, key, row_index, &promoted_key, &new_child);
+    if (result != 2) return result;
 
-    new_root = take_reserved_string_node(&pool, 0);
+    new_root = create_string_node(0);
     if (!new_root) {
         free(promoted_key);
-        release_unused_string_pool_nodes(&pool);
         return -1;
     }
     new_root->keys[0] = promoted_key;
@@ -896,7 +882,6 @@ int bptree_string_insert(BPlusStringTree *tree, const char *key, int row_index) 
     new_root->children[1] = new_child;
     new_root->key_count = 1;
     tree->root = new_root;
-    release_unused_string_pool_nodes(&pool);
     return 1;
 }
 
