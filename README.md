@@ -78,19 +78,21 @@ SELECT * FROM case_basic_users WHERE name = 'AutoUser';
 
 ## B+ Tree Range SELECT
 
-`id(PK)` 범위 조건은 B+ Tree leaf linked list를 사용합니다.
+`id(PK)`와 `UK` 범위 조건은 B+ Tree leaf linked list를 사용합니다.
 
 ```sql
 SELECT * FROM case_basic_users WHERE id BETWEEN 2 AND 4;
+SELECT * FROM case_basic_users WHERE email BETWEEN 'a@test.com' AND 'm@test.com';
 ```
 
 실행 결과에 다음 표시가 나오면 B+ Tree range scan 경로를 사용한 것입니다.
 
 ```text
 [index] B+ tree id range lookup
+[index] UK B+ tree range lookup on column 'email'
 ```
 
-범위 검색은 시작 key가 들어갈 leaf를 찾은 뒤, leaf의 `next` 포인터를 따라가며 끝 key까지 출력합니다.
+범위 검색은 시작 key가 들어갈 leaf를 찾은 뒤, leaf의 `next` 포인터를 따라가며 끝 key까지 출력합니다. 문자열 UK 범위는 `strcmp` 기준 사전순입니다.
 
 ## 성능 테스트
 

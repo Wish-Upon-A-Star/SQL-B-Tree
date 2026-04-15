@@ -1268,6 +1268,17 @@ static int print_range_row_visitor(long key, int row_index, void *ctx) {
     return 1;
 }
 
+static int print_string_range_row_visitor(const char *key, int row_index, void *ctx) {
+    RangePrintContext *range_ctx = (RangePrintContext *)ctx;
+    (void)key;
+
+    if (!range_ctx || !range_ctx->tc) return 0;
+    if (row_index < 0 || row_index >= range_ctx->tc->record_count) return 1;
+    print_selected_row(range_ctx->tc->records[row_index], range_ctx->select_idx,
+                       range_ctx->select_count, range_ctx->select_all);
+    return 1;
+}
+
 static void execute_select_file_scan(TableCache *tc, long start_offset, int where_idx,
                                      int select_idx[MAX_COLS], int select_count,
                                      int select_all, const char *where_val) {
@@ -1371,6 +1382,59 @@ static void execute_select_file_range_scan(TableCache *tc, long start_offset, in
     fseek(tc->file, 0, SEEK_END);
 }
 
+static void execute_select_file_string_range_scan(TableCache *tc, long start_offset, int where_idx,
+                                                  int select_idx[MAX_COLS], int select_count,
+                                                  int select_all, const char *start_key,
+                                                  const char *end_key) {
+    char line[RECORD_SIZE];
+
+    if (!tc || !tc->file || !start_key || !end_key || strcmp(start_key, end_key) > 0) return;
+    if (fflush(tc->file) != 0) {
+        printf("[error] SELECT failed: could not scan table file.\n");
+        return;
+    }
+    if (start_offset > 0) {
+        if (fseek(tc->file, start_offset, SEEK_SET) != 0) {
+            printf("[error] SELECT failed: could not seek uncached CSV tail.\n");
+            return;
+        }
+        printf("[scan] uncached CSV tail string range scan from offset %ld\n", start_offset);
+    } else {
+        if (fseek(tc->file, 0, SEEK_SET) != 0) {
+            printf("[error] SELECT failed: could not scan table file.\n");
+            return;
+        }
+        if (!fgets(line, sizeof(line), tc->file)) {
+            fseek(tc->file, 0, SEEK_END);
+            return;
+        }
+        printf("[scan] full CSV string range scan\n");
+    }
+
+    while (fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        size_t line_len = strlen(line);
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        char key[RECORD_SIZE];
+
+        if (!nl && line_len == sizeof(line) - 1 && !feof(tc->file)) {
+            printf("[error] row too long while scanning '%s' (max %d bytes).\n",
+                   tc->table_name, RECORD_SIZE - 1);
+            fseek(tc->file, 0, SEEK_END);
+            return;
+        }
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+        parse_csv_row(line, fields, row_buf);
+        normalize_value(fields[where_idx], key, sizeof(key));
+        if (strcmp(key, start_key) >= 0 && strcmp(key, end_key) <= 0) {
+            print_selected_row(line, select_idx, select_count, select_all);
+        }
+    }
+    fseek(tc->file, 0, SEEK_END);
+}
+
 void execute_select(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
     int where_idx;
@@ -1403,28 +1467,54 @@ void execute_select(Statement *stmt) {
             printf("[error] SELECT failed: WHERE column does not exist.\n");
             return;
         }
-        if (where_idx != tc->pk_idx) {
-            printf("[error] SELECT failed: BETWEEN currently uses the PK B+ tree only.\n");
-            return;
-        }
-        if (!parse_long_value(stmt->where_val, &start_key) ||
-            !parse_long_value(stmt->where_end_val, &end_key)) {
-            printf("[error] SELECT failed: BETWEEN bounds must be integers.\n");
-            return;
-        }
-        printf("[index] B+ tree id range lookup\n");
         range_ctx.tc = tc;
         memcpy(range_ctx.select_idx, select_idx, sizeof(range_ctx.select_idx));
         range_ctx.select_count = select_count;
         range_ctx.select_all = stmt->select_all;
-        if (!bptree_range_search(tc->id_index, start_key, end_key, print_range_row_visitor, &range_ctx)) {
-            printf("[error] SELECT failed: B+ tree range scan failed.\n");
+
+        if (where_idx == tc->pk_idx) {
+            if (!parse_long_value(stmt->where_val, &start_key) ||
+                !parse_long_value(stmt->where_end_val, &end_key)) {
+                printf("[error] SELECT failed: BETWEEN bounds must be integers for PK range search.\n");
+                return;
+            }
+            printf("[index] B+ tree id range lookup\n");
+            if (!bptree_range_search(tc->id_index, start_key, end_key, print_range_row_visitor, &range_ctx)) {
+                printf("[error] SELECT failed: B+ tree range scan failed.\n");
+                return;
+            }
+            if (tc->cache_truncated) {
+                execute_select_file_range_scan(tc, tc->uncached_start_offset, where_idx, select_idx,
+                                               select_count, stmt->select_all, start_key, end_key);
+            }
             return;
         }
-        if (tc->cache_truncated) {
-            execute_select_file_range_scan(tc, tc->uncached_start_offset, where_idx, select_idx,
-                                           select_count, stmt->select_all, start_key, end_key);
+
+        if (tc->cols[where_idx].type == COL_UK) {
+            int uk_slot = get_uk_slot(tc, where_idx);
+            char start_text[RECORD_SIZE];
+            char end_text[RECORD_SIZE];
+
+            if (uk_slot == -1 || !ensure_uk_indexes(tc)) {
+                printf("[error] SELECT failed: UK index is not available.\n");
+                return;
+            }
+            normalize_value(stmt->where_val, start_text, sizeof(start_text));
+            normalize_value(stmt->where_end_val, end_text, sizeof(end_text));
+            printf("[index] UK B+ tree range lookup on column '%s'\n", stmt->where_col);
+            if (!bptree_string_range_search(tc->uk_indexes[uk_slot]->tree, start_text, end_text,
+                                            print_string_range_row_visitor, &range_ctx)) {
+                printf("[error] SELECT failed: UK B+ tree range scan failed.\n");
+                return;
+            }
+            if (tc->cache_truncated) {
+                execute_select_file_string_range_scan(tc, tc->uncached_start_offset, where_idx, select_idx,
+                                                      select_count, stmt->select_all, start_text, end_text);
+            }
+            return;
         }
+
+        printf("[error] SELECT failed: BETWEEN uses PK or UK B+ tree indexes only.\n");
         return;
     }
 

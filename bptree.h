@@ -15,6 +15,7 @@ typedef struct {
 } BPlusStringPair;
 
 typedef int (*BPlusRangeVisitor)(long key, int row_index, void *ctx);
+typedef int (*BPlusStringRangeVisitor)(const char *key, int row_index, void *ctx);
 
 BPlusTree *bptree_create(void);
 void bptree_destroy(BPlusTree *tree);
@@ -29,6 +30,8 @@ BPlusStringTree *bptree_string_create(void);
 void bptree_string_destroy(BPlusStringTree *tree);
 int bptree_string_insert(BPlusStringTree *tree, const char *key, int row_index);
 int bptree_string_search(BPlusStringTree *tree, const char *key, int *row_index);
+int bptree_string_range_search(BPlusStringTree *tree, const char *start_key, const char *end_key,
+                               BPlusStringRangeVisitor visitor, void *ctx);
 void bptree_string_clear(BPlusStringTree *tree);
 int bptree_string_build_from_sorted(BPlusStringTree *tree, BPlusStringPair *pairs, int count);
 

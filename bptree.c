@@ -609,6 +609,32 @@ int bptree_string_search(BPlusStringTree *tree, const char *key, int *row_index)
     return 0;
 }
 
+int bptree_string_range_search(BPlusStringTree *tree, const char *start_key, const char *end_key,
+                               BPlusStringRangeVisitor visitor, void *ctx) {
+    BPlusStringNode *node;
+    int i;
+
+    if (!tree || !tree->root || !start_key || !end_key || !visitor) return 0;
+    if (strcmp(start_key, end_key) > 0) return 1;
+
+    node = tree->root;
+    while (!node->is_leaf) {
+        i = 0;
+        while (i < node->key_count && strcmp(start_key, node->keys[i]) >= 0) i++;
+        node = node->children[i];
+    }
+
+    while (node) {
+        for (i = 0; i < node->key_count; i++) {
+            if (strcmp(node->keys[i], start_key) < 0) continue;
+            if (strcmp(node->keys[i], end_key) > 0) return 1;
+            if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
+        }
+        node = node->next;
+    }
+    return 1;
+}
+
 static int string_insert_recursive(BPlusStringNode *node, const char *key, int row_index,
                                    char **promoted_key, BPlusStringNode **new_child,
                                    StringNodePool *pool) {
