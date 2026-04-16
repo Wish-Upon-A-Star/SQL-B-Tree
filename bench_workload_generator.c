@@ -63,6 +63,65 @@ static const char *sql_exe_path(void) {
     return (env && env[0] != '\0') ? env : DEFAULT_SQL_EXE;
 }
 
+static const char *track_for_id(int id) {
+    static const char *const tracks[] = {
+        "sw_ai_lab", "game_lab", "game_tech_lab"
+    };
+    return tracks[(id - 1) % 3];
+}
+
+static const char *background_for_id(int id) {
+    int bucket = (id - 1) % 100;
+    if (bucket < 62) return "student";
+    if (bucket < 74) return "newgrad";
+    if (bucket < 86) return "incumbent";
+    if (bucket < 95) return "switcher";
+    return "selftaught";
+}
+
+static const char *history_for_id(int id) {
+    static const char *const histories[] = {
+        "major_cs_grade_3", "major_design_grade_4", "frontend_3y",
+        "backend_2y", "designer_4y", "major_game_grade_2"
+    };
+    return histories[(id - 1) % 6];
+}
+
+static const char *status_for_id(int id) {
+    static const char *const statuses[] = {
+        "submitted", "pretest_pass", "interview_wait", "final_wait"
+    };
+    return statuses[(id - 1) % 4];
+}
+
+static int generate_source_csv_internal(int rows) {
+    FILE *f = fopen(SOURCE_CSV, "w");
+    int i;
+
+    if (!f) return 0;
+    fprintf(f, "id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round\n");
+    for (i = 1; i <= rows; i++) {
+        fprintf(f,
+                "%d,jungle%07d@apply.kr,010-%04d-%04d,Applicant%07d,%s,%s,%s,%d,gh_%07d,%s,2026_spring\n",
+                i,
+                i,
+                (i / 10000) % 10000,
+                i % 10000,
+                i,
+                track_for_id(i),
+                background_for_id(i),
+                history_for_id(i),
+                50 + (i % 51),
+                i,
+                status_for_id(i));
+        if (ferror(f)) {
+            fclose(f);
+            return 0;
+        }
+    }
+    return fclose(f) == 0;
+}
+
 static int count_csv_rows(const char *path) {
     FILE *f = fopen(path, "r");
     int lines = 0;
@@ -89,8 +148,11 @@ static int ensure_source_csv(int rows) {
     }
 
     snprintf(cmd, sizeof(cmd), "\"%s\" --generate-jungle %d %s", sql_exe_path(), rows, SOURCE_CSV);
-    if (system(cmd) != 0) {
-        fprintf(stderr, "[error] failed to generate source CSV: %s\n", cmd);
+    if (system(cmd) == 0 && count_csv_rows(SOURCE_CSV) >= rows) return 1;
+
+    fprintf(stderr, "[notice] target SQL executable does not provide compatible --generate-jungle; generating source CSV internally.\n");
+    if (!generate_source_csv_internal(rows)) {
+        fprintf(stderr, "[error] failed to generate source CSV internally: %s\n", SOURCE_CSV);
         return 0;
     }
     return 1;

@@ -241,24 +241,46 @@ static int reset_workload_csv_header(void) {
     return 1;
 }
 
-static int run_sql_file(const char *sql_file, int memtrack, double *elapsed, int *exit_code, char *output, size_t output_size) {
-    char cmd[1024];
+static void build_sql_command(char *cmd, size_t cmd_size, const char *sql_file, int memtrack, int quiet) {
 #if defined(_WIN32)
     if (memtrack) {
-        snprintf(cmd, sizeof(cmd), "set BENCH_MEMTRACK_REPORT=1 && \"%s\" --quiet %s 2>&1",
-                 sql_exe_path(), sql_file);
+        snprintf(cmd, cmd_size, "set BENCH_MEMTRACK_REPORT=1 && \"%s\" %s%s 2>&1",
+                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
     } else {
-        snprintf(cmd, sizeof(cmd), "\"%s\" --quiet %s 2>&1", sql_exe_path(), sql_file);
+        snprintf(cmd, cmd_size, "\"%s\" %s%s 2>&1",
+                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
     }
 #else
     if (memtrack) {
-        snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 \"%s\" --quiet %s 2>&1",
-                 sql_exe_path(), sql_file);
+        snprintf(cmd, cmd_size, "BENCH_MEMTRACK_REPORT=1 \"%s\" %s%s 2>&1",
+                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
     } else {
-        snprintf(cmd, sizeof(cmd), "\"%s\" --quiet %s 2>&1", sql_exe_path(), sql_file);
+        snprintf(cmd, cmd_size, "\"%s\" %s%s 2>&1",
+                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
     }
 #endif
-    return run_command_capture(cmd, output, output_size, elapsed, exit_code);
+}
+
+static int run_sql_file(const char *sql_file, int memtrack, double *elapsed, int *exit_code, char *output, size_t output_size) {
+    char cmd[1024];
+    double first_elapsed = 0.0;
+    double retry_elapsed = 0.0;
+    int first_exit = 1;
+    int retry_exit = 1;
+
+    build_sql_command(cmd, sizeof(cmd), sql_file, memtrack, 1);
+    if (!run_command_capture(cmd, output, output_size, &first_elapsed, &first_exit)) return 0;
+    if (first_exit == 0) {
+        if (elapsed) *elapsed = first_elapsed;
+        if (exit_code) *exit_code = first_exit;
+        return 1;
+    }
+
+    build_sql_command(cmd, sizeof(cmd), sql_file, memtrack, 0);
+    if (!run_command_capture(cmd, output, output_size, &retry_elapsed, &retry_exit)) return 0;
+    if (elapsed) *elapsed = first_elapsed + retry_elapsed;
+    if (exit_code) *exit_code = retry_exit;
+    return 1;
 }
 
 static double max_live_payload_bytes(int rows) {
