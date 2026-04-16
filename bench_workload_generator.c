@@ -9,6 +9,11 @@
 #define TABLE_NAME "jungle_workload_users"
 #define SOURCE_CSV "jungle_benchmark_users.csv"
 #define WORKLOAD_CSV "jungle_workload_users.csv"
+#if defined(_WIN32)
+#define DEFAULT_SQL_EXE ".\\sqlsprocessor.exe"
+#else
+#define DEFAULT_SQL_EXE "./sqlsprocessor"
+#endif
 
 #define LINE_MAX_LEN 2048
 #define SQL_MAX_LEN 8192
@@ -53,6 +58,11 @@ static int file_exists(const char *path) {
     return 1;
 }
 
+static const char *sql_exe_path(void) {
+    const char *env = getenv("SQLSPROCESSOR_EXE");
+    return (env && env[0] != '\0') ? env : DEFAULT_SQL_EXE;
+}
+
 static int count_csv_rows(const char *path) {
     FILE *f = fopen(path, "r");
     int lines = 0;
@@ -78,7 +88,7 @@ static int ensure_source_csv(int rows) {
         if (header_ok) return 1;
     }
 
-    snprintf(cmd, sizeof(cmd), "./sqlsprocessor --generate-jungle %d %s", rows, SOURCE_CSV);
+    snprintf(cmd, sizeof(cmd), "\"%s\" --generate-jungle %d %s", sql_exe_path(), rows, SOURCE_CSV);
     if (system(cmd) != 0) {
         fprintf(stderr, "[error] failed to generate source CSV: %s\n", cmd);
         return 0;
