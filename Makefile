@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -O2 -fdiagnostics-color=always -g
+CFLAGS ?= -O3 -march=native -fdiagnostics-color=always -g
 TARGET ?= sqlsprocessor
 BENCH_GEN ?= bench_workload_generator
 BENCH_RUNNER ?= benchmark_runner
@@ -70,7 +70,7 @@ bench-smoke: build bench-tools
 	./$(BENCH_RUNNER) --profile smoke --seed 20260415 --repeat 3
 
 bench-score: build bench-tools
-	./$(BENCH_RUNNER) --profile score --seed 20260415 --repeat 1
+	./$(BENCH_RUNNER) --profile score --seed 20260415 --repeat 1 --memtrack
 
 bench-report: $(BENCH_RUNNER)
 	./$(BENCH_RUNNER) --report-only

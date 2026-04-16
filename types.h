@@ -144,6 +144,7 @@ typedef struct {
     long append_offset;            /* 다음 CSV append가 시작될 byte offset */
     int snapshot_loaded;           /* 유효한 .idx snapshot으로 현재 상태를 복구했는지 */
     int snapshot_dirty;            /* INSERT/UPDATE/DELETE 이후 .idx 재저장이 필요한지 */
+    int rows_materialized;          /* mutation-heavy fast path에서 CSV row를 메모리에 순차 적재했는지 */
     unsigned long long last_used_seq; /* LRU 계산용 사용 순번 */
 } TableCache;
 

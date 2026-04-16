@@ -9,6 +9,8 @@
 #define TABLE_NAME "jungle_workload_users"
 #define SOURCE_CSV "jungle_benchmark_users.csv"
 #define WORKLOAD_CSV "jungle_workload_users.csv"
+#define WORKLOAD_IDX "jungle_workload_users.idx"
+#define WORKLOAD_DELTA "jungle_workload_users.delta"
 #if defined(_WIN32)
 #define DEFAULT_SQL_EXE ".\\sqlsprocessor.exe"
 #else
@@ -156,6 +158,12 @@ static int ensure_source_csv(int rows) {
         return 0;
     }
     return 1;
+}
+
+static void remove_stale_workload_artifacts(void) {
+    remove(WORKLOAD_CSV);
+    remove(WORKLOAD_IDX);
+    remove(WORKLOAD_DELTA);
 }
 
 static int ensure_dir(const char *path) {
@@ -352,6 +360,7 @@ static int generate_sqls(const GeneratorOptions *opt) {
     }
     trim_newline(line);
 
+    remove_stale_workload_artifacts();
     workload = fopen(WORKLOAD_CSV, "w");
     if (!workload) {
         fclose(src);

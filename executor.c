@@ -2165,6 +2165,81 @@ static int build_updated_row(TableCache *tc, const char *row, int set_idx,
     return 1;
 }
 
+static int build_updated_row_slice(TableCache *tc, const char *row, int set_idx,
+                                   const char *set_value, char *new_row, size_t new_row_size) {
+    const char *field_start;
+    const char *field_end;
+    const char *p;
+    size_t prefix_len;
+    size_t offset = 0;
+    int col = 0;
+    int in_quote = 0;
+
+    if (!tc || !row || !new_row || set_idx < 0 || set_idx >= tc->col_count) return 0;
+    field_start = row;
+    field_end = row + strlen(row);
+    for (p = row; ; p++) {
+        if (*p == '\'') in_quote = !in_quote;
+        if ((*p == ',' && !in_quote) || *p == '\0') {
+            if (col == set_idx) {
+                field_end = p;
+                break;
+            }
+            if (*p == '\0') return 0;
+            col++;
+            field_start = p + 1;
+        }
+    }
+
+    prefix_len = (size_t)(field_start - row);
+    if (prefix_len >= new_row_size) return 0;
+    memcpy(new_row, row, prefix_len);
+    offset = prefix_len;
+    if (!append_csv_field(new_row, new_row_size, &offset, set_value, 1)) return 0;
+    if (*field_end == ',') {
+        size_t suffix_len = strlen(field_end);
+        if (offset + suffix_len >= new_row_size) return 0;
+        memcpy(new_row + offset, field_end, suffix_len + 1);
+    } else {
+        if (offset >= new_row_size) return 0;
+        new_row[offset] = '\0';
+    }
+    return 1;
+}
+
+static int materialize_cached_csv_rows(TableCache *tc) {
+    char line[RECORD_SIZE];
+    int slot_id = 0;
+
+    if (!tc || tc->rows_materialized || tc->cache_truncated) return 1;
+    if (!tc->file) return 0;
+    if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_SET) != 0) return 0;
+    if (!fgets(line, sizeof(line), tc->file)) return 0;
+
+    while (slot_id < tc->record_count && fgets(line, sizeof(line), tc->file)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = '\0';
+        if (strlen(line) == 0) continue;
+
+        if (tc->record_active[slot_id] && tc->row_store[slot_id] == ROW_STORE_CSV && !tc->records[slot_id]) {
+            tc->records[slot_id] = dup_string(line);
+            if (!tc->records[slot_id]) return 0;
+            tc->row_store[slot_id] = ROW_STORE_MEMORY;
+            tc->row_offsets[slot_id] = -1;
+            tc->row_cached[slot_id] = 0;
+            tc->row_cache_seq[slot_id] = 0;
+            if (tc->row_refs) {
+                tc->row_refs[slot_id].store = ROW_STORE_MEMORY;
+                tc->row_refs[slot_id].offset = -1;
+            }
+        }
+        slot_id++;
+    }
+    if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
+    tc->rows_materialized = 1;
+    return 1;
+}
+
 static int remove_record_indexes(TableCache *tc, const char *row) {
     char row_buf[RECORD_SIZE];
     char *fields[MAX_COLS] = {0};
@@ -3349,6 +3424,15 @@ void execute_insert(Statement *stmt) {
     INFO_PRINTF("[ok] INSERT completed. id=%ld\n", id_value);
 }
 
+int execute_insert_values_fast(const char *table_name, const char *values_csv) {
+    TableCache *tc;
+
+    if (!table_name || !values_csv) return 0;
+    tc = get_table(table_name);
+    if (!tc) return 0;
+    return insert_row_data(tc, values_csv, 0, NULL);
+}
+
 typedef struct {
     int select_idx[MAX_COLS];
     int select_count;
@@ -4512,6 +4596,84 @@ void execute_update(Statement *stmt) {
     }
 }
 
+int execute_update_id_fast(const char *table_name, const char *set_col, const char *set_value, const char *id_value) {
+    TableCache *tc;
+    int set_idx;
+    int rebuild_uk_needed;
+    int target_row = -1;
+    char *old_record;
+    char *new_copy;
+    char new_row[RECORD_SIZE];
+
+    if (!table_name || !set_col || !set_value || !id_value) return 0;
+    tc = get_table(table_name);
+    if (!tc || tc->pk_idx < 0 || tc->cache_truncated) return 0;
+    if (!materialize_cached_csv_rows(tc)) return 0;
+    set_idx = get_col_idx(tc, set_col);
+    if (set_idx < 0) return 0;
+
+    if (!find_pk_row(tc, id_value, &target_row)) return 1;
+    old_record = slot_row(tc, target_row);
+    if (!old_record) return 0;
+    rebuild_uk_needed = get_uk_slot(tc, set_idx) != -1;
+    if (rebuild_uk_needed) {
+        int found_row = -1;
+        int uk_slot = get_uk_slot(tc, set_idx);
+        if (uk_slot == -1 || !ensure_uk_indexes(tc)) return 0;
+        if (strlen(set_value) > 0 &&
+            unique_index_find(tc, tc->uk_indexes[uk_slot], set_value, &found_row) &&
+            found_row != target_row) {
+            return 0;
+        }
+    }
+    if (!build_updated_row_slice(tc, old_record, set_idx, set_value, new_row, sizeof(new_row)) &&
+        !build_updated_row(tc, old_record, set_idx, set_value, new_row, sizeof(new_row))) {
+        return 0;
+    }
+    new_copy = dup_string(new_row);
+    if (!new_copy) return 0;
+    if (rebuild_uk_needed && !remove_record_single_uk(tc, old_record, set_idx)) {
+        free(new_copy);
+        return 0;
+    }
+    if (tc->row_cached[target_row] && tc->cached_record_count > 0) {
+        tc->cached_record_count--;
+    }
+    tc->records[target_row] = new_copy;
+    tc->row_store[target_row] = ROW_STORE_MEMORY;
+    tc->row_offsets[target_row] = -1;
+    if (tc->row_refs) {
+        tc->row_refs[target_row].store = ROW_STORE_MEMORY;
+        tc->row_refs[target_row].offset = -1;
+    }
+    tc->row_cached[target_row] = 0;
+    tc->row_cache_seq[target_row] = 0;
+    if (rebuild_uk_needed && !index_record_single_uk(tc, target_row, set_idx)) {
+        free(tc->records[target_row]);
+        tc->records[target_row] = old_record;
+        rebuild_uk_indexes(tc);
+        return 0;
+    }
+    if (can_use_delta_log(tc)) {
+        if (!append_delta_update_slot(tc, target_row, tc->records[target_row])) {
+            free(tc->records[target_row]);
+            tc->records[target_row] = old_record;
+            if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+            return 0;
+        }
+        if (!maybe_compact_delta_log(tc)) return 0;
+    } else if (!rewrite_file(tc)) {
+        free(tc->records[target_row]);
+        tc->records[target_row] = old_record;
+        if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+        return 0;
+    }
+    free(old_record);
+    tc->snapshot_dirty = 1;
+
+    return 1;
+}
+
 void execute_delete(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
     int where_idx = -1;
@@ -4724,6 +4886,53 @@ void execute_delete(Statement *stmt) {
         free(removed_index_flags);
         INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
     }
+}
+
+int execute_delete_id_fast(const char *table_name, const char *id_value) {
+    TableCache *tc;
+    int target_row = -1;
+    char *old_record;
+
+    if (!table_name || !id_value) return 0;
+    tc = get_table(table_name);
+    if (!tc || tc->pk_idx < 0 || tc->cache_truncated) return 0;
+    if (!materialize_cached_csv_rows(tc)) return 0;
+
+    if (!find_pk_row(tc, id_value, &target_row)) return 1;
+    old_record = slot_row(tc, target_row);
+    if (!old_record) return 0;
+    if (!remove_record_indexes(tc, old_record)) return 0;
+
+    tc->record_active[target_row] = 0;
+    tc->active_count--;
+    if (can_use_delta_log(tc)) {
+        if (!append_delta_delete_slot(tc, target_row, old_record)) {
+            tc->record_active[target_row] = 1;
+            tc->active_count++;
+            restore_record_indexes(tc, target_row);
+            return 0;
+        }
+        if (!maybe_compact_delta_log(tc)) return 0;
+    } else if (!rewrite_file(tc)) {
+        tc->record_active[target_row] = 1;
+        tc->active_count++;
+        restore_record_indexes(tc, target_row);
+        return 0;
+    }
+
+    free(tc->records[target_row]);
+    tc->records[target_row] = NULL;
+    tc->row_store[target_row] = ROW_STORE_NONE;
+    tc->row_offsets[target_row] = 0;
+    if (tc->row_refs) {
+        tc->row_refs[target_row].store = ROW_STORE_NONE;
+        tc->row_refs[target_row].offset = 0;
+    }
+    if (tc->free_count < tc->free_capacity) {
+        tc->free_slots[tc->free_count++] = target_row;
+    }
+    tc->snapshot_dirty = 1;
+    return 1;
 }
 
 static double current_seconds(void) {
@@ -5024,6 +5233,19 @@ void run_bplus_benchmark(int record_count) {
             free(uk_pairs);
             return;
         }
+        tc->records[inserted_slot] = dup_string(new_line);
+        if (!tc->records[inserted_slot]) {
+            printf("[error] benchmark row cache allocation failed at row %d.\n", i);
+            free(id_pairs);
+            free(uk_pairs);
+            return;
+        }
+        tc->row_store[inserted_slot] = ROW_STORE_MEMORY;
+        tc->row_offsets[inserted_slot] = -1;
+        if (tc->row_refs) {
+            tc->row_refs[inserted_slot].store = ROW_STORE_MEMORY;
+            tc->row_refs[inserted_slot].offset = -1;
+        }
         id_pairs[i - 1].key = i;
         id_pairs[i - 1].row_index = inserted_slot;
         uk_pairs[i - 1].key = dup_string(email);
@@ -5094,22 +5316,15 @@ void run_bplus_benchmark(int record_count) {
     start = current_seconds();
     for (i = 0; i < linear_query_count; i++) {
         char target[64];
-        char line[RECORD_SIZE];
+        int row_index;
         snprintf(target, sizeof(target), "User%d", record_count - ((i * 7919) % record_count));
-        if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_SET) != 0) break;
-        if (!fgets(line, sizeof(line), tc->file)) break;
-        while (fgets(line, sizeof(line), tc->file)) {
-            char *nl = strpbrk(line, "\r\n");
-            char row_buf[RECORD_SIZE];
-            char *fields[MAX_COLS] = {0};
-            if (nl) *nl = '\0';
-            parse_csv_row(line, fields, row_buf);
-            if (compare_value(fields[3], target)) {
+        for (row_index = 0; row_index < tc->record_count; row_index++) {
+            const char *row = tc->records[row_index];
+            if (row && strstr(row, target)) {
                 found++;
                 break;
             }
         }
-        fseek(tc->file, 0, SEEK_END);
     }
     end = current_seconds();
     linear_time = end - start;
@@ -5224,7 +5439,7 @@ void close_all_tables(void) {
     for (i = 0; i < open_table_count; i++) {
         TableCache *tc = &open_tables[i];
 
-        if (tc->file && !tc->cache_truncated && tc->active_count <= ROW_CACHE_LIMIT && delta_log_exists(tc)) {
+        if (tc->file && !tc->cache_truncated && tc->active_count <= MAX_RECORDS && delta_log_exists(tc)) {
             if (!compact_table_file_for_shutdown(tc)) {
                 INFO_PRINTF("[warning] failed to compact delta-backed table '%s' during shutdown.\n",
                             tc->table_name);

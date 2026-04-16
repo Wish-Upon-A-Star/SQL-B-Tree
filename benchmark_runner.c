@@ -451,15 +451,15 @@ int main(int argc, char **argv) {
     if (!getenv("SQLSPROCESSOR_EXE")) {
 #if defined(_WIN32)
         if (opt.memtrack) {
-            rc = system("gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe");
+            rc = system("gcc -O3 -march=native -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe");
         } else {
-            rc = system("gcc -O2 -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe");
+            rc = system("gcc -O3 -march=native -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe");
         }
 #else
         if (opt.memtrack) {
-            rc = system("make -B build CFLAGS='-O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK'");
+            rc = system("make -B build CFLAGS='-O3 -march=native -fdiagnostics-color=always -g -DBENCH_MEMTRACK'");
         } else {
-            rc = system("make -B build CFLAGS='-O2 -fdiagnostics-color=always -g'");
+            rc = system("make -B build CFLAGS='-O3 -march=native -fdiagnostics-color=always -g'");
         }
 #endif
         if (rc != 0) {

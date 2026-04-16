@@ -5,7 +5,7 @@
 
 #define BPTREE_MIN_ORDER 8
 #define BPTREE_DEFAULT_ORDER 8
-#define BPTREE_MAX_ORDER 64
+#define BPTREE_MAX_ORDER 256
 #define BPTREE_MAX_KEYS (BPTREE_MAX_ORDER - 1)
 
 typedef struct BPlusNode {
@@ -39,14 +39,17 @@ static int normalize_order(int order) {
     if (order <= 8) return 8;
     if (order <= 16) return 16;
     if (order <= 32) return 32;
-    return 64;
+    if (order <= 64) return 64;
+    if (order <= 128) return 128;
+    return 256;
 }
 
 static int choose_order_for_count(int count) {
     if (count < 4096) return 8;
     if (count < 65536) return 16;
     if (count < 262144) return 32;
-    return 64;
+    if (count < 1048576) return 128;
+    return 256;
 }
 
 int bptree_recommended_order(int count) {
