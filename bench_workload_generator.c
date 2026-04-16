@@ -206,6 +206,11 @@ static int ensure_source_csv(const GeneratorOptions *opt) {
         return generate_source_csv_internal(opt->rows, opt);
     }
 
+    if (!file_exists(SOURCE_CSV) || count_csv_rows(SOURCE_CSV) < opt->rows) {
+        fprintf(stderr, "[warn] target generator did not produce enough rows, using internal CSV generator.\n");
+        return generate_source_csv_internal(opt->rows, opt);
+    }
+
     if (is_plain_constraint_mode(opt)) {
         FILE *f = fopen(SOURCE_CSV, "r");
         char line[LINE_MAX_LEN];
