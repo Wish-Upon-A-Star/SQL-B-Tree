@@ -4,8 +4,8 @@
 #include "bptree.h"
 
 #define BPTREE_MIN_ORDER 8
-#define BPTREE_DEFAULT_ORDER 8
-#define BPTREE_MAX_ORDER 256
+#define BPTREE_DEFAULT_ORDER 32
+#define BPTREE_MAX_ORDER 64
 #define BPTREE_MAX_KEYS (BPTREE_MAX_ORDER - 1)
 
 typedef struct BPlusNode {
@@ -39,21 +39,14 @@ static int normalize_order(int order) {
     if (order <= 8) return 8;
     if (order <= 16) return 16;
     if (order <= 32) return 32;
-    if (order <= 64) return 64;
-    if (order <= 128) return 128;
-    return 256;
+    return 64;
 }
 
 static int choose_order_for_count(int count) {
     if (count < 4096) return 8;
     if (count < 65536) return 16;
     if (count < 262144) return 32;
-    if (count < 1048576) return 128;
-    return 256;
-}
-
-int bptree_recommended_order(int count) {
-    return choose_order_for_count(count);
+    return 64;
 }
 
 static int tree_order(const BPlusTree *tree) {
@@ -326,6 +319,22 @@ int bptree_range_search(BPlusTree *tree, long start_key, long end_key,
         for (i = 0; i < node->key_count; i++) {
             if (node->keys[i] < start_key) continue;
             if (node->keys[i] > end_key) return 1;
+            if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
+        }
+        node = node->next;
+    }
+    return 1;
+}
+
+int bptree_visit_pairs(BPlusTree *tree, BPlusPairVisitor visitor, void *ctx) {
+    BPlusNode *node;
+    int i;
+
+    if (!tree || !tree->root || !visitor) return 0;
+    node = tree->root;
+    while (node && !node->is_leaf) node = node->children[0];
+    while (node) {
+        for (i = 0; i < node->key_count; i++) {
             if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
         }
         node = node->next;
@@ -767,6 +776,22 @@ int bptree_string_range_search(BPlusStringTree *tree, const char *start_key, con
         for (i = 0; i < node->key_count; i++) {
             if (strcmp(node->keys[i], start_key) < 0) continue;
             if (strcmp(node->keys[i], end_key) > 0) return 1;
+            if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
+        }
+        node = node->next;
+    }
+    return 1;
+}
+
+int bptree_string_visit_pairs(BPlusStringTree *tree, BPlusStringPairVisitor visitor, void *ctx) {
+    BPlusStringNode *node;
+    int i;
+
+    if (!tree || !tree->root || !visitor) return 0;
+    node = tree->root;
+    while (node && !node->is_leaf) node = node->children[0];
+    while (node) {
+        for (i = 0; i < node->key_count; i++) {
             if (!visitor(node->keys[i], node->values[i], ctx)) return 0;
         }
         node = node->next;

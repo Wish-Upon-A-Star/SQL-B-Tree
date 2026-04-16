@@ -9,12 +9,11 @@
 #define TABLE_NAME "jungle_workload_users"
 #define SOURCE_CSV "jungle_benchmark_users.csv"
 #define WORKLOAD_CSV "jungle_workload_users.csv"
-#define WORKLOAD_IDX "jungle_workload_users.idx"
-#define WORKLOAD_DELTA "jungle_workload_users.delta"
+
 #if defined(_WIN32)
-#define DEFAULT_SQL_EXE ".\\sqlsprocessor.exe"
+#define DEFAULT_SQLPROCESSOR_CMD ".\\sqlsprocessor.exe"
 #else
-#define DEFAULT_SQL_EXE "./sqlsprocessor"
+#define DEFAULT_SQLPROCESSOR_CMD "./sqlsprocessor"
 #endif
 
 #define LINE_MAX_LEN 2048
@@ -23,9 +22,14 @@
 typedef struct {
     const char *profile;
     int rows;
+    int update_rows;
+    int delete_rows;
     int mixed_ops;
     unsigned int seed;
     const char *output_dir;
+    const char *exec_spec;
+    char sql_exe[512];
+    char constraint_mode[32];
 } GeneratorOptions;
 
 static int is_numeric_col(int col_idx) {
@@ -36,6 +40,16 @@ static int profile_rows(const char *profile) {
     if (strcmp(profile, "smoke") == 0) return 10000;
     if (strcmp(profile, "regression") == 0) return 100000;
     return 1000000;
+}
+
+static int profile_update_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 1000000;
+    return profile_rows(profile);
+}
+
+static int profile_delete_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 1000000;
+    return profile_rows(profile);
 }
 
 static int profile_ops(const char *profile) {
@@ -53,6 +67,60 @@ static void trim_newline(char *s) {
     }
 }
 
+static void trim_spaces(char *s) {
+    char *start;
+    char *end;
+    if (!s) return;
+    start = s;
+    while (*start == ' ' || *start == '\t') start++;
+    if (start != s) memmove(s, start, strlen(start) + 1);
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+}
+
+static void load_exec_spec(GeneratorOptions *opt) {
+    FILE *f;
+    char line[1536];
+    const char *env_sql;
+
+    if (!opt) return;
+    strncpy(opt->sql_exe, DEFAULT_SQLPROCESSOR_CMD, sizeof(opt->sql_exe) - 1);
+    strncpy(opt->constraint_mode, "pkuk", sizeof(opt->constraint_mode) - 1);
+    opt->sql_exe[sizeof(opt->sql_exe) - 1] = '\0';
+    opt->constraint_mode[sizeof(opt->constraint_mode) - 1] = '\0';
+    env_sql = getenv("SQLSPROCESSOR_EXE");
+    if (env_sql && env_sql[0] != '\0') {
+        strncpy(opt->sql_exe, env_sql, sizeof(opt->sql_exe) - 1);
+        opt->sql_exe[sizeof(opt->sql_exe) - 1] = '\0';
+    }
+    if (!opt->exec_spec || opt->exec_spec[0] == '\0') return;
+    f = fopen(opt->exec_spec, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        char *eq;
+        char *key;
+        char *value;
+        trim_newline(line);
+        key = line;
+        trim_spaces(key);
+        if (key[0] == '\0' || key[0] == '#') continue;
+        eq = strchr(key, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        value = eq + 1;
+        trim_spaces(key);
+        trim_spaces(value);
+        if (strcmp(key, "sql_exe") == 0) {
+            strncpy(opt->sql_exe, value, sizeof(opt->sql_exe) - 1);
+            opt->sql_exe[sizeof(opt->sql_exe) - 1] = '\0';
+        } else if (strcmp(key, "constraint_mode") == 0) {
+            strncpy(opt->constraint_mode, value, sizeof(opt->constraint_mode) - 1);
+            opt->constraint_mode[sizeof(opt->constraint_mode) - 1] = '\0';
+        }
+    }
+    fclose(f);
+}
+
 static int file_exists(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -60,68 +128,20 @@ static int file_exists(const char *path) {
     return 1;
 }
 
-static const char *sql_exe_path(void) {
-    const char *env = getenv("SQLSPROCESSOR_EXE");
-    return (env && env[0] != '\0') ? env : DEFAULT_SQL_EXE;
+static int is_plain_constraint_mode(const GeneratorOptions *opt) {
+    return opt && strcmp(opt->constraint_mode, "plain") == 0;
 }
 
-static const char *track_for_id(int id) {
-    static const char *const tracks[] = {
-        "sw_ai_lab", "game_lab", "game_tech_lab"
-    };
-    return tracks[(id - 1) % 3];
-}
-
-static const char *background_for_id(int id) {
-    int bucket = (id - 1) % 100;
-    if (bucket < 62) return "student";
-    if (bucket < 74) return "newgrad";
-    if (bucket < 86) return "incumbent";
-    if (bucket < 95) return "switcher";
-    return "selftaught";
-}
-
-static const char *history_for_id(int id) {
-    static const char *const histories[] = {
-        "major_cs_grade_3", "major_design_grade_4", "frontend_3y",
-        "backend_2y", "designer_4y", "major_game_grade_2"
-    };
-    return histories[(id - 1) % 6];
-}
-
-static const char *status_for_id(int id) {
-    static const char *const statuses[] = {
-        "submitted", "pretest_pass", "interview_wait", "final_wait"
-    };
-    return statuses[(id - 1) % 4];
-}
-
-static int generate_source_csv_internal(int rows) {
-    FILE *f = fopen(SOURCE_CSV, "w");
-    int i;
-
-    if (!f) return 0;
-    fprintf(f, "id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round\n");
-    for (i = 1; i <= rows; i++) {
-        fprintf(f,
-                "%d,jungle%07d@apply.kr,010-%04d-%04d,Applicant%07d,%s,%s,%s,%d,gh_%07d,%s,2026_spring\n",
-                i,
-                i,
-                (i / 10000) % 10000,
-                i % 10000,
-                i,
-                track_for_id(i),
-                background_for_id(i),
-                history_for_id(i),
-                50 + (i % 51),
-                i,
-                status_for_id(i));
-        if (ferror(f)) {
-            fclose(f);
-            return 0;
-        }
+static const char *csv_header_for_mode(const GeneratorOptions *opt) {
+    if (is_plain_constraint_mode(opt)) {
+        return "id,email,phone,name,track,background,history,pretest,github,status,round";
     }
-    return fclose(f) == 0;
+    return "id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round";
+}
+
+static int header_matches_mode(const char *line, const GeneratorOptions *opt) {
+    const char *expected = csv_header_for_mode(opt);
+    return strncmp(line, expected, strlen(expected)) == 0;
 }
 
 static int count_csv_rows(const char *path) {
@@ -135,35 +155,69 @@ static int count_csv_rows(const char *path) {
     return lines - 1;
 }
 
-static int ensure_source_csv(int rows) {
-    char cmd[512];
+static int generate_source_csv_internal(int rows, const GeneratorOptions *opt) {
+    FILE *f = fopen(SOURCE_CSV, "w");
+    int i;
+    if (!f) {
+        fprintf(stderr, "[error] cannot create %s\n", SOURCE_CSV);
+        return 0;
+    }
+
+    fprintf(f, "%s\n", csv_header_for_mode(opt));
+    for (i = 1; i <= rows; i++) {
+        fprintf(f,
+                "%d,user%07d@example.com,010-%04d-%04d,User%07d,track_%02d,background_%02d,history_%02d,%d,gh_user_%07d,submitted,2026_spring\n",
+                i,
+                i,
+                (i / 10000) % 10000,
+                i % 10000,
+                i,
+                i % 8,
+                i % 5,
+                i % 7,
+                40 + (i % 61),
+                i);
+    }
+    fclose(f);
+    return 1;
+}
+
+static int ensure_source_csv(const GeneratorOptions *opt) {
+    char cmd[1024];
     int header_ok = 0;
-    if (file_exists(SOURCE_CSV) && count_csv_rows(SOURCE_CSV) >= rows) {
+    if (file_exists(SOURCE_CSV) && count_csv_rows(SOURCE_CSV) >= opt->rows) {
         FILE *f = fopen(SOURCE_CSV, "r");
         char line[LINE_MAX_LEN];
         if (f && fgets(line, sizeof(line), f)) {
             trim_newline(line);
-            header_ok = strstr(line, "id(PK),email(UK),phone(UK),name,track(NN),") == line;
+            header_ok = header_matches_mode(line, opt);
         }
         if (f) fclose(f);
         if (header_ok) return 1;
     }
 
-    snprintf(cmd, sizeof(cmd), "\"%s\" --generate-jungle %d %s", sql_exe_path(), rows, SOURCE_CSV);
-    if (system(cmd) == 0 && count_csv_rows(SOURCE_CSV) >= rows) return 1;
+#if defined(_WIN32)
+    snprintf(cmd, sizeof(cmd), "%s --generate-jungle %d %s", opt->sql_exe, opt->rows, SOURCE_CSV);
+#else
+    snprintf(cmd, sizeof(cmd), "\"%s\" --generate-jungle %d %s", opt->sql_exe, opt->rows, SOURCE_CSV);
+#endif
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[warn] target generator failed, using internal CSV generator: %s\n", cmd);
+        return generate_source_csv_internal(opt->rows, opt);
+    }
 
-    fprintf(stderr, "[notice] target SQL executable does not provide compatible --generate-jungle; generating source CSV internally.\n");
-    if (!generate_source_csv_internal(rows)) {
-        fprintf(stderr, "[error] failed to generate source CSV internally: %s\n", SOURCE_CSV);
-        return 0;
+    if (is_plain_constraint_mode(opt)) {
+        FILE *f = fopen(SOURCE_CSV, "r");
+        char line[LINE_MAX_LEN];
+        int generated_plain = 0;
+        if (f && fgets(line, sizeof(line), f)) {
+            trim_newline(line);
+            generated_plain = header_matches_mode(line, opt);
+        }
+        if (f) fclose(f);
+        if (!generated_plain) return generate_source_csv_internal(opt->rows, opt);
     }
     return 1;
-}
-
-static void remove_stale_workload_artifacts(void) {
-    remove(WORKLOAD_CSV);
-    remove(WORKLOAD_IDX);
-    remove(WORKLOAD_DELTA);
 }
 
 static int ensure_dir(const char *path) {
@@ -279,6 +333,13 @@ static int write_correctness_sql(const GeneratorOptions *opt) {
 
     f = fopen(path_failure, "w");
     if (!f) return 0;
+    if (is_plain_constraint_mode(opt)) {
+        fprintf(f,
+                "-- correctness failure is disabled for plain id/email/phone headers.\n"
+                "-- Plain mode runs against SQL processors that do not declare PK/UK/NN in CSV headers.\n");
+        fclose(f);
+        return 1;
+    }
     fprintf(f,
             "-- correctness failure for profile=%s\n"
             "INSERT INTO %s VALUES (900000001, 'bench_dup_pk@apply.kr', '010-9000-1001', '중복PK', 'sw_ai_lab', 'student', 'major_ai_grade_2', 90, 'gh_dup_pk', 'submitted', '2026_spring');\n"
@@ -312,22 +373,25 @@ static int write_meta_files(const GeneratorOptions *opt, int generated_rows) {
             "  \"profile\": \"%s\",\n"
             "  \"seed\": %u,\n"
             "  \"row_count\": %d,\n"
+            "  \"update_row_count\": %d,\n"
+            "  \"delete_row_count\": %d,\n"
             "  \"preload\": %d,\n"
             "  \"op_count\": %d,\n"
             "  \"crud_ratio\": {\"select\": 60, \"insert\": 20, \"update\": 15, \"delete\": 5},\n"
             "  \"created_at_epoch\": %ld\n"
             "}\n",
-            opt->profile, opt->seed, generated_rows, opt->rows, opt->mixed_ops, (long)now);
+            opt->profile, opt->seed, generated_rows, opt->update_rows, opt->delete_rows, opt->rows, opt->mixed_ops, (long)now);
     fclose(meta_f);
 
     oracle_f = fopen(oracle_path, "w");
     if (!oracle_f) return 0;
     fprintf(oracle_f,
             "{\n"
-            "  \"expected_failure_errors_min\": 4,\n"
+            "  \"expected_failure_errors_min\": %d,\n"
             "  \"correctness_success_sql\": \"jungle_correctness_success_%s.sql\",\n"
             "  \"correctness_failure_sql\": \"jungle_correctness_failure_%s.sql\"\n"
             "}\n",
+            is_plain_constraint_mode(opt) ? 0 : 4,
             opt->profile, opt->profile);
     fclose(oracle_f);
     return 1;
@@ -347,6 +411,8 @@ static int generate_sqls(const GeneratorOptions *opt) {
     char mixed_path[512];
     int *ids = NULL;
     int rows = 0;
+    int update_rows = 0;
+    int delete_rows = 0;
     FILE *mixed_f = NULL;
 
     if (!src) {
@@ -360,7 +426,6 @@ static int generate_sqls(const GeneratorOptions *opt) {
     }
     trim_newline(line);
 
-    remove_stale_workload_artifacts();
     workload = fopen(WORKLOAD_CSV, "w");
     if (!workload) {
         fclose(src);
@@ -395,8 +460,6 @@ static int generate_sqls(const GeneratorOptions *opt) {
     }
 
     fprintf(insert_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, opt->rows, opt->seed);
-    fprintf(update_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, opt->rows, opt->seed);
-    fprintf(delete_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, opt->rows, opt->seed);
 
     while (rows < opt->rows && fgets(line, sizeof(line), src)) {
         char row_copy[LINE_MAX_LEN];
@@ -424,9 +487,16 @@ static int generate_sqls(const GeneratorOptions *opt) {
         rows++;
     }
 
+    update_rows = opt->update_rows <= rows ? opt->update_rows : rows;
+    delete_rows = opt->delete_rows <= rows ? opt->delete_rows : rows;
+    fprintf(update_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, update_rows, opt->seed);
+    fprintf(delete_f, "-- generated profile=%s rows=%d seed=%u\n", opt->profile, delete_rows, opt->seed);
+
     shuffle_ids(ids, rows, opt->seed);
-    for (int i = 0; i < rows; i++) {
+    for (int i = 0; i < update_rows; i++) {
         fprintf(update_f, "UPDATE %s SET status = 'final_wait' WHERE id = %d;\n", TABLE_NAME, ids[i]);
+    }
+    for (int i = 0; i < delete_rows; i++) {
         fprintf(delete_f, "DELETE FROM %s WHERE id = %d;\n", TABLE_NAME, ids[i]);
     }
 
@@ -467,7 +537,8 @@ static int generate_sqls(const GeneratorOptions *opt) {
     if (!write_correctness_sql(opt)) return 0;
     if (!write_meta_files(opt, rows)) return 0;
 
-    printf("[ok] profile=%s rows=%d seed=%u\n", opt->profile, rows, opt->seed);
+    printf("[ok] profile=%s rows=%d update_rows=%d delete_rows=%d seed=%u\n",
+           opt->profile, rows, update_rows, delete_rows, opt->seed);
     printf("[ok] wrote %s\n", insert_path);
     printf("[ok] wrote %s\n", update_path);
     printf("[ok] wrote %s\n", delete_path);
@@ -485,14 +556,24 @@ static void parse_args(int argc, char **argv, GeneratorOptions *opt) {
             opt->rows = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--preload") == 0 && i + 1 < argc) {
             opt->rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--update-rows") == 0 && i + 1 < argc) {
+            opt->update_rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--delete-rows") == 0 && i + 1 < argc) {
+            opt->delete_rows = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ops") == 0 && i + 1 < argc) {
             opt->mixed_ops = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--output-dir") == 0 && i + 1 < argc) {
             opt->output_dir = argv[++i];
+        } else if (strcmp(argv[i], "--exec-spec") == 0 && i + 1 < argc) {
+            opt->exec_spec = argv[++i];
         }
     }
 
     if (opt->rows <= 0) opt->rows = profile_rows(opt->profile);
+    if (opt->update_rows <= 0) opt->update_rows = profile_update_rows(opt->profile);
+    if (opt->delete_rows <= 0) opt->delete_rows = profile_delete_rows(opt->profile);
+    if (opt->update_rows > opt->rows) opt->update_rows = opt->rows;
+    if (opt->delete_rows > opt->rows) opt->delete_rows = opt->rows;
     if (opt->mixed_ops <= 0) opt->mixed_ops = profile_ops(opt->profile);
 }
 
@@ -501,14 +582,18 @@ int main(int argc, char **argv) {
 
     opt.profile = "score";
     opt.rows = 0;
+    opt.update_rows = 0;
+    opt.delete_rows = 0;
     opt.mixed_ops = 0;
     opt.seed = 20260415u;
     opt.output_dir = "generated_sql";
+    opt.exec_spec = "bench_score_exec.conf";
 
     parse_args(argc, argv, &opt);
+    load_exec_spec(&opt);
 
     if (!ensure_dir(opt.output_dir)) return 1;
-    if (!ensure_source_csv(opt.rows)) return 1;
+    if (!ensure_source_csv(&opt)) return 1;
     if (!generate_sqls(&opt)) return 1;
 
     return 0;

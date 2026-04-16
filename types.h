@@ -7,7 +7,7 @@
 #define INITIAL_RECORD_CAPACITY 1024
 #define ROW_CACHE_LIMIT 65536
 #define PAGE_CACHE_PAGE_SIZE 65536
-#define PAGE_CACHE_LIMIT 64
+#define PAGE_CACHE_LIMIT 2048
 #define RECORD_SIZE 1024
 #define MAX_COLS 15
 #define MAX_TABLES 1
@@ -134,17 +134,11 @@ typedef struct {
     long *tail_offsets;             /* tail_pk_ids와 대응되는 CSV 파일 offset */
     int tail_count;                 /* 캐시 밖 PK offset 개수 */
     int tail_capacity;              /* tail offset 배열 용량 */
-    long *tail_delta_ids;           /* delta가 적용된 캐시 밖 PK id 목록 */
-    char **tail_delta_rows;         /* UPDATE delta row, DELETE면 NULL */
-    unsigned char *tail_delta_deleted; /* DELETE delta 여부 */
-    int tail_delta_count;           /* tail delta overlay 개수 */
-    int tail_delta_capacity;        /* tail delta overlay 용량 */
     long next_auto_id;             /* INSERT 시 자동 부여할 다음 ID */
     long next_row_id;              /* PK가 없는 테이블의 delta/index 식별자 */
     long append_offset;            /* 다음 CSV append가 시작될 byte offset */
     int snapshot_loaded;           /* 유효한 .idx snapshot으로 현재 상태를 복구했는지 */
     int snapshot_dirty;            /* INSERT/UPDATE/DELETE 이후 .idx 재저장이 필요한지 */
-    int rows_materialized;          /* mutation-heavy fast path에서 CSV row를 메모리에 순차 적재했는지 */
     unsigned long long last_used_seq; /* LRU 계산용 사용 순번 */
 } TableCache;
 

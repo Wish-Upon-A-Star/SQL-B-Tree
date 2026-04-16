@@ -6,7 +6,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #if defined(_WIN32)
-#include <direct.h>
+#include <windows.h>
 #define popen _popen
 #define pclose _pclose
 #else
@@ -28,23 +28,40 @@
 #define REF_DELETE 120000.0
 #define REF_UTIL_PROXY 0.03
 #define REF_UTIL_MEMTRACK 0.08
-#define COMMAND_OUTPUT_BUFFER_SIZE (1 << 20)
 
 #if defined(_WIN32)
-#define DEFAULT_SQL_EXE ".\\sqlsprocessor.exe"
+#define DEFAULT_SQLPROCESSOR_CMD ".\\sqlsprocessor.exe"
+#define DEFAULT_BENCH_GENERATOR_CMD ".\\bench_workload_generator.exe"
+#define DEFAULT_BUILD_CMD "gcc -O2 -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe"
+#define DEFAULT_MEMTRACK_BUILD_CMD "gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe"
 #else
-#define DEFAULT_SQL_EXE "./sqlsprocessor"
+#define DEFAULT_SQLPROCESSOR_CMD "./sqlsprocessor"
+#define DEFAULT_BENCH_GENERATOR_CMD "./bench_workload_generator"
+#define DEFAULT_BUILD_CMD "make -B build CFLAGS='-O2 -fdiagnostics-color=always -g'"
+#define DEFAULT_MEMTRACK_BUILD_CMD "make -B build CFLAGS='-O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK'"
 #endif
 
 typedef struct {
     const char *profile;
     int rows;
+    int update_rows;
+    int delete_rows;
     int mixed_ops;
     unsigned int seed;
     int repeat;
     int memtrack;
     int report_only;
+    const char *exec_spec;
 } RunnerOptions;
+
+typedef struct {
+    char sql_exe[512];
+    char generator_exe[512];
+    char build_cmd[1024];
+    char memtrack_build_cmd[1024];
+    char constraint_mode[32];
+    int expected_failure_errors;
+} BenchExecSpec;
 
 typedef struct {
     double insert;
@@ -68,6 +85,16 @@ static int profile_rows(const char *profile) {
     return 1000000;
 }
 
+static int profile_update_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 1000000;
+    return profile_rows(profile);
+}
+
+static int profile_delete_rows(const char *profile) {
+    if (strcmp(profile, "score") == 0) return 1000000;
+    return profile_rows(profile);
+}
+
 static int profile_ops(const char *profile) {
     if (strcmp(profile, "smoke") == 0) return 20000;
     if (strcmp(profile, "regression") == 0) return 100000;
@@ -76,17 +103,16 @@ static int profile_ops(const char *profile) {
 
 static double now_seconds(void) {
 #if defined(_WIN32)
-    return (double)clock() / (double)CLOCKS_PER_SEC;
+    LARGE_INTEGER freq;
+    LARGE_INTEGER counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)freq.QuadPart;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 #endif
-}
-
-static const char *sql_exe_path(void) {
-    const char *env = getenv("SQLSPROCESSOR_EXE");
-    return (env && env[0] != '\0') ? env : DEFAULT_SQL_EXE;
 }
 
 static void trim_newline(char *s) {
@@ -95,6 +121,87 @@ static void trim_newline(char *s) {
     len = strlen(s);
     while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
         s[--len] = '\0';
+    }
+}
+
+static void trim_spaces(char *s) {
+    char *start;
+    char *end;
+    if (!s) return;
+    start = s;
+    while (*start == ' ' || *start == '\t') start++;
+    if (start != s) memmove(s, start, strlen(start) + 1);
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+}
+
+static void init_exec_spec(BenchExecSpec *spec) {
+    const char *env_sql;
+    if (!spec) return;
+    memset(spec, 0, sizeof(*spec));
+    strncpy(spec->sql_exe, DEFAULT_SQLPROCESSOR_CMD, sizeof(spec->sql_exe) - 1);
+    strncpy(spec->generator_exe, DEFAULT_BENCH_GENERATOR_CMD, sizeof(spec->generator_exe) - 1);
+    strncpy(spec->build_cmd, DEFAULT_BUILD_CMD, sizeof(spec->build_cmd) - 1);
+    strncpy(spec->memtrack_build_cmd, DEFAULT_MEMTRACK_BUILD_CMD, sizeof(spec->memtrack_build_cmd) - 1);
+    strncpy(spec->constraint_mode, "pkuk", sizeof(spec->constraint_mode) - 1);
+    spec->sql_exe[sizeof(spec->sql_exe) - 1] = '\0';
+    spec->generator_exe[sizeof(spec->generator_exe) - 1] = '\0';
+    spec->build_cmd[sizeof(spec->build_cmd) - 1] = '\0';
+    spec->memtrack_build_cmd[sizeof(spec->memtrack_build_cmd) - 1] = '\0';
+    spec->constraint_mode[sizeof(spec->constraint_mode) - 1] = '\0';
+    spec->expected_failure_errors = EXPECTED_FAILURE_ERRORS;
+    env_sql = getenv("SQLSPROCESSOR_EXE");
+    if (env_sql && env_sql[0] != '\0') {
+        strncpy(spec->sql_exe, env_sql, sizeof(spec->sql_exe) - 1);
+        spec->sql_exe[sizeof(spec->sql_exe) - 1] = '\0';
+        spec->build_cmd[0] = '\0';
+        spec->memtrack_build_cmd[0] = '\0';
+    }
+}
+
+static void load_exec_spec(BenchExecSpec *spec, const char *path) {
+    FILE *f;
+    char line[1536];
+    if (!spec || !path || path[0] == '\0') return;
+    f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        char *eq;
+        char *key;
+        char *value;
+        trim_newline(line);
+        key = line;
+        trim_spaces(key);
+        if (key[0] == '\0' || key[0] == '#') continue;
+        eq = strchr(key, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        value = eq + 1;
+        trim_spaces(key);
+        trim_spaces(value);
+        if (strcmp(key, "sql_exe") == 0) {
+            strncpy(spec->sql_exe, value, sizeof(spec->sql_exe) - 1);
+            spec->sql_exe[sizeof(spec->sql_exe) - 1] = '\0';
+        } else if (strcmp(key, "generator_exe") == 0) {
+            strncpy(spec->generator_exe, value, sizeof(spec->generator_exe) - 1);
+            spec->generator_exe[sizeof(spec->generator_exe) - 1] = '\0';
+        } else if (strcmp(key, "build_cmd") == 0) {
+            strncpy(spec->build_cmd, value, sizeof(spec->build_cmd) - 1);
+            spec->build_cmd[sizeof(spec->build_cmd) - 1] = '\0';
+        } else if (strcmp(key, "memtrack_build_cmd") == 0) {
+            strncpy(spec->memtrack_build_cmd, value, sizeof(spec->memtrack_build_cmd) - 1);
+            spec->memtrack_build_cmd[sizeof(spec->memtrack_build_cmd) - 1] = '\0';
+        } else if (strcmp(key, "constraint_mode") == 0) {
+            strncpy(spec->constraint_mode, value, sizeof(spec->constraint_mode) - 1);
+            spec->constraint_mode[sizeof(spec->constraint_mode) - 1] = '\0';
+            if (strcmp(value, "plain") == 0) spec->expected_failure_errors = 0;
+        } else if (strcmp(key, "expected_failure_errors") == 0) {
+            spec->expected_failure_errors = atoi(value);
+        }
+    }
+    fclose(f);
+    if (strcmp(spec->constraint_mode, "plain") == 0 && spec->expected_failure_errors == EXPECTED_FAILURE_ERRORS) {
+        spec->expected_failure_errors = 0;
     }
 }
 
@@ -117,7 +224,7 @@ static int count_token(const char *text, const char *token) {
 
 static int ensure_dir(const char *path) {
 #if defined(_WIN32)
-    int rc = _mkdir(path);
+    int rc = mkdir(path);
 #else
     int rc = mkdir(path, 0755);
 #endif
@@ -238,37 +345,37 @@ static int reset_workload_csv_header(void) {
     fprintf(dst, "%s\n", line);
     fclose(src);
     fclose(dst);
+    remove("jungle_workload_users.delta");
+    remove("jungle_workload_users.idx");
     return 1;
 }
 
-static void build_sql_command(char *cmd, size_t cmd_size, const char *sql_file, int memtrack, int quiet) {
+static void build_sql_command(char *cmd, size_t cmd_size, const BenchExecSpec *spec,
+                              const char *sql_file, int memtrack, int quiet) {
+    const char *quiet_arg = quiet ? "--quiet " : "";
 #if defined(_WIN32)
     if (memtrack) {
-        snprintf(cmd, cmd_size, "set BENCH_MEMTRACK_REPORT=1 && \"%s\" %s%s 2>&1",
-                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
+        snprintf(cmd, cmd_size, "set BENCH_MEMTRACK_REPORT=1&& %s %s%s 2>&1",
+                 spec->sql_exe, quiet_arg, sql_file);
     } else {
-        snprintf(cmd, cmd_size, "\"%s\" %s%s 2>&1",
-                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
+        snprintf(cmd, cmd_size, "%s %s%s 2>&1", spec->sql_exe, quiet_arg, sql_file);
     }
 #else
     if (memtrack) {
         snprintf(cmd, cmd_size, "BENCH_MEMTRACK_REPORT=1 \"%s\" %s%s 2>&1",
-                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
+                 spec->sql_exe, quiet_arg, sql_file);
     } else {
-        snprintf(cmd, cmd_size, "\"%s\" %s%s 2>&1",
-                 sql_exe_path(), quiet ? "--quiet " : "", sql_file);
+        snprintf(cmd, cmd_size, "\"%s\" %s%s 2>&1", spec->sql_exe, quiet_arg, sql_file);
     }
 #endif
 }
 
-static int run_sql_file(const char *sql_file, int memtrack, double *elapsed, int *exit_code, char *output, size_t output_size) {
+static int run_sql_file(const BenchExecSpec *spec, const char *sql_file, int memtrack, double *elapsed, int *exit_code, char *output, size_t output_size) {
     char cmd[1024];
     double first_elapsed = 0.0;
-    double retry_elapsed = 0.0;
-    int first_exit = 1;
-    int retry_exit = 1;
+    int first_exit = 0;
 
-    build_sql_command(cmd, sizeof(cmd), sql_file, memtrack, 1);
+    build_sql_command(cmd, sizeof(cmd), spec, sql_file, memtrack, 1);
     if (!run_command_capture(cmd, output, output_size, &first_elapsed, &first_exit)) return 0;
     if (first_exit == 0) {
         if (elapsed) *elapsed = first_elapsed;
@@ -276,10 +383,9 @@ static int run_sql_file(const char *sql_file, int memtrack, double *elapsed, int
         return 1;
     }
 
-    build_sql_command(cmd, sizeof(cmd), sql_file, memtrack, 0);
-    if (!run_command_capture(cmd, output, output_size, &retry_elapsed, &retry_exit)) return 0;
-    if (elapsed) *elapsed = first_elapsed + retry_elapsed;
-    if (exit_code) *exit_code = retry_exit;
+    build_sql_command(cmd, sizeof(cmd), spec, sql_file, memtrack, 0);
+    if (!run_command_capture(cmd, output, output_size, elapsed, exit_code)) return 0;
+    if (elapsed) *elapsed += first_elapsed;
     return 1;
 }
 
@@ -344,6 +450,20 @@ static double normalize(double value, double ref) {
     return value / ref;
 }
 
+static void stage_begin(const char *label) {
+    printf("[progress] %s ...\n", label);
+    fflush(stdout);
+}
+
+static void stage_end(const char *label, int ok, double elapsed_sec) {
+    if (elapsed_sec > 0.0) {
+        printf("[progress] %s %s (%.2f sec)\n", label, ok ? "done" : "failed", elapsed_sec);
+    } else {
+        printf("[progress] %s %s\n", label, ok ? "done" : "failed");
+    }
+    fflush(stdout);
+}
+
 static void parse_args(int argc, char **argv, RunnerOptions *opt) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) opt->profile = argv[++i];
@@ -351,12 +471,19 @@ static void parse_args(int argc, char **argv, RunnerOptions *opt) {
         else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) opt->repeat = atoi(argv[++i]);
         else if (strcmp(argv[i], "--rows") == 0 && i + 1 < argc) opt->rows = atoi(argv[++i]);
         else if (strcmp(argv[i], "--preload") == 0 && i + 1 < argc) opt->rows = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--update-rows") == 0 && i + 1 < argc) opt->update_rows = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--delete-rows") == 0 && i + 1 < argc) opt->delete_rows = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ops") == 0 && i + 1 < argc) opt->mixed_ops = atoi(argv[++i]);
         else if (strcmp(argv[i], "--memtrack") == 0) opt->memtrack = 1;
         else if (strcmp(argv[i], "--report-only") == 0) opt->report_only = 1;
+        else if (strcmp(argv[i], "--exec-spec") == 0 && i + 1 < argc) opt->exec_spec = argv[++i];
     }
 
     if (opt->rows <= 0) opt->rows = profile_rows(opt->profile);
+    if (opt->update_rows <= 0) opt->update_rows = profile_update_rows(opt->profile);
+    if (opt->delete_rows <= 0) opt->delete_rows = profile_delete_rows(opt->profile);
+    if (opt->update_rows > opt->rows) opt->update_rows = opt->rows;
+    if (opt->delete_rows > opt->rows) opt->delete_rows = opt->rows;
     if (opt->mixed_ops <= 0) opt->mixed_ops = profile_ops(opt->profile);
     if (opt->repeat <= 0) opt->repeat = DEFAULT_REPEAT;
 }
@@ -414,23 +541,29 @@ int main(int argc, char **argv) {
     char delete_mode[16] = "measured";
     char util_mode[16] = "proxy";
     char *output = NULL;
+    size_t output_size = 1u << 20;
     char cmd[1024];
     int rc;
     double total_start = now_seconds();
     double total_elapsed = 0.0;
+    BenchExecSpec spec;
 
     opt.profile = "score";
     opt.rows = 0;
+    opt.update_rows = 0;
+    opt.delete_rows = 0;
     opt.mixed_ops = 0;
     opt.seed = DEFAULT_SEED;
     opt.repeat = DEFAULT_REPEAT;
     opt.memtrack = 0;
     opt.report_only = 0;
+    opt.exec_spec = "bench_score_exec.conf";
     parse_args(argc, argv, &opt);
-
-    output = (char *)malloc(COMMAND_OUTPUT_BUFFER_SIZE);
+    init_exec_spec(&spec);
+    load_exec_spec(&spec, opt.exec_spec);
+    output = (char *)malloc(output_size);
     if (!output) {
-        fprintf(stderr, "[error] failed to allocate command output buffer\n");
+        fprintf(stderr, "[error] memory allocation failed\n");
         return 1;
     }
 
@@ -448,56 +581,66 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!getenv("SQLSPROCESSOR_EXE")) {
-#if defined(_WIN32)
-        if (opt.memtrack) {
-            rc = system("gcc -O3 -march=native -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe");
-        } else {
-            rc = system("gcc -O3 -march=native -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe");
-        }
-#else
-        if (opt.memtrack) {
-            rc = system("make -B build CFLAGS='-O3 -march=native -fdiagnostics-color=always -g -DBENCH_MEMTRACK'");
-        } else {
-            rc = system("make -B build CFLAGS='-O3 -march=native -fdiagnostics-color=always -g'");
-        }
-#endif
-        if (rc != 0) {
-            fprintf(stderr, "[error] build failed\n");
-            free(output);
-            return 1;
+    {
+        const char *build_cmd = opt.memtrack ? spec.memtrack_build_cmd : spec.build_cmd;
+        if (build_cmd[0] != '\0') {
+            rc = system(build_cmd);
+            if (rc != 0) {
+                fprintf(stderr, "[error] build failed: %s\n", build_cmd);
+                free(output);
+                return 1;
+            }
         }
     }
 
 #if defined(_WIN32)
-    snprintf(cmd, sizeof(cmd), ".\\bench_workload_generator.exe --profile %s --seed %u --preload %d --ops %d --output-dir generated_sql",
-             opt.profile, opt.seed, opt.rows, opt.mixed_ops);
+    snprintf(cmd, sizeof(cmd),
+             "%s --exec-spec \"%s\" --profile %s --seed %u --preload %d --update-rows %d --delete-rows %d --ops %d --output-dir generated_sql",
+             spec.generator_exe, opt.exec_spec, opt.profile, opt.seed, opt.rows, opt.update_rows, opt.delete_rows, opt.mixed_ops);
 #else
-    snprintf(cmd, sizeof(cmd), "./bench_workload_generator --profile %s --seed %u --preload %d --ops %d --output-dir generated_sql",
-             opt.profile, opt.seed, opt.rows, opt.mixed_ops);
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" --exec-spec \"%s\" --profile %s --seed %u --preload %d --update-rows %d --delete-rows %d --ops %d --output-dir generated_sql",
+             spec.generator_exe, opt.exec_spec, opt.profile, opt.seed, opt.rows, opt.update_rows, opt.delete_rows, opt.mixed_ops);
 #endif
     if (system(cmd) != 0) {
         fprintf(stderr, "[error] workload generation failed\n");
-        free(output);
         return 1;
     }
 
     if (!reset_workload_csv_header()) {
         fprintf(stderr, "[error] failed to reset workload CSV\n");
-        free(output);
         return 1;
     }
 
     snprintf(cmd, sizeof(cmd), "generated_sql/jungle_correctness_success_%s.sql", opt.profile);
-    if (!run_sql_file(cmd, opt.memtrack, NULL, &rc, output, COMMAND_OUTPUT_BUFFER_SIZE) || rc != 0 || contains_token(output, "[error]") || contains_token(output, "[오류]")) {
-        correctness_pass = 0;
-        snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness success script failed");
+    {
+        double elapsed = 0.0;
+        int ok = 0;
+        stage_begin("correctness success");
+        ok = run_sql_file(&spec, cmd, opt.memtrack, &elapsed, &rc, output, output_size) &&
+             rc == 0 &&
+             !contains_token(output, "[error]") &&
+             !contains_token(output, "[오류]");
+        stage_end("correctness success", ok, elapsed);
+        if (!ok) {
+            correctness_pass = 0;
+            snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness success script failed");
+        }
     }
 
     snprintf(cmd, sizeof(cmd), "generated_sql/jungle_correctness_failure_%s.sql", opt.profile);
-    if (!run_sql_file(cmd, opt.memtrack, NULL, &rc, output, COMMAND_OUTPUT_BUFFER_SIZE) || rc != 0 || count_token(output, "[error]") < EXPECTED_FAILURE_ERRORS) {
-        correctness_pass = 0;
-        snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness failure script did not emit expected constraint errors");
+    {
+        double elapsed = 0.0;
+        int ok = 0;
+        stage_begin("correctness failure");
+        ok = run_sql_file(&spec, cmd, opt.memtrack, &elapsed, &rc, output, output_size) &&
+             rc == 0 &&
+             count_token(output, "[error]") >= spec.expected_failure_errors;
+        stage_end("correctness failure", ok, elapsed);
+        if (!ok) {
+            correctness_pass = 0;
+            snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "correctness failure script did not emit expected constraint errors");
+        }
     }
 
     iters = (IterationResult *)calloc((size_t)opt.repeat, sizeof(IterationResult));
@@ -511,7 +654,6 @@ int main(int argc, char **argv) {
 
     if (!iters || !id_vals || !email_vals || !phone_vals || !scan_vals || !insert_vals || !update_vals || !delete_vals) {
         fprintf(stderr, "[error] memory allocation failed\n");
-        free(output);
         return 1;
     }
 
@@ -521,28 +663,31 @@ int main(int argc, char **argv) {
             double elapsed = 0.0;
             int cmd_exit = 0;
             double peak;
+            char stage_label[128];
 
+            if (opt.memtrack) {
 #if defined(_WIN32)
-            if (opt.memtrack) {
-                snprintf(cmd, sizeof(cmd), "set BENCH_MEMTRACK_REPORT=1 && \"%s\" --benchmark %d 2>&1",
-                         sql_exe_path(), opt.rows);
-            } else {
-                snprintf(cmd, sizeof(cmd), "\"%s\" --benchmark %d 2>&1", sql_exe_path(), opt.rows);
-            }
+                snprintf(cmd, sizeof(cmd), "set BENCH_MEMTRACK_REPORT=1&& %s --benchmark %d 2>&1", spec.sql_exe, opt.rows);
 #else
-            if (opt.memtrack) {
-                snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 \"%s\" --benchmark %d 2>&1",
-                         sql_exe_path(), opt.rows);
-            } else {
-                snprintf(cmd, sizeof(cmd), "\"%s\" --benchmark %d 2>&1", sql_exe_path(), opt.rows);
-            }
+                snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 \"%s\" --benchmark %d 2>&1", spec.sql_exe, opt.rows);
 #endif
+            } else {
+#if defined(_WIN32)
+                snprintf(cmd, sizeof(cmd), "%s --benchmark %d 2>&1", spec.sql_exe, opt.rows);
+#else
+                snprintf(cmd, sizeof(cmd), "\"%s\" --benchmark %d 2>&1", spec.sql_exe, opt.rows);
+#endif
+            }
 
-            if (!run_command_capture(cmd, output, COMMAND_OUTPUT_BUFFER_SIZE, &elapsed, &cmd_exit) || cmd_exit != 0 || !parse_benchmark_output(output, &bench)) {
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d benchmark", i + 1, opt.repeat);
+            stage_begin(stage_label);
+            if (!run_command_capture(cmd, output, output_size, &elapsed, &cmd_exit) || cmd_exit != 0 || !parse_benchmark_output(output, &bench)) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "benchmark command parse failed");
                 break;
             }
+            stage_end(stage_label, 1, elapsed);
             peak = parse_memtrack_peak(output);
             if (peak > peak_heap) peak_heap = peak;
 
@@ -553,32 +698,44 @@ int main(int argc, char **argv) {
             }
 
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_insert_%s.sql", opt.profile);
-            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, COMMAND_OUTPUT_BUFFER_SIZE) || cmd_exit != 0) {
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d insert", i + 1, opt.repeat);
+            stage_begin(stage_label);
+            if (!run_sql_file(&spec, cmd, opt.memtrack, &elapsed, &cmd_exit, output, output_size) || cmd_exit != 0) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "insert workload failed");
                 break;
             }
+            stage_end(stage_label, 1, elapsed);
             iters[i].throughput.insert = elapsed > 0.0 ? (double)opt.rows / elapsed : 0.0;
             peak = parse_memtrack_peak(output);
             if (peak > peak_heap) peak_heap = peak;
 
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_update_%s.sql", opt.profile);
-            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, COMMAND_OUTPUT_BUFFER_SIZE) || cmd_exit != 0) {
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d update", i + 1, opt.repeat);
+            stage_begin(stage_label);
+            if (!run_sql_file(&spec, cmd, opt.memtrack, &elapsed, &cmd_exit, output, output_size) || cmd_exit != 0) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "update workload failed");
                 break;
             }
-            iters[i].throughput.update = elapsed > 0.0 ? (double)opt.rows / elapsed : 0.0;
+            stage_end(stage_label, 1, elapsed);
+            iters[i].throughput.update = elapsed > 0.0 ? (double)opt.update_rows / elapsed : 0.0;
             peak = parse_memtrack_peak(output);
             if (peak > peak_heap) peak_heap = peak;
 
             snprintf(cmd, sizeof(cmd), "generated_sql/jungle_delete_%s.sql", opt.profile);
-            if (!run_sql_file(cmd, opt.memtrack, &elapsed, &cmd_exit, output, COMMAND_OUTPUT_BUFFER_SIZE)) {
+            snprintf(stage_label, sizeof(stage_label), "iteration %d/%d delete", i + 1, opt.repeat);
+            stage_begin(stage_label);
+            if (!run_sql_file(&spec, cmd, opt.memtrack, &elapsed, &cmd_exit, output, output_size)) {
+                stage_end(stage_label, 0, elapsed);
                 correctness_pass = 0;
                 snprintf(fail_reasons[fail_count++], sizeof(fail_reasons[0]), "delete workload failed to execute");
                 break;
             }
-            iters[i].throughput.delete_op = elapsed > 0.0 ? (double)opt.rows / elapsed : 0.0;
+            stage_end(stage_label, cmd_exit == 0, elapsed);
+            iters[i].throughput.delete_op = elapsed > 0.0 ? (double)opt.delete_rows / elapsed : 0.0;
             iters[i].delete_measured = (cmd_exit == 0 && !contains_token(output, "[error]"));
             if (!iters[i].delete_measured) strcpy(delete_mode, "estimated");
             peak = parse_memtrack_peak(output);
@@ -664,7 +821,7 @@ int main(int argc, char **argv) {
         time_t now = time(NULL);
         struct tm *tm_now = localtime(&now);
 #if defined(_WIN32)
-        FILE *git_pipe = popen("git rev-parse --short HEAD 2>NUL", "r");
+        FILE *git_pipe = popen("git rev-parse --short HEAD 2>nul", "r");
 #else
         FILE *git_pipe = popen("git rev-parse --short HEAD 2>/dev/null", "r");
 #endif

@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -O3 -march=native -fdiagnostics-color=always -g
+CFLAGS ?= -O2 -fdiagnostics-color=always -g
 TARGET ?= sqlsprocessor
 BENCH_GEN ?= bench_workload_generator
 BENCH_RUNNER ?= benchmark_runner
@@ -10,6 +10,10 @@ SQL ?= demo_bptree.sql
 PYTHON ?= python
 JUNGLE_DATASET ?= jungle_benchmark_users.csv
 JUNGLE_RECORDS ?= 1000000
+BENCH_SCORE_UPDATE_ROWS ?= 1000000
+BENCH_SCORE_DELETE_ROWS ?= 1000000
+BENCH_SCORE_IN_TMP ?= 1
+BENCH_EXEC_SPEC ?= bench_score_exec.conf
 
 .PHONY: all build bench-tools bench-test run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 
@@ -67,10 +71,14 @@ benchmark-jungle: $(TARGET)
 	./$(TARGET) --benchmark-jungle 1000000
 
 bench-smoke: build bench-tools
-	./$(BENCH_RUNNER) --profile smoke --seed 20260415 --repeat 3
+	./$(BENCH_RUNNER) --exec-spec $(BENCH_EXEC_SPEC) --profile smoke --seed 20260415 --repeat 3 --memtrack
 
 bench-score: build bench-tools
-	./$(BENCH_RUNNER) --profile score --seed 20260415 --repeat 1 --memtrack
+ifeq ($(BENCH_SCORE_IN_TMP),1)
+	tr -d '\r' < scripts/run_bench_score_tmp.sh | sh -s -- "$(CURDIR)" "$(BENCH_SCORE_UPDATE_ROWS)" "$(BENCH_SCORE_DELETE_ROWS)" "$(BENCH_EXEC_SPEC)"
+else
+	./$(BENCH_RUNNER) --exec-spec $(BENCH_EXEC_SPEC) --profile score --seed 20260415 --repeat 1 --update-rows $(BENCH_SCORE_UPDATE_ROWS) --delete-rows $(BENCH_SCORE_DELETE_ROWS) --memtrack
+endif
 
 bench-report: $(BENCH_RUNNER)
 	./$(BENCH_RUNNER) --report-only
