@@ -11,7 +11,7 @@
         -> TCPCmdProcessor
         -> connection별 read thread
         -> JSON line 요청 검증
-        -> CmdProcessor.submit()
+        -> DB 처리 계층으로 위임
         -> DB 구현체
         -> response callback
         -> 원래 connection으로 JSON line 응답
@@ -22,7 +22,7 @@
 - 사용자는 TCP connection을 하나 이상 열 수 있다.
 - 서버는 accepted socket 하나마다 `TCPConnection`을 만든다.
 - connection 하나에서는 여러 요청이 동시에 in-flight 상태가 될 수 있다.
-- 요청 실행은 `CmdProcessor.submit()` 뒤쪽의 구현체가 결정한다.
+- 요청 실행은 DB 처리 계층 뒤쪽의 구현체가 결정한다.
 - TCP 계층은 DB가 병렬로 실행하는지, 직렬로 실행하는지 알지 않는다.
 
 ## 2. 사용자, connection, request 구분
@@ -60,7 +60,7 @@ DOT 원본은 [diagrams/004_tcp_cmd_processor_architecture_flow.dot](./diagrams/
 
 핵심은 connection 자체가 DBMS 안으로 이동하는 것이 아니라는 점이다. `사용자 TCP connections` 블록은 서버 밖의 열린 connection들을 나타내고, `DBMS` 블록 안에는 `TCPCmdProcessor`와 `DB black box`가 있다. `TCPCmdProcessor` 내부의 `connection layer`는 사용자 connection과 1:1로 대응하는 server-side socket session을 관리하고, `metadata state`는 session 목록과 client별 제한을 보조 상태로 관리한다.
 
-이동하는 것은 connection이 아니라 request와 response다. 요청 방향에서는 session이 JSON line을 읽고, `req / res adapter`가 기본 검증과 in-flight 등록을 끝낸 뒤 `CmdRequest`와 callback context를 `CmdProcessor` 경계로 넘긴다. 응답 방향에서는 DB 처리 결과가 callback으로 돌아오고, callback context가 가리키는 원래 session에 JSON line 응답을 쓴다.
+이동하는 것은 connection이 아니라 request와 response다. 요청 방향에서는 session이 JSON line을 읽고, `req / res adapter`가 기본 검증과 in-flight 등록을 끝낸 뒤 `CmdRequest`와 callback context를 함께 실어 DB 처리 계층으로 넘긴다. 응답 방향에서는 DB 처리 결과가 callback으로 돌아오고, callback context가 가리키는 원래 session에 JSON line 응답을 쓴다.
 
 | 영역 | 책임 |
 | --- | --- |

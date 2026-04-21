@@ -1,10 +1,11 @@
 digraph TcpCmdProcessor {
     graph [
-        rankdir=LR,
+        rankdir=TB,
         compound=true,
         nodesep=0.65,
         ranksep=1.0,
-        splines=ortho,
+        splines=line,
+        newrank=true,
         pad=0.2,
         bgcolor="transparent"
     ];
@@ -34,9 +35,6 @@ digraph TcpCmdProcessor {
         fontname="Pretendard";
         fontsize=13;
         margin=18;
-
-        { rank=same; user_a1; user_a2; user_b1; }
-
         user_a1 [label="A-1"];
         user_a2 [label="A-2"];
         user_b1 [label="B-1"];
@@ -68,9 +66,6 @@ digraph TcpCmdProcessor {
                 fontname="Pretendard";
                 fontsize=12;
                 margin=14;
-
-                { rank=same; tcp_a1; tcp_a2; tcp_b1; }
-
                 tcp_a1 [label="socket A-1"];
                 tcp_a2 [label="socket A-2"];
                 tcp_b1 [label="socket B-1"];
@@ -86,7 +81,6 @@ digraph TcpCmdProcessor {
                 margin=14;
 
                 req [label="request"];
-                callback_context [label="context"];
                 res [label="response"];
             }
 
@@ -98,6 +92,8 @@ digraph TcpCmdProcessor {
                 fontname="Pretendard";
                 fontsize=12;
                 margin=14;
+
+                { rank=same; connection_list; client_counters; in_flight_ids; }
 
                 connection_list [label="connections"];
                 client_counters [label="client counters"];
@@ -118,6 +114,16 @@ digraph TcpCmdProcessor {
         }
     }
 
+    { rank=same; user_a1; tcp_a1; res; }
+    { rank=same; user_a2; tcp_a2; req; db_black_box; }
+    { rank=same; user_b1; tcp_b1; }
+
+    user_a1 -> user_a2 -> user_b1 [style=invis, weight=30];
+    tcp_a1 -> tcp_a2 -> tcp_b1 [style=invis, weight=30];
+    connection_list -> tcp_a1 [style=invis, weight=30];
+    client_counters -> req [style=invis, weight=30];
+    in_flight_ids -> db_black_box [style=invis, weight=30];
+
     user_a1 -> tcp_a1 [dir=both, weight=10];
     user_a2 -> tcp_a2 [dir=both, weight=10];
     user_b1 -> tcp_b1 [dir=both, weight=10];
@@ -126,8 +132,7 @@ digraph TcpCmdProcessor {
     tcp_a2 -> req [weight=10];
     tcp_b1 -> req [weight=10];
 
-    req -> callback_context;
-    callback_context -> db_black_box [xlabel="submit"];
+    req -> db_black_box [label="delegate request\nCmdRequest + callback context", weight=10];
 
     db_black_box -> res [style=dashed, xlabel="callback", constraint=false];
     res -> tcp_a1 [style=dashed, constraint=false];
