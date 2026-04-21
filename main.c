@@ -102,6 +102,19 @@ static void bench_memtrack_report(void) {
 #define free(ptr) bench_free(ptr)
 #endif
 
+static void configure_console_encoding(void);
+static void copy_trimmed(char *dst, size_t dst_size, const char *start, const char *end);
+static int starts_with_keyword(const char *text, const char *keyword);
+static const char *skip_utf8_bom_and_space(const char *sql);
+static void dispatch_statement(const Statement *stmt);
+static int parse_fast_insert_sql(const char *sql);
+static int parse_fast_update_sql(const char *sql);
+static int parse_fast_delete_sql(const char *sql);
+static int try_execute_fast_sql(const char *sql);
+static void execute_sql_text(const char *sql);
+static int flush_sql_buffer(char *sql_buffer, int *length, int *too_long);
+static int execute_sql_file(const char *filename);
+
 static void configure_console_encoding(void) {
 #if defined(_WIN32)
     SetConsoleOutputCP(CP_UTF8);
@@ -125,112 +138,234 @@ static void copy_trimmed(char *dst, size_t dst_size, const char *start, const ch
     dst[len] = '\0';
 }
 
-static int starts_with_keyword(const char *s, const char *kw) {
-    size_t len = strlen(kw);
-    return strncmp(s, kw, len) == 0 && (s[len] == '\0' || isspace((unsigned char)s[len]));
+static int starts_with_keyword(const char *text, const char *keyword) {
+    size_t length = strlen(keyword);
+
+    return strncmp(text, keyword, length) == 0 &&
+           (text[length] == '\0' || isspace((unsigned char)text[length]));
 }
 
-static int try_execute_fast_sql(const char *s) {
+static const char *skip_utf8_bom_and_space(const char *sql) {
+    if ((unsigned char)sql[0] == 0xEF &&
+        (unsigned char)sql[1] == 0xBB &&
+        (unsigned char)sql[2] == 0xBF) {
+        sql += 3;
+    }
+
+    while (isspace((unsigned char)*sql)) sql++;
+    return sql;
+}
+
+static void dispatch_statement(const Statement *stmt) {
+    switch (stmt->type) {
+        case STMT_INSERT:
+            execute_insert((Statement *)stmt);
+            return;
+        case STMT_SELECT:
+            execute_select((Statement *)stmt);
+            return;
+        case STMT_DELETE:
+            execute_delete((Statement *)stmt);
+            return;
+        case STMT_UPDATE:
+            execute_update((Statement *)stmt);
+            return;
+        default:
+            return;
+    }
+}
+
+static int parse_fast_insert_sql(const char *sql) {
     const char *p;
     const char *values_kw;
+    const char *close_paren;
+    char table[256];
+    char values[MAX_SQL_LEN];
+
+    if (!starts_with_keyword(sql, "INSERT")) return 0;
+
+    p = strstr(sql, "INTO");
+    if (!p) return 0;
+    p += 4;
+
+    while (isspace((unsigned char)*p)) p++;
+    values_kw = strstr(p, "VALUES");
+    if (!values_kw) return 0;
+
+    copy_trimmed(table, sizeof(table), p, values_kw);
+    p = strchr(values_kw, '(');
+    close_paren = strrchr(values_kw, ')');
+    if (!p || !close_paren || close_paren <= p) return 0;
+
+    copy_trimmed(values, sizeof(values), p + 1, close_paren);
+    return execute_insert_values_fast(table, values);
+}
+
+static int parse_fast_update_sql(const char *sql) {
+    const char *cursor;
     const char *set_kw;
     const char *where_kw;
     const char *eq;
     char table[256];
-    char col[50];
+    char column[50];
     char value[256];
     char id_value[64];
 
-    if (starts_with_keyword(s, "INSERT")) {
-        const char *q;
-        char values[MAX_SQL_LEN];
+    if (!starts_with_keyword(sql, "UPDATE")) return 0;
 
-        p = strstr(s, "INTO");
-        if (!p) return 0;
-        p += 4;
-        while (isspace((unsigned char)*p)) p++;
-        values_kw = strstr(p, "VALUES");
-        if (!values_kw) return 0;
-        copy_trimmed(table, sizeof(table), p, values_kw);
-        p = strchr(values_kw, '(');
-        q = strrchr(values_kw, ')');
-        if (!p || !q || q <= p) return 0;
-        copy_trimmed(values, sizeof(values), p + 1, q);
-        return execute_insert_values_fast(table, values);
+    cursor = sql + 6;
+    while (isspace((unsigned char)*cursor)) cursor++;
+
+    set_kw = strstr(cursor, "SET");
+    where_kw = strstr(cursor, "WHERE");
+    if (!set_kw || !where_kw || where_kw <= set_kw) return 0;
+
+    copy_trimmed(table, sizeof(table), cursor, set_kw);
+    cursor = set_kw + 3;
+    eq = strchr(cursor, '=');
+    if (!eq || eq > where_kw) return 0;
+
+    copy_trimmed(column, sizeof(column), cursor, eq);
+    copy_trimmed(value, sizeof(value), eq + 1, where_kw);
+
+    cursor = where_kw + 5;
+    while (isspace((unsigned char)*cursor)) cursor++;
+    if (strncmp(cursor, "id", 2) != 0 ||
+        !(cursor[2] == '\0' || isspace((unsigned char)cursor[2]) || cursor[2] == '=')) {
+        return 0;
     }
 
-    if (starts_with_keyword(s, "UPDATE")) {
-        p = s + 6;
-        while (isspace((unsigned char)*p)) p++;
-        set_kw = strstr(p, "SET");
-        where_kw = strstr(p, "WHERE");
-        if (!set_kw || !where_kw || where_kw <= set_kw) return 0;
-        copy_trimmed(table, sizeof(table), p, set_kw);
-        p = set_kw + 3;
-        eq = strchr(p, '=');
-        if (!eq || eq > where_kw) return 0;
-        copy_trimmed(col, sizeof(col), p, eq);
-        copy_trimmed(value, sizeof(value), eq + 1, where_kw);
-        p = where_kw + 5;
-        while (isspace((unsigned char)*p)) p++;
-        if (strncmp(p, "id", 2) != 0 || !(p[2] == '\0' || isspace((unsigned char)p[2]) || p[2] == '=')) return 0;
-        eq = strchr(p, '=');
-        if (!eq) return 0;
-        copy_trimmed(id_value, sizeof(id_value), eq + 1, s + strlen(s));
-        return execute_update_id_fast(table, col, value, id_value);
+    eq = strchr(cursor, '=');
+    if (!eq) return 0;
+
+    copy_trimmed(id_value, sizeof(id_value), eq + 1, sql + strlen(sql));
+    return execute_update_id_fast(table, column, value, id_value);
+}
+
+static int parse_fast_delete_sql(const char *sql) {
+    const char *from_kw;
+    const char *where_kw;
+    const char *cursor;
+    const char *eq;
+    char table[256];
+    char id_value[64];
+
+    if (!starts_with_keyword(sql, "DELETE")) return 0;
+
+    from_kw = strstr(sql, "FROM");
+    where_kw = strstr(sql, "WHERE");
+    if (!from_kw || !where_kw || where_kw <= from_kw) return 0;
+
+    cursor = from_kw + 4;
+    copy_trimmed(table, sizeof(table), cursor, where_kw);
+
+    cursor = where_kw + 5;
+    while (isspace((unsigned char)*cursor)) cursor++;
+    if (strncmp(cursor, "id", 2) != 0 ||
+        !(cursor[2] == '\0' || isspace((unsigned char)cursor[2]) || cursor[2] == '=')) {
+        return 0;
     }
 
-    if (starts_with_keyword(s, "DELETE")) {
-        p = strstr(s, "FROM");
-        where_kw = strstr(s, "WHERE");
-        if (!p || !where_kw || where_kw <= p) return 0;
-        p += 4;
-        copy_trimmed(table, sizeof(table), p, where_kw);
-        p = where_kw + 5;
-        while (isspace((unsigned char)*p)) p++;
-        if (strncmp(p, "id", 2) != 0 || !(p[2] == '\0' || isspace((unsigned char)p[2]) || p[2] == '=')) return 0;
-        eq = strchr(p, '=');
-        if (!eq) return 0;
-        copy_trimmed(id_value, sizeof(id_value), eq + 1, s + strlen(s));
-        return execute_delete_id_fast(table, id_value);
-    }
+    eq = strchr(cursor, '=');
+    if (!eq) return 0;
+
+    copy_trimmed(id_value, sizeof(id_value), eq + 1, sql + strlen(sql));
+    return execute_delete_id_fast(table, id_value);
+}
+
+static int try_execute_fast_sql(const char *sql) {
+    if (parse_fast_insert_sql(sql)) return 1;
+    if (parse_fast_update_sql(sql)) return 1;
+    if (parse_fast_delete_sql(sql)) return 1;
 
     return 0;
 }
 
 static void execute_sql_text(const char *sql) {
     Statement stmt;
-    const char *s = sql;
+    const char *normalized_sql = skip_utf8_bom_and_space(sql);
 
-    if ((unsigned char)s[0] == 0xEF &&
-        (unsigned char)s[1] == 0xBB &&
-        (unsigned char)s[2] == 0xBF) {
-        s += 3;
+    if (*normalized_sql == '\0') return;
+    if (try_execute_fast_sql(normalized_sql)) return;
+
+    if (!parse_statement(normalized_sql, &stmt)) {
+        printf("[오류] 잘못된 SQL 문장입니다: %s\n", normalized_sql);
+        return;
     }
-    while (isspace((unsigned char)*s)) s++;
-    if (*s == '\0') return;
 
-    if (try_execute_fast_sql(s)) return;
+    dispatch_statement(&stmt);
+}
 
-    if (parse_statement(s, &stmt)) {
-        if (stmt.type == STMT_INSERT) execute_insert(&stmt);
-        else if (stmt.type == STMT_SELECT) execute_select(&stmt);
-        else if (stmt.type == STMT_DELETE) execute_delete(&stmt);
-        else if (stmt.type == STMT_UPDATE) execute_update(&stmt);
-    } else {
-        printf("[오류] 잘못된 SQL 문장입니다: %s\n", s);
+static int flush_sql_buffer(char *sql_buffer, int *length, int *too_long) {
+    sql_buffer[*length] = '\0';
+
+    if (*too_long) {
+        printf("[오류] SQL 문장이 너무 깁니다. 최대 길이=%d\n", MAX_SQL_LEN - 1);
+        *length = 0;
+        *too_long = 0;
+        return 0;
     }
+
+    execute_sql_text(sql_buffer);
+    *length = 0;
+    *too_long = 0;
+    return 1;
+}
+
+static int execute_sql_file(const char *filename) {
+    FILE *file = fopen(filename, "r");
+    char sql_buffer[MAX_SQL_LEN];
+    char line[MAX_SQL_LEN];
+    int buffer_length = 0;
+    int in_quote = 0;
+    int too_long = 0;
+
+    if (!file) {
+        printf("[오류] '%s' 파일을 열 수 없습니다.\n", filename);
+        return 1;
+    }
+
+    while (fgets(line, sizeof(line), file)) {
+        char *cursor = line;
+
+        if (!in_quote) {
+            while (isspace((unsigned char)*cursor)) cursor++;
+            if (cursor[0] == '-' && cursor[1] == '-') continue;
+        }
+
+        for (; *cursor; cursor++) {
+            if (*cursor == '\'') in_quote = !in_quote;
+
+            if (*cursor == ';' && !in_quote) {
+                flush_sql_buffer(sql_buffer, &buffer_length, &too_long);
+                continue;
+            }
+
+            if (buffer_length < MAX_SQL_LEN - 1) {
+                sql_buffer[buffer_length++] = *cursor;
+            } else {
+                too_long = 1;
+            }
+        }
+    }
+
+    if (buffer_length > 0) {
+        flush_sql_buffer(sql_buffer, &buffer_length, &too_long);
+    }
+
+    fclose(file);
+    return 0;
 }
 
 /* SQL 파일에서 ';'로 구분되는 SQL 문장을 순서대로 실행합니다. */
 int main(int argc, char *argv[]) {
+    char filename[256];
+    int argi = 1;
+
     configure_console_encoding();
 #if defined(BENCH_MEMTRACK)
     atexit(bench_memtrack_report);
 #endif
-
-    char filename[256];
-    int argi = 1;
 
     if (argi < argc && strcmp(argv[argi], "--quiet") == 0) {
         set_executor_quiet(1);
@@ -263,58 +398,8 @@ int main(int argc, char *argv[]) {
         if (scanf("%255s", filename) != 1) return 1;
     }
 
-    FILE *f = fopen(filename, "r");
-    if (!f) {
-        printf("[오류] '%s' 파일을 열 수 없습니다.\n", filename);
-        return 1;
-    }
-
-    char buf[MAX_SQL_LEN];
-    char line[MAX_SQL_LEN];
-    int idx = 0;
-    int q = 0;
-    int too_long = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        char *p = line;
-
-        if (!q) {
-            while (isspace((unsigned char)*p)) p++;
-            if (p[0] == '-' && p[1] == '-') continue;
-        }
-
-        for (; *p; p++) {
-            if (*p == '\'') q = !q;
-
-            if (*p == ';' && !q) {
-                buf[idx] = '\0';
-                if (too_long) {
-                    printf("[오류] SQL 문장이 너무 깁니다. 최대 길이=%d\n", MAX_SQL_LEN - 1);
-                } else {
-                    execute_sql_text(buf);
-                }
-                idx = 0;
-                too_long = 0;
-            } else if (idx < MAX_SQL_LEN - 1) {
-                buf[idx++] = *p;
-            } else {
-                too_long = 1;
-            }
-        }
-    }
-
-    if (idx > 0) {
-        buf[idx] = '\0';
-        if (too_long) {
-            printf("[오류] SQL 문장이 너무 깁니다. 최대 길이=%d\n", MAX_SQL_LEN - 1);
-        } else {
-            execute_sql_text(buf);
-        }
-    }
-
-    fclose(f);
+    if (execute_sql_file(filename) != 0) return 1;
     close_all_tables();
-
     return 0;
 }
 
