@@ -5,9 +5,11 @@ BENCH_GEN ?= bench_workload_generator
 BENCH_RUNNER ?= benchmark_runner
 BENCH_TEST ?= bench_formula_test
 CMD_PROCESSOR_TEST ?= cmd_processor_test
+CMD_PROCESSOR_DIR = cmd_processor
 SRC = main.c
 SRC_DEPS = main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c bench_memtrack.h jungle_benchmark.h lexer.h parser.h bptree.h executor.h types.h sqlsprocessor_bundle.h
-CMD_PROCESSOR_TEST_SRC = cmd_processor_test.c cmd_processor.c mock_cmd_processor.c
+CMD_PROCESSOR_TEST_SRC = $(CMD_PROCESSOR_DIR)/cmd_processor_test.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/mock_cmd_processor.c
+CMD_PROCESSOR_TEST_DEPS = $(CMD_PROCESSOR_TEST_SRC) $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/mock_cmd_processor.h
 CMD_PROCESSOR_TEST_RUN = $(if $(filter /%,$(CMD_PROCESSOR_TEST)),$(CMD_PROCESSOR_TEST),./$(CMD_PROCESSOR_TEST))
 SQL ?= demo_bptree.sql
 PYTHON ?= python
@@ -41,8 +43,8 @@ $(BENCH_TEST): bench_formula_test.c
 bench-test: $(BENCH_TEST)
 	./$(BENCH_TEST)
 
-$(CMD_PROCESSOR_TEST): cmd_processor_test.c cmd_processor.c cmd_processor.h mock_cmd_processor.c mock_cmd_processor.h
-	$(CC) $(CFLAGS) $(CMD_PROCESSOR_TEST_SRC) -o $(CMD_PROCESSOR_TEST) -pthread
+$(CMD_PROCESSOR_TEST): $(CMD_PROCESSOR_TEST_DEPS)
+	$(CC) $(CFLAGS) -I$(CMD_PROCESSOR_DIR) $(CMD_PROCESSOR_TEST_SRC) -o $(CMD_PROCESSOR_TEST) -pthread
 
 test-cmd-processor: $(CMD_PROCESSOR_TEST)
 	$(CMD_PROCESSOR_TEST_RUN)
