@@ -1,0 +1,97 @@
+digraph TcpCmdProcessorStateLifecycle {
+    graph [
+        rankdir=LR,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.85,
+        splines=line,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_tcp {
+        label="TCPCmdProcessor state";
+        style="rounded,filled";
+        color="#93c5fd";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        server_fields [label="listen_fd / actual_port\nstopping / active_clients\nprocessor*"];
+        connections [label="connections\nTCPConnection linked list"];
+        counters [label="client_counters\nTCPClientCounter linked list"];
+    }
+
+    subgraph cluster_connection {
+        label="TCPConnection state";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        conn_fields [label="client_fd / client_key\nclosing / ref_count\nstate_mutex / write_mutex"];
+        inflight [label="inflight_ids\nid linked list"];
+        inflight_count [label="inflight_count"];
+    }
+
+    subgraph cluster_request {
+        label="request lifecycle";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        json [label="JSON line\n{id, op, sql}"];
+        parse [label="parse + validate\nid/op/sql"];
+        register [label="register_inflight()\n중복/limit 검사"];
+        acquire [label="cmd_processor_acquire_request()"];
+        set_request [label="set_sql_request()\nor set_ping_request()"];
+        submit [label="cmd_processor_submit()\ncallback user_data=connection"];
+        callback [label="tcp_response_callback()"];
+        write [label="write_json_line()\nwrite_mutex"];
+        remove [label="remove_inflight()\ncount 감소"];
+        release [label="release response/request\nconnection_release()"];
+    }
+
+    cmd [label="CmdProcessor 구현체\nEngine / REPL / Mock", fillcolor="#ffffff", color="#64748b"];
+
+    server_fields -> connections;
+    server_fields -> counters;
+    connections -> conn_fields;
+    conn_fields -> inflight;
+    conn_fields -> inflight_count;
+
+    json -> parse -> register -> acquire -> set_request -> submit -> cmd;
+    register -> inflight [label="id 추가", lhead=cluster_connection];
+    register -> inflight_count [label="+1"];
+    register -> counters [label="client inflight +1", lhead=cluster_tcp];
+    cmd -> callback [label="response callback"];
+    callback -> write;
+    callback -> remove;
+    remove -> inflight [label="id 제거"];
+    remove -> inflight_count [label="-1"];
+    remove -> counters [label="client inflight -1"];
+    write -> release;
+}

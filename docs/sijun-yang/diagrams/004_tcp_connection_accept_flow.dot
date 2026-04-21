@@ -1,0 +1,53 @@
+digraph TcpConnectionAcceptFlow {
+    graph [
+        rankdir=TB,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.65,
+        splines=line,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    client [label="client\nconnect()"];
+    accept [label="accept_thread\naccept(listen_fd)"];
+    key [label="make_client_key()\nIP address -> client_key"];
+    reserve [label="reserve_connection_slot()\nserver mutex"];
+    check [shape=diamond, label="connection limit\n통과?"];
+    reject [label="close(client_fd)\nconnection 거절", fillcolor="#fff1f2", color="#fda4af"];
+    timeout [label="set_socket_timeouts()\nread/write timeout"];
+    create [label="create_connection()\nTCPConnection 할당"];
+    fields [label="TCPConnection\nclient_fd, client_key\nstate/write mutex\nref_count=1\ninflight_ids=NULL"];
+    list [label="server->connections\nlinked list에 추가"];
+    thread [label="pthread_create()\nconnection_thread_main"];
+    read_loop [label="read_json_line()\nnewline 단위 JSON 반복 처리"];
+
+    client -> accept;
+    accept -> key;
+    key -> reserve;
+    reserve -> check;
+    check -> reject [label="no"];
+    check -> timeout [label="yes"];
+    timeout -> create;
+    create -> fields;
+    fields -> list;
+    list -> thread;
+    thread -> read_loop;
+}

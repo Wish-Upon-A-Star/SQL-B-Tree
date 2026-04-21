@@ -1,0 +1,135 @@
+digraph ReplCmdProcessorStructure {
+    graph [
+        rankdir=TB,
+        compound=true,
+        nodesep=0.65,
+        ranksep=0.9,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.12,0.08"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_users {
+        label="REPL frontend";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        console [label="console\ninput / output"];
+        repl_loop [label="REPL loop\nprompt + SQL assembly"];
+    }
+
+    subgraph cluster_dbms {
+        label="DBMS";
+        style="rounded,filled";
+        color="#94a3b8";
+        fillcolor="#f1f5f9";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=20;
+
+        subgraph cluster_repl {
+            label="REPLCmdProcessor";
+            style="rounded,filled";
+            color="#93c5fd";
+            fillcolor="#eff6ff";
+            fontname="Pretendard";
+            fontsize=13;
+            margin=18;
+
+            subgraph cluster_adapter {
+                label="req / res adapter";
+                style="rounded,filled";
+                color="#bae6fd";
+                fillcolor="#ffffff";
+                fontname="Pretendard";
+                fontsize=12;
+                margin=14;
+
+                res [label="CmdResponse"];
+                req [label="CmdRequest"];
+            }
+
+            subgraph cluster_execution {
+                label="sync execution";
+                style="rounded,filled";
+                color="#bfdbfe";
+                fillcolor="#ffffff";
+                fontname="Pretendard";
+                fontsize=12;
+                margin=14;
+
+                execute [label="command execution\nping / SQL"];
+            }
+
+            subgraph cluster_state {
+                label="processor-owned state";
+                style="rounded,filled";
+                color="#cbd5e1";
+                fillcolor="#ffffff";
+                fontname="Pretendard";
+                fontsize=12;
+                margin=14;
+
+                { rank=same; request_slots; response_slots; mutex; }
+
+                request_slots [label="request slot pool"];
+                response_slots [label="response slot pool"];
+                mutex [label="processor mutex"];
+            }
+        }
+
+        subgraph cluster_db {
+            label="DB";
+            style="rounded,filled";
+            color="#cbd5e1";
+            fillcolor="#ffffff";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            db_black_box [label="BlackBox"];
+        }
+    }
+
+    { rank=same; console; res; }
+    { rank=same; repl_loop; req; execute; db_black_box; }
+    { rank=same; request_slots; response_slots; mutex; }
+
+    res -> req [style=invis, weight=30];
+    req -> request_slots [style=invis, weight=30];
+    execute -> mutex [style=invis, weight=30];
+    response_slots -> mutex [style=invis, weight=30];
+
+    console -> repl_loop [label="콘솔 입출력", dir=both, weight=10];
+    repl_loop -> req [weight=10];
+    req -> execute [label="요청 제출", weight=10];
+    execute -> db_black_box [label="실행\n동기 반환", dir=both, weight=10];
+    execute -> res [style=dashed, constraint=false];
+    res -> repl_loop [style=dashed, constraint=false];
+
+    req -> request_slots [style=dotted, arrowhead=none, constraint=false];
+    res -> response_slots [style=dotted, arrowhead=none, constraint=false];
+    execute -> mutex [style=dotted, arrowhead=none, constraint=false];
+}

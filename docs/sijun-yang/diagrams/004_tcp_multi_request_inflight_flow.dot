@@ -1,0 +1,90 @@
+digraph TcpMultiRequestInflightFlow {
+    graph [
+        rankdir=TB,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.65,
+        splines=ortho,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_client {
+        label="client";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=14;
+
+        send_r1 [label="send r1\nsql delay"];
+        send_r2 [label="send r2\nsql fast"];
+        recv_r2 [label="receive response\nid=r2"];
+        recv_r1 [label="receive response\nid=r1"];
+    }
+
+    subgraph cluster_tcp {
+        label="TCPConnection";
+        style="rounded,filled";
+        color="#93c5fd";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=14;
+
+        read_r1 [label="read JSON line r1"];
+        add_r1 [label="inflight_ids\n[r1]"];
+        submit_r1 [label="submit r1"];
+        read_r2 [label="read JSON line r2"];
+        add_r2 [label="inflight_ids\n[r2, r1]"];
+        submit_r2 [label="submit r2"];
+        write_r2 [label="write response r2\nremove r2"];
+        left_r1 [label="inflight_ids\n[r1]"];
+        write_r1 [label="write response r1\nremove r1"];
+        empty [label="inflight_ids\n[]"];
+    }
+
+    subgraph cluster_processor {
+        label="CmdProcessor";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=14;
+
+        run_r1 [label="r1 처리 중\n느린 요청"];
+        run_r2 [label="r2 처리\n빠른 요청"];
+        cb_r2 [label="callback r2 먼저"];
+        cb_r1 [label="callback r1 나중"];
+    }
+
+    note [label="응답 순서는 완료 순서\n클라이언트는 id로 매칭", fillcolor="#fefce8", color="#facc15"];
+
+    send_r1 -> read_r1 -> add_r1 -> submit_r1 -> run_r1;
+    send_r2 -> read_r2 -> add_r2 -> submit_r2 -> run_r2;
+    run_r2 -> cb_r2 -> write_r2 -> recv_r2;
+    write_r2 -> left_r1;
+    run_r1 -> cb_r1 -> write_r1 -> recv_r1;
+    write_r1 -> empty;
+    note -> recv_r2 [style=dashed, constraint=false];
+    note -> recv_r1 [style=dashed, constraint=false];
+}

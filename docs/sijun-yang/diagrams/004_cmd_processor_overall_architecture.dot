@@ -1,0 +1,112 @@
+digraph CmdProcessorOverallArchitecture {
+    graph [
+        rankdir=LR,
+        compound=true,
+        nodesep=0.65,
+        ranksep=0.9,
+        splines=line,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_frontends {
+        label="외부 진입점";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        tcp [label="TCP clients\nJSON line"];
+        tcp_adapter [label="TCPCmdProcessor\nJSONL <-> CmdRequest"];
+        cli [label="CLI / file 실행\nmain.c"];
+        sync_bridge [label="submit_sync bridge\ncallback -> blocking wait"];
+        tests [label="tests"];
+    }
+
+    subgraph cluster_contract {
+        label="공통 계약";
+        style="rounded,filled";
+        color="#93c5fd";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        api [label="CmdProcessor interface\nacquire / set / submit\ncallback / release", fillcolor="#ffffff"];
+        request [label="CmdRequest\nid + type + sql"];
+        response [label="CmdResponse\nstatus + body + counts"];
+    }
+
+    subgraph cluster_impls {
+        label="CmdProcessor 구현체";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        engine [label="EngineCmdProcessor\nslots + queues + workers"];
+        repl [label="REPLCmdProcessor\nsync SQL eval"];
+        mock [label="MockCmdProcessor\ncontract tests"];
+    }
+
+    subgraph cluster_db {
+        label="DB 실행 계층";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#ffffff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        planner [label="planner cache\nroute + lock plan"];
+        locks [label="lock manager\nread / write lock"];
+        parser [label="parser\nparse_statement()"];
+        executor [label="executor\nexecutor_execute_statement()"];
+        storage [label="tables / B+Tree\nCSV + delta + index"];
+    }
+
+    tcp -> tcp_adapter;
+    tcp_adapter -> api [label="CmdRequest + callback", ltail=cluster_frontends, lhead=cluster_contract];
+    cli -> sync_bridge;
+    sync_bridge -> api [label="submit_sync"];
+    tests -> api;
+
+    api -> request;
+    api -> response;
+    request -> engine [label="vtable dispatch", ltail=cluster_contract, lhead=cluster_impls];
+    request -> repl [label="vtable dispatch"];
+    request -> mock [label="vtable dispatch"];
+
+    engine -> planner [label="SQL plan", ltail=cluster_impls, lhead=cluster_db];
+    planner -> locks;
+    locks -> parser;
+    repl -> parser [label="sql_repl_eval()", ltail=cluster_impls, lhead=cluster_db];
+    parser -> executor;
+    executor -> storage [dir=both];
+
+    executor -> response [label="CmdResponse", ltail=cluster_db, lhead=cluster_contract];
+    response -> tcp_adapter [label="callback"];
+    response -> sync_bridge [label="callback"];
+    response -> tests [label="callback"];
+}
