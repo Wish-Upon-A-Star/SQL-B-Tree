@@ -2,8 +2,8 @@ digraph TcpCmdProcessorStateLifecycle {
     graph [
         rankdir=TB,
         compound=true,
-        nodesep=0.55,
-        ranksep=0.75,
+        nodesep=0.5,
+        ranksep=0.65,
         splines=line,
         newrank=true,
         pad=0.2,
@@ -17,7 +17,7 @@ digraph TcpCmdProcessorStateLifecycle {
         color="#64748b",
         fontname="Pretendard",
         fontsize=11,
-        margin="0.14,0.09"
+        margin="0.10,0.07"
     ];
 
     edge [
@@ -27,25 +27,8 @@ digraph TcpCmdProcessorStateLifecycle {
         arrowsize=0.7
     ];
 
-    subgraph cluster_lifecycle {
-        label="request / response lifecycle";
-        style="rounded,filled";
-        color="#94a3b8";
-        fillcolor="#f8fafc";
-        fontname="Pretendard";
-        fontsize=13;
-        margin=18;
-
-        read_validate [label="JSON line\nread + validate"];
-        register [label="in-flight 등록\n중복 / limit 검사"];
-        submit [label="CmdRequest 생성\nCmdProcessor 제출"];
-        processor [label="CmdProcessor 구현체\nEngine / REPL / Mock"];
-        callback [label="response callback"];
-        write_cleanup [label="JSON 응답 write\nin-flight 제거\nrequest/response release"];
-    }
-
-    subgraph cluster_server_state {
-        label="TCPCmdProcessor state";
+    subgraph cluster_server {
+        label="TCPCmdProcessor: TCP 서버 / client connection 관리";
         style="rounded,filled";
         color="#93c5fd";
         fillcolor="#eff6ff";
@@ -53,32 +36,172 @@ digraph TcpCmdProcessorStateLifecycle {
         fontsize=13;
         margin=18;
 
-        server_state [label="listen fd / port\nconnections\nclient counters\nprocessor pointer"];
+        server_state [
+            shape=plain,
+            label=<
+                <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                    <TR><TD BGCOLOR="#dbeafe"><B>server state</B></TD></TR>
+                    <TR><TD>listen_fd</TD></TR>
+                    <TR><TD>actual_port</TD></TR>
+                    <TR><TD>stopping</TD></TR>
+                    <TR><TD>active_clients</TD></TR>
+                </TABLE>
+            >
+        ];
+
+        processor_ref [
+            label="processor*\nCmdProcessor BlackBox 참조",
+            fillcolor="#f0f9ff",
+            color="#7dd3fc"
+        ];
+
+        subgraph cluster_connections {
+            label="connections: accept된 TCPConnection linked list";
+            style="rounded,filled";
+            color="#bfdbfe";
+            fillcolor="#ffffff";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            conn_head [label="head"];
+            conn_a [
+                shape=plain,
+                label=<
+                    <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                        <TR><TD BGCOLOR="#f8fafc"><B>TCPConnection A</B></TD></TR>
+                        <TR><TD>client_fd</TD></TR>
+                        <TR><TD>client_key</TD></TR>
+                        <TR><TD>inflight_count = 2</TD></TR>
+                        <TR><TD>ref_count</TD></TR>
+                        <TR><TD>next</TD></TR>
+                    </TABLE>
+                >
+            ];
+            conn_b [
+                shape=plain,
+                label=<
+                    <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                        <TR><TD BGCOLOR="#f8fafc"><B>TCPConnection B</B></TD></TR>
+                        <TR><TD>client_fd</TD></TR>
+                        <TR><TD>client_key</TD></TR>
+                        <TR><TD>inflight_count = 1</TD></TR>
+                        <TR><TD>ref_count</TD></TR>
+                        <TR><TD>next</TD></TR>
+                    </TABLE>
+                >
+            ];
+            conn_null [label="NULL", shape=plaintext, fillcolor="transparent", color="transparent"];
+        }
+
+        subgraph cluster_connection_detail {
+            label="TCPConnection A 상세 상태";
+            style="rounded,filled";
+            color="#cbd5e1";
+            fillcolor="#f8fafc";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            conn_state [
+                shape=plain,
+                label=<
+                    <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                        <TR><TD BGCOLOR="#f8fafc"><B>connection state</B></TD></TR>
+                        <TR><TD>client_fd</TD></TR>
+                        <TR><TD>client_key</TD></TR>
+                        <TR><TD>closing</TD></TR>
+                        <TR><TD>state_mutex</TD></TR>
+                        <TR><TD>write_mutex</TD></TR>
+                    </TABLE>
+                >
+            ];
+
+            subgraph cluster_inflight {
+                label="inflight_ids";
+                style="rounded,filled";
+                color="#cbd5e1";
+                fillcolor="#ffffff";
+                fontname="Pretendard";
+                fontsize=12;
+                margin=12;
+
+                inflight_head [label="head"];
+                inflight_r2 [
+                    shape=plain,
+                    label=<
+                        <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                            <TR><TD BGCOLOR="#dbeafe"><B>TCPInflightId</B></TD></TR>
+                            <TR><TD>id = r2</TD></TR>
+                            <TR><TD>next</TD></TR>
+                        </TABLE>
+                    >
+                ];
+                inflight_r1 [
+                    shape=plain,
+                    label=<
+                        <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                            <TR><TD BGCOLOR="#dbeafe"><B>TCPInflightId</B></TD></TR>
+                            <TR><TD>id = r1</TD></TR>
+                            <TR><TD>next</TD></TR>
+                        </TABLE>
+                    >
+                ];
+                inflight_null [label="NULL", shape=plaintext, fillcolor="transparent", color="transparent"];
+            }
+        }
+
+        subgraph cluster_counters {
+            label="client_counters: client별 connection / in-flight 제한";
+            style="rounded,filled";
+            color="#bae6fd";
+            fillcolor="#ffffff";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            counter_head [label="head"];
+            counter_a [
+                shape=plain,
+                label=<
+                    <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                        <TR><TD BGCOLOR="#f8fafc"><B>TCPClientCounter A</B></TD></TR>
+                        <TR><TD>key</TD></TR>
+                        <TR><TD>connection_count</TD></TR>
+                        <TR><TD>inflight_count = 2</TD></TR>
+                        <TR><TD>next</TD></TR>
+                    </TABLE>
+                >
+            ];
+            counter_b [
+                shape=plain,
+                label=<
+                    <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                        <TR><TD BGCOLOR="#f8fafc"><B>TCPClientCounter B</B></TD></TR>
+                        <TR><TD>key</TD></TR>
+                        <TR><TD>connection_count</TD></TR>
+                        <TR><TD>inflight_count = 1</TD></TR>
+                        <TR><TD>next</TD></TR>
+                    </TABLE>
+                >
+            ];
+            counter_null [label="NULL", shape=plaintext, fillcolor="transparent", color="transparent"];
+        }
     }
 
-    subgraph cluster_connection_state {
-        label="TCPConnection state";
-        style="rounded,filled";
-        color="#bae6fd";
-        fillcolor="#f0f9ff";
-        fontname="Pretendard";
-        fontsize=13;
-        margin=18;
+    { rank=same; server_state; processor_ref; }
+    { rank=same; conn_head; conn_a; conn_b; conn_null; }
+    { rank=same; conn_state; counter_head; counter_a; counter_b; counter_null; }
+    { rank=same; inflight_head; inflight_r2; inflight_r1; inflight_null; }
 
-        connection_state [label="client fd / client key\nin-flight ids\nwrite mutex\nref count"];
-    }
+    server_state -> conn_head [style=invis, weight=30];
+    processor_ref -> counter_head [style=invis, weight=30];
 
-    { rank=same; read_validate; register; }
-    { rank=same; submit; processor; callback; }
-    { rank=same; write_cleanup; }
-    { rank=same; server_state; connection_state; }
+    conn_head -> conn_a -> conn_b -> conn_null;
+    conn_a -> conn_state [style=dotted, arrowhead=none, label="상세"];
 
-    read_validate -> register -> submit -> processor;
-    processor -> callback [style=dashed, label="완료"];
-    callback -> write_cleanup;
+    conn_state -> inflight_head [style=dotted, arrowhead=none];
+    inflight_head -> inflight_r2 -> inflight_r1 -> inflight_null;
 
-    register -> server_state [style=dotted, arrowhead=none, constraint=false];
-    register -> connection_state [style=dotted, arrowhead=none, constraint=false];
-    write_cleanup -> server_state [style=dotted, arrowhead=none, constraint=false];
-    write_cleanup -> connection_state [style=dotted, arrowhead=none, constraint=false];
+    counter_head -> counter_a -> counter_b -> counter_null;
 }

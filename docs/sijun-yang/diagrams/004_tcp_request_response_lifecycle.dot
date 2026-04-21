@@ -1,0 +1,130 @@
+digraph TcpRequestResponseLifecycle {
+    graph [
+        rankdir=TB,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.8,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_state_touch {
+        label="갱신되는 상태";
+        style="rounded,filled";
+        color="#fdba74";
+        fillcolor="#fff7ed";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        state_before [
+            shape=plain,
+            label=<
+                <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                    <TR><TD COLSPAN="4" BGCOLOR="#f8fafc">등록 전</TD></TR>
+                    <TR><TD BGCOLOR="#e0f2fe">inflight_ids</TD><TD>head</TD><TD>r2</TD><TD BGCOLOR="#f1f5f9">NULL</TD></TR>
+                    <TR><TD BGCOLOR="#fef3c7">inflight_count</TD><TD COLSPAN="3">1</TD></TR>
+                </TABLE>
+            >
+        ];
+
+        state_registered [
+            shape=plain,
+            label=<
+                <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                    <TR><TD COLSPAN="5" BGCOLOR="#f8fafc">request 등록 후</TD></TR>
+                    <TR><TD BGCOLOR="#e0f2fe">inflight_ids</TD><TD>head</TD><TD BGCOLOR="#bfdbfe">r3</TD><TD>r2</TD><TD BGCOLOR="#f1f5f9">NULL</TD></TR>
+                    <TR><TD BGCOLOR="#fef3c7">inflight_count</TD><TD COLSPAN="4">2</TD></TR>
+                </TABLE>
+            >
+        ];
+
+        state_returned [
+            shape=plain,
+            label=<
+                <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#64748b">
+                    <TR><TD COLSPAN="4" BGCOLOR="#f8fafc">response 반환 후</TD></TR>
+                    <TR><TD BGCOLOR="#e0f2fe">inflight_ids</TD><TD>head</TD><TD>r2</TD><TD BGCOLOR="#f1f5f9">NULL</TD></TR>
+                    <TR><TD BGCOLOR="#fef3c7">inflight_count</TD><TD COLSPAN="3">1</TD></TR>
+                </TABLE>
+            >
+        ];
+    }
+
+    subgraph cluster_request {
+        label="request 등록 흐름";
+        style="rounded,filled";
+        color="#93c5fd";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        read [label="JSON line 수신\nid / op / sql"];
+        reserve [label="요청 등록\nid 추가\ncount 증가"];
+        submit [label="CmdRequest 생성"];
+    }
+
+    subgraph cluster_response {
+        label="response 반환 흐름";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        callback [label="CmdResponse callback"];
+        write [label="JSON line 응답 작성"];
+        cleanup [label="id 제거 + count 감소\nrequest / response release"];
+    }
+
+    subgraph cluster_processor {
+        label="CmdProcessor";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        processor [label="요청 처리\nEngine / REPL / Mock"];
+    }
+
+    { rank=source; state_before; state_registered; state_returned; }
+    { rank=same; read; reserve; submit; processor; }
+    { rank=same; callback; write; cleanup; }
+
+    state_before -> state_registered [label="등록"];
+    state_registered -> state_returned [label="반환"];
+
+    read -> reserve -> submit -> processor;
+    processor -> callback [style=dashed, label="완료", constraint=false];
+    callback -> write [weight=100];
+    write -> cleanup [weight=100];
+
+    state_before -> read [style=invis, weight=30];
+    state_registered -> reserve [style=invis, weight=50];
+    state_returned -> cleanup [style=invis, weight=50];
+    submit -> callback [style=invis, weight=50];
+
+}
