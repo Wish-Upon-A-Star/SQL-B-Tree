@@ -429,6 +429,7 @@ static void free_partial_state(MockCmdProcessorState *state) {
     mock_shutdown(&state->context);
 }
 
+// 여기서 Mock 함수의 포인터를 CmdProcessor의 CmdProcessorContext에 연결
 int mock_cmd_processor_create(const CmdProcessorContext *base_context,
                               CmdProcessor **out_processor) {
     MockCmdProcessorState *state;
@@ -497,6 +498,7 @@ int mock_cmd_processor_create(const CmdProcessorContext *base_context,
     state->context.response_body_capacity = state->response_capacity;
     state->context.shared_state = state;
 
+    /* Public CmdProcessor wrapper가 호출할 mock callback들을 연결한다. */
     state->processor.context = &state->context;
     state->processor.acquire_request = mock_acquire_request;
     state->processor.process = mock_process;
