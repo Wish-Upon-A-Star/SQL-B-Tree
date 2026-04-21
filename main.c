@@ -2,6 +2,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <time.h>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -9,6 +12,9 @@
 #include "types.h"
 #include "parser.h"
 #include "executor.h"
+#include "cmd_processor/cmd_processor.h"
+#include "cmd_processor/cmd_processor_sync_bridge.h"
+#include "cmd_processor/engine_cmd_processor.h"
 #include "bench_memtrack.h"
 
 static void configure_console_encoding(void);
@@ -44,6 +50,11 @@ static int try_execute_fast_sql(const char *sql);
 static void execute_sql_text(const char *sql);
 static int flush_sql_buffer(char *sql_buffer, int *length, int *too_long);
 static int execute_sql_file(const char *filename);
+static int ensure_cmd_processor(void);
+static void shutdown_cmd_processor(void);
+static void next_request_id(char buffer[64]);
+
+static CmdProcessor *g_cmd_processor = NULL;
 
 static void configure_console_encoding(void) {
 #if defined(_WIN32)
@@ -84,6 +95,16 @@ static const char *skip_utf8_bom_and_space(const char *sql) {
 
     while (isspace((unsigned char)*sql)) sql++;
     return sql;
+}
+
+static void next_request_id(char buffer[64]) {
+    static uint64_t counter = 0;
+    uint64_t now = (uint64_t)time(NULL);
+    if (!buffer) return;
+    counter++;
+    snprintf(buffer, 64, "req-%llu-%llu",
+             (unsigned long long)now,
+             (unsigned long long)counter);
 }
 
 static void dispatch_statement(const Statement *stmt) {
@@ -179,8 +200,9 @@ static int run_app(const AppConfig *config) {
             return 0;
         case APP_MODE_EXEC_FILE:
         default:
+            if (!ensure_cmd_processor()) return 1;
             if (execute_sql_file(config->filename) != 0) return 1;
-            close_all_tables();
+            shutdown_cmd_processor();
             return 0;
     }
 }
@@ -292,18 +314,57 @@ static int try_execute_fast_sql(const char *sql) {
 }
 
 static void execute_sql_text(const char *sql) {
-    Statement stmt;
+    CmdRequest *request = NULL;
+    CmdResponse *response = NULL;
+    CmdStatusCode set_status;
     const char *normalized_sql = skip_utf8_bom_and_space(sql);
+    char request_id[64];
 
     if (*normalized_sql == '\0') return;
-    if (try_execute_fast_sql(normalized_sql)) return;
+    if (!ensure_cmd_processor()) {
+        printf("[오류] CmdProcessor 초기화에 실패했습니다.\n");
+        return;
+    }
+    if (cmd_processor_acquire_request(g_cmd_processor, &request) != 0 || !request) {
+        printf("[오류] 요청 버퍼를 확보하지 못했습니다.\n");
+        return;
+    }
+    next_request_id(request_id);
+    set_status = cmd_processor_set_sql_request(g_cmd_processor, request, request_id, normalized_sql);
+    if (set_status != CMD_STATUS_OK) {
+        if (cmd_processor_make_error_response(g_cmd_processor,
+                                              request_id,
+                                              set_status,
+                                              "SQL request validation failed",
+                                              &response) != 0) {
+            printf("[오류] 요청 검증 실패를 응답으로 변환하지 못했습니다.\n");
+            cmd_processor_release_request(g_cmd_processor, request);
+                return;
+        }
+    } else {
+        if (cmd_processor_submit_sync(g_cmd_processor, request, &response) != 0) {
+            printf("[오류] SQL 실행 중 내부 오류가 발생했습니다.\n");
+            cmd_processor_release_request(g_cmd_processor, request);
+            return;
+        }
+    }
 
-    if (!parse_statement(normalized_sql, &stmt)) {
-        printf("[오류] 잘못된 SQL 문장입니다: %s\n", normalized_sql);
+    if (set_status == CMD_STATUS_OK && !response) {
+        printf("[오류] SQL 실행 중 내부 오류가 발생했습니다.\n");
+        cmd_processor_release_request(g_cmd_processor, request);
         return;
     }
 
-    dispatch_statement(&stmt);
+    if (response->body && response->body[0] != '\0') {
+        printf("%s\n", response->body);
+    } else if (response->error_message && response->error_message[0] != '\0') {
+        printf("[오류] %s\n", response->error_message);
+    } else {
+        printf("[%s]\n", cmd_status_to_string(response->status));
+    }
+
+    cmd_processor_release_response(g_cmd_processor, response);
+    cmd_processor_release_request(g_cmd_processor, request);
 }
 
 static int flush_sql_buffer(char *sql_buffer, int *length, int *too_long) {
@@ -365,6 +426,32 @@ static int execute_sql_file(const char *filename) {
 
     fclose(file);
     return 0;
+}
+
+static int ensure_cmd_processor(void) {
+    CmdProcessorContext context;
+    EngineCmdProcessorOptions options;
+
+    if (g_cmd_processor) return 1;
+    memset(&context, 0, sizeof(context));
+    context.name = "sqlsprocessor_engine";
+    context.max_sql_len = MAX_SQL_LEN - 1;
+    context.request_buffer_count = 0;
+    context.response_body_capacity = 4096;
+
+    memset(&options, 0, sizeof(options));
+    options.worker_count = 2;
+    options.shard_count = 1;
+    options.queue_capacity_per_shard = 64;
+    options.planner_cache_capacity = 128;
+
+    return engine_cmd_processor_create(&context, &options, &g_cmd_processor) == 0;
+}
+
+static void shutdown_cmd_processor(void) {
+    if (!g_cmd_processor) return;
+    cmd_processor_shutdown(g_cmd_processor);
+    g_cmd_processor = NULL;
 }
 
 /* SQL 파일에서 ';'로 구분되는 SQL 문장을 순서대로 실행합니다. */

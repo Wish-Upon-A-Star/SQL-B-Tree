@@ -23,6 +23,9 @@ jungle_benchmark_users.csv
 bench_workload_generator
 benchmark_runner
 bench_formula_test
+docs/CMD_PROCESSOR_IMPLEMENTATION_HARNESS_KO.md
+docs/CMD_PROCESSOR_READABILITY_SCORE_HARNESS_KO.md
+docs/CMD_PROCESSOR_READABILITY_SCORE_SHEET.md
 
 # Created by https://www.toptal.com/developers/gitignore/api/jetbrains+all
 # Edit at https://www.toptal.com/developers/gitignore?templates=jetbrains+all

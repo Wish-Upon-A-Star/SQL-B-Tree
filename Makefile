@@ -6,10 +6,11 @@ BENCH_RUNNER ?= benchmark_runner
 BENCH_TEST ?= bench_formula_test
 CMD_PROCESSOR_TEST ?= cmd_processor_test
 TCP_CMD_PROCESSOR_TEST ?= tcp_cmd_processor_test
+CMD_PROCESSOR_SCALE_SCORE_TEST ?= cmd_processor_engine_scale_score_test
 CMD_PROCESSOR_DIR = cmd_processor
 CJSON_DIR = thirdparty/cjson
 SRC = main.c
-SRC_DEPS = main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c bench_memtrack.h jungle_benchmark.h lexer.h parser.h bptree.h executor.h types.h sqlsprocessor_bundle.h
+SRC_DEPS = main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c bench_memtrack.h jungle_benchmark.h lexer.h parser.h bptree.h executor.h types.h sqlsprocessor_bundle.h platform_threads.h $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/cmd_processor_sync_bridge.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_internal.h $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/cmd_processor_sync_bridge.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_support.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_planner.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_runtime.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor.c
 CMD_PROCESSOR_TEST_SRC = $(CMD_PROCESSOR_DIR)/cmd_processor_test.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/mock_cmd_processor.c
 CMD_PROCESSOR_TEST_DEPS = $(CMD_PROCESSOR_TEST_SRC) $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/mock_cmd_processor.h
 CMD_PROCESSOR_TEST_RUN = $(if $(filter /%,$(CMD_PROCESSOR_TEST)),$(CMD_PROCESSOR_TEST),./$(CMD_PROCESSOR_TEST))
@@ -17,6 +18,9 @@ TCP_CMD_PROCESSOR_TEST_SRC = $(CMD_PROCESSOR_DIR)/tcp_cmd_processor_test.c $(CMD
 TCP_CMD_PROCESSOR_TEST_DEPS = $(TCP_CMD_PROCESSOR_TEST_SRC) $(CMD_PROCESSOR_DIR)/tcp_cmd_processor.h $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/mock_cmd_processor.h $(CJSON_DIR)/cJSON.h
 TCP_CMD_PROCESSOR_TEST_CFLAGS = -DTCP_MAX_CONNECTIONS_TOTAL=4 -DTCP_MAX_CONNECTIONS_PER_CLIENT=2 -DTCP_MAX_INFLIGHT_PER_CONNECTION=2 -DTCP_MAX_INFLIGHT_PER_CLIENT=3
 TCP_CMD_PROCESSOR_TEST_RUN = $(if $(filter /%,$(TCP_CMD_PROCESSOR_TEST)),$(TCP_CMD_PROCESSOR_TEST),./$(TCP_CMD_PROCESSOR_TEST))
+CMD_PROCESSOR_SCALE_SCORE_TEST_SRC = $(CMD_PROCESSOR_DIR)/engine_cmd_processor_scale_score_test.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_bundle.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c
+CMD_PROCESSOR_SCALE_SCORE_TEST_DEPS = $(CMD_PROCESSOR_SCALE_SCORE_TEST_SRC) $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_internal.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_support.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_planner.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_runtime.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_test_support.h executor.h parser.h types.h platform_threads.h
+CMD_PROCESSOR_SCALE_SCORE_TEST_RUN = $(if $(filter /%,$(CMD_PROCESSOR_SCALE_SCORE_TEST)),$(CMD_PROCESSOR_SCALE_SCORE_TEST),./$(CMD_PROCESSOR_SCALE_SCORE_TEST))
 SQL ?= demo_bptree.sql
 PYTHON ?= python
 JUNGLE_DATASET ?= jungle_benchmark_users.csv
@@ -26,7 +30,7 @@ BENCH_SCORE_DELETE_ROWS ?= 1000000
 BENCH_SCORE_IN_TMP ?= 1
 BENCH_EXEC_SPEC ?= bench_score_exec.conf
 
-.PHONY: all build bench-tools bench-test test-cmd-processor test-tcp-cmd-processor run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
+.PHONY: all build bench-tools bench-test test-cmd-processor test-tcp-cmd-processor test-cmd-processor-scale-score run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 
 all: build
 
@@ -60,6 +64,12 @@ $(TCP_CMD_PROCESSOR_TEST): $(TCP_CMD_PROCESSOR_TEST_DEPS)
 
 test-tcp-cmd-processor: $(TCP_CMD_PROCESSOR_TEST)
 	$(TCP_CMD_PROCESSOR_TEST_RUN)
+
+$(CMD_PROCESSOR_SCALE_SCORE_TEST): $(CMD_PROCESSOR_SCALE_SCORE_TEST_DEPS)
+	$(CC) $(CFLAGS) -I$(CMD_PROCESSOR_DIR) $(CMD_PROCESSOR_SCALE_SCORE_TEST_SRC) -o $(CMD_PROCESSOR_SCALE_SCORE_TEST) -pthread
+
+test-cmd-processor-scale-score: $(CMD_PROCESSOR_SCALE_SCORE_TEST)
+	$(CMD_PROCESSOR_SCALE_SCORE_TEST_RUN)
 
 $(JUNGLE_DATASET): $(TARGET)
 	./$(TARGET) --generate-jungle $(JUNGLE_RECORDS) $(JUNGLE_DATASET)
@@ -119,4 +129,4 @@ bench-clean:
 	rm -f generated_sql/oracle_smoke.json generated_sql/oracle_regression.json generated_sql/oracle_score.json
 
 clean:
-	rm -f $(TARGET) $(BENCH_GEN) $(BENCH_RUNNER) $(BENCH_TEST) $(CMD_PROCESSOR_TEST) $(TCP_CMD_PROCESSOR_TEST)
+	rm -f $(TARGET) $(BENCH_GEN) $(BENCH_RUNNER) $(BENCH_TEST) $(CMD_PROCESSOR_TEST) $(TCP_CMD_PROCESSOR_TEST) $(CMD_PROCESSOR_SCALE_SCORE_TEST)
