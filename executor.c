@@ -122,6 +122,9 @@ static void reset_deleted_flags(TableCache *tc, int *delete_flags, int old_count
 static void release_deleted_slots(TableCache *tc, int *delete_flags, int old_count);
 static void clear_slot_storage(TableCache *tc, int slot_id);
 int rewrite_file(TableCache *tc);
+static int execute_insert_internal(Statement *stmt, long *inserted_id);
+static int execute_update_internal(Statement *stmt, int *affected_rows);
+static int execute_delete_internal(Statement *stmt, int *affected_rows);
 
 static char *dup_string(const char *src) {
     size_t len = strlen(src) + 1;
@@ -3223,12 +3226,20 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
     return 1;
 }
 
-void execute_insert(Statement *stmt) {
+static int execute_insert_internal(Statement *stmt, long *inserted_id) {
     TableCache *tc = get_table(stmt->table_name);
     long id_value = 0;
 
-    if (!tc) return;
-    if (!insert_row_data(tc, stmt->row_data, 0, &id_value)) return;
+    if (!tc) return 0;
+    if (!insert_row_data(tc, stmt->row_data, 0, &id_value)) return 0;
+    if (inserted_id) *inserted_id = id_value;
+    return 1;
+}
+
+void execute_insert(Statement *stmt) {
+    long id_value = 0;
+
+    if (!execute_insert_internal(stmt, &id_value)) return;
     INFO_PRINTF("[ok] INSERT completed. id=%ld\n", id_value);
 }
 
@@ -4637,7 +4648,7 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
                                rebuild_uk_needed, 0, 1);
 }
 
-void execute_update(Statement *stmt) {
+static int execute_update_internal(Statement *stmt, int *affected_rows) {
     TableCache *tc = get_table(stmt->table_name);
     MutationLookupPlan lookup;
     int set_idx;
@@ -4645,19 +4656,20 @@ void execute_update(Statement *stmt) {
     int rebuild_uk_needed;
     int result;
 
-    if (!tc) return;
-    if (!validate_where_columns(tc, stmt, "UPDATE")) return;
+    if (affected_rows) *affected_rows = 0;
+    if (!tc) return 0;
+    if (!validate_where_columns(tc, stmt, "UPDATE")) return 0;
     if (stmt->where_count == 0) {
         printf("[error] UPDATE failed: WHERE condition is required.\n");
-        return;
+        return 0;
     }
     build_mutation_lookup_plan(tc, stmt, &lookup);
     if (lookup.where_idx == -1) {
         printf("[error] UPDATE failed: WHERE or SET column does not exist.\n");
-        return;
+        return 0;
     }
     if (!prepare_update_set(tc, stmt, &set_idx, set_value, sizeof(set_value), &rebuild_uk_needed)) {
-        return;
+        return 0;
     }
 
     if (tc->cache_truncated) {
@@ -4666,20 +4678,19 @@ void execute_update(Statement *stmt) {
             long tail_offset;
 
             if (!parse_long_value(stmt->where_conditions[lookup.condition_index].val, &pk_key)) {
-                INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
-                return;
+                return 1;
             }
             if (find_tail_pk_offset(tc, pk_key, &tail_offset)) {
                 int result = execute_update_tail_pk_row(tc, stmt, pk_key, tail_offset, set_idx, set_value);
-                if (result == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
-                return;
+                if (result > 0 && affected_rows) *affected_rows = result;
+                return result >= 0;
             }
             {
                 int result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
                                                        set_idx, set_value,
                                                        lookup.uses_pk_lookup, lookup.uses_uk_lookup, rebuild_uk_needed);
-                if (result == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
-                return;
+                if (result > 0 && affected_rows) *affected_rows = result;
+                return result >= 0;
             }
         }
         if (lookup.uses_uk_lookup) {
@@ -4687,19 +4698,29 @@ void execute_update(Statement *stmt) {
         }
         if (!rewrite_truncated_update(tc, stmt, set_idx, set_value)) {
             printf("[error] UPDATE failed while using CSV scan fallback.\n");
+            return 0;
         }
-        return;
+        if (affected_rows) *affected_rows = 1;
+        return 1;
     }
 
     if (lookup.uses_pk_lookup || lookup.uses_uk_lookup) {
         result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
                                            set_idx, set_value,
                                            lookup.uses_pk_lookup, lookup.uses_uk_lookup, rebuild_uk_needed);
-        if (result == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
-        return;
+        if (result > 0 && affected_rows) *affected_rows = result;
+        return result >= 0;
     }
     result = execute_update_scan(tc, stmt, set_idx, set_value, rebuild_uk_needed);
-    if (result == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
+    if (result > 0 && affected_rows) *affected_rows = result;
+    return result >= 0;
+}
+
+void execute_update(Statement *stmt) {
+    int affected_rows = 0;
+
+    if (!execute_update_internal(stmt, &affected_rows)) return;
+    if (affected_rows == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
 }
 
 int execute_update_id_fast(const char *table_name, const char *set_col, const char *set_value, const char *id_value) {
@@ -4724,16 +4745,17 @@ int execute_update_id_fast(const char *table_name, const char *set_col, const ch
                                rebuild_uk_needed, 1, 0) > 0;
 }
 
-void execute_delete(Statement *stmt) {
+static int execute_delete_internal(Statement *stmt, int *affected_rows) {
     TableCache *tc = get_table(stmt->table_name);
     MutationLookupPlan lookup;
     int result;
 
-    if (!tc) return;
-    if (!validate_where_columns(tc, stmt, "DELETE")) return;
+    if (affected_rows) *affected_rows = 0;
+    if (!tc) return 0;
+    if (!validate_where_columns(tc, stmt, "DELETE")) return 0;
     if (stmt->where_count == 0) {
         printf("[error] DELETE failed: WHERE condition is required.\n");
-        return;
+        return 0;
     }
     build_mutation_lookup_plan(tc, stmt, &lookup);
     if (tc->cache_truncated) {
@@ -4742,13 +4764,12 @@ void execute_delete(Statement *stmt) {
             long tail_offset;
 
             if (!parse_long_value(stmt->where_conditions[lookup.condition_index].val, &pk_key)) {
-                INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
-                return;
+                return 1;
             }
             if (find_tail_pk_offset(tc, pk_key, &tail_offset)) {
                 int result = execute_delete_tail_pk_row(tc, stmt, pk_key, tail_offset);
-                if (result == 0) INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
-                return;
+                if (result > 0 && affected_rows) *affected_rows = result;
+                return result >= 0;
             }
         }
         if (!lookup.uses_pk_lookup) {
@@ -4757,19 +4778,29 @@ void execute_delete(Statement *stmt) {
             }
             if (!rewrite_truncated_delete(tc, stmt)) {
                 printf("[error] DELETE failed while using CSV scan fallback.\n");
+                return 0;
             }
-            return;
+            if (affected_rows) *affected_rows = 1;
+            return 1;
         }
     }
     if (lookup.uses_pk_lookup || lookup.uses_uk_lookup) {
         result = execute_delete_single_row(tc, stmt, lookup.where_idx,
                                            &stmt->where_conditions[lookup.condition_index], lookup.uses_pk_lookup);
-        if (result == 0) INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
-        return;
+        if (result > 0 && affected_rows) *affected_rows = result;
+        return result >= 0;
     }
 
     result = execute_delete_scan(tc, stmt);
-    if (result == 0) INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
+    if (result > 0 && affected_rows) *affected_rows = result;
+    return result >= 0;
+}
+
+void execute_delete(Statement *stmt) {
+    int affected_rows = 0;
+
+    if (!execute_delete_internal(stmt, &affected_rows)) return;
+    if (affected_rows == 0) INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
 }
 
 int execute_delete_id_fast(const char *table_name, const char *id_value) {
@@ -4791,6 +4822,28 @@ int execute_delete_id_fast(const char *table_name, const char *id_value) {
         return 0;
     }
     return 1;
+}
+
+int executor_execute_statement(Statement *stmt, int *matched_rows, int *affected_rows, long *generated_id) {
+    if (matched_rows) *matched_rows = 0;
+    if (affected_rows) *affected_rows = 0;
+    if (generated_id) *generated_id = 0;
+    if (!stmt) return 0;
+
+    switch (stmt->type) {
+        case STMT_INSERT:
+            if (!execute_insert_internal(stmt, generated_id)) return 0;
+            if (affected_rows) *affected_rows = 1;
+            return 1;
+        case STMT_SELECT:
+            return execute_select_internal(stmt, 0, 0, matched_rows);
+        case STMT_UPDATE:
+            return execute_update_internal(stmt, affected_rows);
+        case STMT_DELETE:
+            return execute_delete_internal(stmt, affected_rows);
+        default:
+            return 0;
+    }
 }
 
 static double current_seconds(void) {
