@@ -4,8 +4,11 @@ TARGET ?= sqlsprocessor
 BENCH_GEN ?= bench_workload_generator
 BENCH_RUNNER ?= benchmark_runner
 BENCH_TEST ?= bench_formula_test
+CMD_PROCESSOR_TEST ?= cmd_processor_test
 SRC = main.c
 SRC_DEPS = main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c bench_memtrack.h jungle_benchmark.h lexer.h parser.h bptree.h executor.h types.h sqlsprocessor_bundle.h
+CMD_PROCESSOR_TEST_SRC = cmd_processor_test.c cmd_processor.c mock_cmd_processor.c
+CMD_PROCESSOR_TEST_RUN = $(if $(filter /%,$(CMD_PROCESSOR_TEST)),$(CMD_PROCESSOR_TEST),./$(CMD_PROCESSOR_TEST))
 SQL ?= demo_bptree.sql
 PYTHON ?= python
 JUNGLE_DATASET ?= jungle_benchmark_users.csv
@@ -15,7 +18,7 @@ BENCH_SCORE_DELETE_ROWS ?= 1000000
 BENCH_SCORE_IN_TMP ?= 1
 BENCH_EXEC_SPEC ?= bench_score_exec.conf
 
-.PHONY: all build bench-tools bench-test run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
+.PHONY: all build bench-tools bench-test test-cmd-processor run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 
 all: build
 
@@ -37,6 +40,12 @@ $(BENCH_TEST): bench_formula_test.c
 
 bench-test: $(BENCH_TEST)
 	./$(BENCH_TEST)
+
+$(CMD_PROCESSOR_TEST): cmd_processor_test.c cmd_processor.c cmd_processor.h mock_cmd_processor.c mock_cmd_processor.h
+	$(CC) $(CFLAGS) $(CMD_PROCESSOR_TEST_SRC) -o $(CMD_PROCESSOR_TEST) -pthread
+
+test-cmd-processor: $(CMD_PROCESSOR_TEST)
+	$(CMD_PROCESSOR_TEST_RUN)
 
 $(JUNGLE_DATASET): $(TARGET)
 	./$(TARGET) --generate-jungle $(JUNGLE_RECORDS) $(JUNGLE_DATASET)
@@ -96,4 +105,4 @@ bench-clean:
 	rm -f generated_sql/oracle_smoke.json generated_sql/oracle_regression.json generated_sql/oracle_score.json
 
 clean:
-	rm -f $(TARGET) $(BENCH_GEN) $(BENCH_RUNNER) $(BENCH_TEST)
+	rm -f $(TARGET) $(BENCH_GEN) $(BENCH_RUNNER) $(BENCH_TEST) $(CMD_PROCESSOR_TEST)

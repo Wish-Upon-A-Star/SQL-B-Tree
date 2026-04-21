@@ -116,6 +116,11 @@ typedef struct CmdProcessor {
     int (*process)(CmdProcessorContext *context,
                    CmdRequest *request,
                    CmdResponse **out_response);
+    int (*make_error_response)(CmdProcessorContext *context,
+                               const char *request_id,
+                               CmdStatusCode status,
+                               const char *error_message,
+                               CmdResponse **out_response);
     void (*release_request)(CmdProcessorContext *context,
                             CmdRequest *request);
     void (*release_response)(CmdProcessorContext *context,
@@ -182,6 +187,7 @@ int mock_cmd_processor_create(const CmdProcessorContext *base_context,
 - SQL 길이 검증은 복사 시점에 `processor->context->max_sql_len` 기준으로 수행한다.
 - SQL 길이가 제한을 넘으면 setter는 `CMD_STATUS_SQL_TOO_LONG`을 반환한다.
 - setter가 `CMD_STATUS_OK`가 아닌 값을 반환하면 외부 진입점은 `cmd_processor_make_error_response()`로 processor-owned 오류 응답을 만들 수 있다.
+- `cmd_processor_make_error_response()`는 processor 구현체의 `make_error_response` callback을 통해 response slot을 확보한다. 따라서 frontend validation 오류 응답도 일반 `CmdResponse`와 같은 release 규칙을 따른다.
 
 `CmdResponse.body` 규칙:
 
