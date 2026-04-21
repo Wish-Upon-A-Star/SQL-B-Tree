@@ -54,54 +54,54 @@
 
 ```mermaid
 flowchart LR
-    subgraph Clients[여러 사용자]
-        A1[User A conn 1]
-        A2[User A conn 2]
-        B1[User B conn 1]
+    subgraph Clients[이미 열려 있는 사용자 connection]
+        A1[User A<br/>connection A-1]
+        A2[User A<br/>connection A-2]
+        B1[User B<br/>connection B-1]
     end
 
     subgraph TCP[TCPCmdProcessor]
-        Listen[listen_fd]
-        Accept[accept thread]
-        Conn1[TCPConnection read thread]
-        Conn2[TCPConnection read thread]
-        Conn3[TCPConnection read thread]
-        Counters[client_counters]
-        Inflight[in-flight ids]
+        S1[connection session A-1]
+        S2[connection session A-2]
+        S3[connection session B-1]
+        Intake[요청 수신/검증<br/>JSON line -> CmdRequest]
+        Inflight[in-flight 관리<br/>connection/client별 제한]
+        Callback[응답 callback 처리<br/>CmdResponse -> JSON line]
     end
 
-    Processor[CmdProcessor]
+    Processor["CmdProcessor 경계<br/>submit request + callback + context"]
     DB[DB 구현체<br/>black box]
 
-    A1 --> Listen
-    A2 --> Listen
-    B1 --> Listen
-    Listen --> Accept
-    Accept --> Conn1
-    Accept --> Conn2
-    Accept --> Conn3
-    Accept --> Counters
-    Conn1 --> Inflight
-    Conn2 --> Inflight
-    Conn3 --> Inflight
-    Conn1 --> Processor
-    Conn2 --> Processor
-    Conn3 --> Processor
+    A1 <--> S1
+    A2 <--> S2
+    B1 <--> S3
+
+    S1 -- request + context A-1 --> Intake
+    S2 -- request + context A-2 --> Intake
+    S3 -- request + context B-1 --> Intake
+
+    Intake --> Inflight
+    Inflight --> Processor
     Processor --> DB
+    DB -. 처리 결과 .-> Processor
+    Processor -. callback .-> Callback
+
+    Callback -. context A-1 .-> S1
+    Callback -. context A-2 .-> S2
+    Callback -. context B-1 .-> S3
 ```
 
-서버에는 `listen_fd`가 하나 있고, 새 TCP connection은 accept thread가 받는다. accept된 connection마다 `TCPConnection` 객체와 read thread가 생긴다.
+이 그림은 connection 수락이 끝나고, 여러 사용자의 connection이 이미 `TCPCmdProcessor` 안에 등록된 상태를 기준으로 한다. listen/accept 과정은 연결을 이 상태로 올려놓는 앞단이며, 전체 요청 흐름을 설명하는 이 절에서는 제외한다.
 
-`TCPCmdProcessor`가 가진 주요 상태는 다음과 같다.
+핵심은 열린 connection마다 독립적인 세션이 있고, 각 세션에서 들어온 요청이 공통 `CmdProcessor` 경계로 위임된다는 점이다. TCP 계층은 요청을 DB가 이해할 수 있는 공통 요청 모델로 바꾸고, 나중에 callback이 오면 처음 요청이 들어온 connection으로 응답을 되돌려 보낸다.
 
-| 상태 | 역할 |
+| 영역 | 책임 |
 | --- | --- |
-| `listen_fd` | 새 TCP connection을 받는 socket |
-| `accept_thread` | `accept()`를 반복하며 새 connection을 등록 |
-| `connections` | 현재 살아 있는 `TCPConnection` 목록 |
-| `client_counters` | client별 connection 수와 in-flight 요청 수 |
-| `active_clients` | 전체 active connection 수 |
-| `processor` | 요청을 넘길 `CmdProcessor` 포인터 |
+| 열린 connection 세션 | 사용자별 TCP 연결을 독립적으로 유지하고, 요청을 읽고 응답을 쓴다. |
+| 요청 수신/검증 | JSON line을 읽어 `id`, `op`, `sql` 같은 기본 형식을 확인한다. |
+| in-flight 관리 | 아직 응답이 돌아오지 않은 요청을 connection/client 단위로 추적한다. |
+| `CmdProcessor` 경계 | 검증된 요청을 DB 처리 계층으로 넘기는 유일한 위임 지점이다. |
+| 응답 callback 처리 | `CmdResponse`를 JSON line으로 바꾸고 원래 connection에 돌려준다. |
 
 `TCPCmdProcessor`는 `CmdProcessor`를 소유하지 않는다. 서버 종료 시 TCP 자원은 정리하지만, `cmd_processor_shutdown()` 호출 여부는 processor 소유자가 결정한다.
 
