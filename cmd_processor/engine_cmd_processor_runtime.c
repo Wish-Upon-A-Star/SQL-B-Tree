@@ -1,4 +1,107 @@
 #include "engine_cmd_processor_internal.h"
+
+static void release_lock_handles(const LockPlan *plan, LockHandle *handles) {
+    int i;
+
+    if (!plan || !handles) return;
+    for (i = plan->lock_count - 1; i >= 0; i--) {
+        if (!handles[i].acquired || !handles[i].bucket) continue;
+        if (handles[i].mode == ENGINE_LOCK_WRITE) db_rwlock_wrunlock(&handles[i].bucket->rwlock);
+        else db_rwlock_rdunlock(&handles[i].bucket->rwlock);
+    }
+}
+
+static void release_partial_lock_handles(LockHandle *handles, int last_index) {
+    while (last_index >= 0) {
+        if (handles[last_index].acquired && handles[last_index].bucket) {
+            if (handles[last_index].mode == ENGINE_LOCK_WRITE) db_rwlock_wrunlock(&handles[last_index].bucket->rwlock);
+            else db_rwlock_rdunlock(&handles[last_index].bucket->rwlock);
+        }
+        last_index--;
+    }
+}
+
+static void set_invalid_sql_request_error(EngineCmdProcessorState *state,
+                                          CmdRequest *request,
+                                          ResponseSlot *response_slot) {
+    set_response_error(response_slot,
+                       request->request_id,
+                       CMD_STATUS_BAD_REQUEST,
+                       "sql request is required",
+                       state->response_body_capacity);
+}
+
+static int parse_statement_or_respond(EngineCmdProcessorState *state,
+                                      CmdRequest *request,
+                                      ResponseSlot *response_slot,
+                                      Statement *stmt) {
+    if (parse_statement(request->sql, stmt)) return 1;
+
+    set_response_error(response_slot,
+                       request->request_id,
+                       CMD_STATUS_PARSE_ERROR,
+                       "parse failed",
+                       state->response_body_capacity);
+    return 0;
+}
+
+static int execute_statement_or_respond(EngineCmdProcessorState *state,
+                                        CmdRequest *request,
+                                        ResponseSlot *response_slot,
+                                        Statement *stmt,
+                                        int *matched_rows,
+                                        int *affected_rows,
+                                        long *generated_id) {
+    if (executor_execute_statement(stmt, matched_rows, affected_rows, generated_id)) return 1;
+
+    set_response_error(response_slot,
+                       request->request_id,
+                       CMD_STATUS_PROCESSING_ERROR,
+                       "execution failed",
+                       state->response_body_capacity);
+    return 0;
+}
+
+static void set_statement_success_response(EngineCmdProcessorState *state,
+                                           CmdRequest *request,
+                                           ResponseSlot *response_slot,
+                                           const Statement *stmt,
+                                           int matched_rows,
+                                           int affected_rows,
+                                           long generated_id) {
+    char body[256];
+
+    if (stmt->type == STMT_SELECT) {
+        snprintf(body, sizeof(body), "SELECT matched_rows=%d", matched_rows);
+    } else if (stmt->type == STMT_INSERT) {
+        snprintf(body, sizeof(body), "INSERT affected_rows=%d id=%ld", affected_rows, generated_id);
+    } else {
+        snprintf(body,
+                 sizeof(body),
+                 "%s affected_rows=%d",
+                 stmt->type == STMT_UPDATE ? "UPDATE" : "DELETE",
+                 affected_rows);
+    }
+
+    set_response_body(response_slot,
+                      request->request_id,
+                      CMD_BODY_TEXT,
+                      body,
+                      strlen(body),
+                      state->response_body_capacity);
+    response_slot->response.row_count = matched_rows;
+    response_slot->response.affected_count = affected_rows;
+}
+
+static void record_completed_job_metrics(EngineCmdProcessorState *state, CmdJob *job) {
+    job->stats.total_us = job->stats.queue_wait_us + job->stats.lock_wait_us + job->stats.exec_us;
+    metrics_record(&state->metrics,
+                   &job->stats,
+                   job->response_slot->response.ok,
+                   job->response_slot->response.status,
+                   job->enqueue_depth);
+}
+
 int lock_manager_init(LockManager *manager) {
 
     if (!manager) return 0;
@@ -45,11 +148,7 @@ int lock_manager_acquire(LockManager *manager, const LockPlan *plan, LockHandle 
         handles[i].bucket = find_or_create_bucket(manager, plan->targets[i].name);
         db_mutex_unlock(&manager->mutex);
         if (!handles[i].bucket) {
-            while (--i >= 0) {
-                if (!handles[i].acquired) continue;
-                if (handles[i].mode == ENGINE_LOCK_WRITE) db_rwlock_wrunlock(&handles[i].bucket->rwlock);
-                else db_rwlock_rdunlock(&handles[i].bucket->rwlock);
-            }
+            release_partial_lock_handles(handles, i - 1);
             return 0;
         }
         handles[i].mode = plan->targets[i].mode;
@@ -64,14 +163,8 @@ int lock_manager_acquire(LockManager *manager, const LockPlan *plan, LockHandle 
 }
 
 void lock_manager_release(LockManager *manager, const LockPlan *plan, LockHandle *handles) {
-    int i;
     (void)manager;
-    if (!plan || !handles) return;
-    for (i = plan->lock_count - 1; i >= 0; i--) {
-        if (!handles[i].acquired || !handles[i].bucket) continue;
-        if (handles[i].mode == ENGINE_LOCK_WRITE) db_rwlock_wrunlock(&handles[i].bucket->rwlock);
-        else db_rwlock_rdunlock(&handles[i].bucket->rwlock);
-    }
+    release_lock_handles(plan, handles);
 }
 
 int metrics_init(MetricsSink *sink) {
@@ -183,42 +276,67 @@ int engine_execute_sql(EngineCmdProcessorState *state, CmdRequest *request, Resp
     int matched_rows = 0;
     int affected_rows = 0;
     long generated_id = 0;
-    char body[256];
 
     if (request->type == CMD_REQUEST_PING) {
         set_response_body(response_slot, request->request_id, CMD_BODY_TEXT, "pong", 4, state->response_body_capacity);
         return 1;
     }
     if (request->type != CMD_REQUEST_SQL || !request->sql || request->sql[0] == '\0') {
-        set_response_error(response_slot, request->request_id, CMD_STATUS_BAD_REQUEST, "sql request is required", state->response_body_capacity);
+        set_invalid_sql_request_error(state, request, response_slot);
         return 0;
     }
 
     db_mutex_lock(&state->engine_mutex);
-    if (!parse_statement(request->sql, &stmt)) {
+    if (!parse_statement_or_respond(state, request, response_slot, &stmt)) {
         db_mutex_unlock(&state->engine_mutex);
-        set_response_error(response_slot, request->request_id, CMD_STATUS_PARSE_ERROR, "parse failed", state->response_body_capacity);
         return 0;
     }
-    if (!executor_execute_statement(&stmt, &matched_rows, &affected_rows, &generated_id)) {
+    if (!execute_statement_or_respond(state,
+                                      request,
+                                      response_slot,
+                                      &stmt,
+                                      &matched_rows,
+                                      &affected_rows,
+                                      &generated_id)) {
         db_mutex_unlock(&state->engine_mutex);
-        set_response_error(response_slot, request->request_id, CMD_STATUS_PROCESSING_ERROR, "execution failed", state->response_body_capacity);
         return 0;
     }
     db_mutex_unlock(&state->engine_mutex);
 
-    if (stmt.type == STMT_SELECT) {
-        snprintf(body, sizeof(body), "SELECT matched_rows=%d", matched_rows);
-    } else if (stmt.type == STMT_INSERT) {
-        snprintf(body, sizeof(body), "INSERT affected_rows=%d id=%ld", affected_rows, generated_id);
-    } else {
-        snprintf(body, sizeof(body), "%s affected_rows=%d",
-                 stmt.type == STMT_UPDATE ? "UPDATE" : "DELETE",
-                 affected_rows);
+    set_statement_success_response(state,
+                                   request,
+                                   response_slot,
+                                   &stmt,
+                                   matched_rows,
+                                   affected_rows,
+                                   generated_id);
+    return 1;
+}
+
+int execute_planned_request(EngineCmdProcessorState *state,
+                            CmdRequest *request,
+                            ResponseSlot *response_slot,
+                            const LockPlan *lock_plan,
+                            ExecutionStats *stats) {
+    LockHandle handles[ENGINE_MAX_TABLES_PER_PLAN];
+    uint64_t exec_start_us;
+
+    if (!state || !request || !response_slot || !lock_plan || !stats) return 0;
+
+    memset(handles, 0, sizeof(handles));
+    if (!lock_manager_acquire(&state->lock_manager, lock_plan, handles, &stats->lock_wait_us)) {
+        set_response_error(response_slot,
+                           request->request_id,
+                           CMD_STATUS_INTERNAL_ERROR,
+                           "lock acquisition failed",
+                           state->response_body_capacity);
+        return 0;
     }
-    set_response_body(response_slot, request->request_id, CMD_BODY_TEXT, body, strlen(body), state->response_body_capacity);
-    response_slot->response.row_count = matched_rows;
-    response_slot->response.affected_count = affected_rows;
+
+    exec_start_us = monotonic_us();
+    engine_execute_sql(state, request, response_slot);
+    stats->exec_us = monotonic_us() - exec_start_us;
+    lock_manager_release(&state->lock_manager, lock_plan, handles);
     return 1;
 }
 
@@ -250,37 +368,16 @@ db_thread_return_t DB_THREAD_CALL worker_main(void *arg_ptr) {
 
     for (;;) {
         CmdJob *job = (CmdJob *)work_queue_pop(queue);
-        LockHandle handles[ENGINE_MAX_TABLES_PER_PLAN];
 
         if (!job) break;
-        memset(handles, 0, sizeof(handles));
 
         job->stats.queue_wait_us = monotonic_us() - job->enqueue_us;
-        if (!lock_manager_acquire(&state->lock_manager, &job->lock_plan, handles, &job->stats.lock_wait_us)) {
-            set_response_error(job->response_slot,
-                               job->request->request_id,
-                               CMD_STATUS_INTERNAL_ERROR,
-                               "lock acquisition failed",
-                               state->response_body_capacity);
-            job->stats.total_us = job->stats.queue_wait_us + job->stats.lock_wait_us;
-            metrics_record(&state->metrics, &job->stats, 0, job->response_slot->response.status, job->enqueue_depth);
-            job_complete(state, job);
-            continue;
-        }
-
-        {
-            uint64_t exec_start_us = monotonic_us();
-            engine_execute_sql(state, job->request, job->response_slot);
-            job->stats.exec_us = monotonic_us() - exec_start_us;
-        }
-
-        job->stats.total_us = job->stats.queue_wait_us + job->stats.lock_wait_us + job->stats.exec_us;
-        lock_manager_release(&state->lock_manager, &job->lock_plan, handles);
-        metrics_record(&state->metrics,
-                       &job->stats,
-                       job->response_slot->response.ok,
-                       job->response_slot->response.status,
-                       job->enqueue_depth);
+        execute_planned_request(state,
+                                job->request,
+                                job->response_slot,
+                                &job->lock_plan,
+                                &job->stats);
+        record_completed_job_metrics(state, job);
         job_complete(state, job);
     }
 

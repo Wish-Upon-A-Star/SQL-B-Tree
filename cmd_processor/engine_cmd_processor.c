@@ -1,5 +1,42 @@
 #include "engine_cmd_processor_internal.h"
 
+static void publish_error_response(CmdProcessor *processor,
+                                   CmdRequest *request,
+                                   ResponseSlot *response_slot,
+                                   CmdProcessorResponseCallback callback,
+                                   void *user_data,
+                                   CmdStatusCode status,
+                                   const char *message,
+                                   size_t response_body_capacity) {
+    set_response_error(response_slot,
+                       request->request_id,
+                       status,
+                       message,
+                       response_body_capacity);
+    callback(processor, request, &response_slot->response, user_data);
+}
+
+static void push_request_slot_free_list(EngineCmdProcessorState *state, RequestSlot *slot) {
+    if (state->current_request_slots_in_use > 0) state->current_request_slots_in_use--;
+    slot->next_free = state->request_free_head;
+    state->request_free_head = (int)(slot - state->request_slots);
+}
+
+static void push_response_slot_free_list(EngineCmdProcessorState *state, ResponseSlot *slot) {
+    if (state->current_response_slots_in_use > 0) state->current_response_slots_in_use--;
+    slot->next_free = state->response_free_head;
+    state->response_free_head = (int)(slot - state->response_slots);
+}
+
+static int enqueue_planned_job(EngineCmdProcessorState *state,
+                               CmdProcessor *processor,
+                               CmdRequest *request,
+                               ResponseSlot *response_slot,
+                               CmdProcessorResponseCallback callback,
+                               void *user_data,
+                               const RoutePlan *route_plan,
+                               const LockPlan *lock_plan);
+
 static int processor_acquire_request(CmdProcessorContext *context, CmdRequest **out_request) {
     EngineCmdProcessorState *state = state_from_context(context);
     int index;
@@ -29,7 +66,7 @@ static int should_inline_execute(EngineCmdProcessorState *state) {
     int inline_execute;
 
     db_mutex_lock(&state->request_mutex);
-    inline_execute = (state->current_request_slots_in_use == 1);
+    inline_execute = (state->current_request_slots_in_use <= (unsigned long long)state->options.worker_count);
     db_mutex_unlock(&state->request_mutex);
     return inline_execute;
 }
@@ -77,17 +114,66 @@ static int submit_sql_inline(EngineCmdProcessorState *state,
                              ResponseSlot *response_slot,
                              CmdProcessorResponseCallback callback,
                              void *user_data,
+                             const LockPlan *lock_plan,
                              uint64_t start_us) {
     ExecutionStats stats;
-    uint64_t exec_start_us;
 
     memset(&stats, 0, sizeof(stats));
-    exec_start_us = monotonic_us();
-    engine_execute_sql(state, request, response_slot);
-    stats.exec_us = monotonic_us() - exec_start_us;
+    execute_planned_request(state, request, response_slot, lock_plan, &stats);
     stats.total_us = monotonic_us() - start_us;
     deliver_inline_response(state, processor, request, response_slot, callback, user_data, &stats);
     return 0;
+}
+
+static int plan_request_or_respond(EngineCmdProcessorState *state,
+                                   CmdProcessor *processor,
+                                   CmdRequest *request,
+                                   ResponseSlot *response_slot,
+                                   CmdProcessorResponseCallback callback,
+                                   void *user_data,
+                                   RoutePlan *route_plan,
+                                   LockPlan *lock_plan) {
+    if (build_request_plan(state, request, route_plan, lock_plan)) return 1;
+
+    publish_error_response(processor,
+                           request,
+                           response_slot,
+                           callback,
+                           user_data,
+                           CMD_STATUS_BAD_REQUEST,
+                           "request planning failed",
+                           state->response_body_capacity);
+    return 0;
+}
+
+static int dispatch_sql_request(EngineCmdProcessorState *state,
+                                CmdProcessor *processor,
+                                CmdRequest *request,
+                                ResponseSlot *response_slot,
+                                CmdProcessorResponseCallback callback,
+                                void *user_data,
+                                const RoutePlan *route_plan,
+                                const LockPlan *lock_plan,
+                                uint64_t start_us) {
+    if (should_inline_execute(state)) {
+        return submit_sql_inline(state,
+                                 processor,
+                                 request,
+                                 response_slot,
+                                 callback,
+                                 user_data,
+                                 lock_plan,
+                                 start_us);
+    }
+
+    return enqueue_planned_job(state,
+                               processor,
+                               request,
+                               response_slot,
+                               callback,
+                               user_data,
+                               route_plan,
+                               lock_plan);
 }
 
 static int enqueue_planned_job(EngineCmdProcessorState *state,
@@ -103,12 +189,14 @@ static int enqueue_planned_job(EngineCmdProcessorState *state,
 
     job = acquire_job(state);
     if (!job) {
-        set_response_error(response_slot,
-                           request->request_id,
-                           CMD_STATUS_INTERNAL_ERROR,
-                           "job allocation failed",
-                           state->response_body_capacity);
-        callback(processor, request, &response_slot->response, user_data);
+        publish_error_response(processor,
+                               request,
+                               response_slot,
+                               callback,
+                               user_data,
+                               CMD_STATUS_INTERNAL_ERROR,
+                               "job allocation failed",
+                               state->response_body_capacity);
         return 0;
     }
 
@@ -122,13 +210,15 @@ static int enqueue_planned_job(EngineCmdProcessorState *state,
     job->enqueue_us = monotonic_us();
 
     if (!state->running || !work_queue_push(&state->queues[route_plan->target_shard], job, &queue_depth)) {
-        set_response_error(response_slot,
-                           request->request_id,
-                           CMD_STATUS_BUSY,
-                           "processor is not accepting requests",
-                           state->response_body_capacity);
+        publish_error_response(processor,
+                               request,
+                               response_slot,
+                               callback,
+                               user_data,
+                               CMD_STATUS_BUSY,
+                               "processor is not accepting requests",
+                               state->response_body_capacity);
         release_job(state, job);
-        callback(processor, request, &response_slot->response, user_data);
         return 0;
     }
 
@@ -142,7 +232,7 @@ static int processor_submit(CmdProcessor *processor,
                             CmdProcessorResponseCallback callback,
                             void *user_data) {
     EngineCmdProcessorState *state = state_from_context(context);
-    ResponseSlot *response_slot = NULL;
+                            ResponseSlot *response_slot = NULL;
     RequestSlot *request_slot;
     RoutePlan route_plan;
     LockPlan lock_plan;
@@ -159,24 +249,26 @@ static int processor_submit(CmdProcessor *processor,
         return submit_ping_inline(state, processor, request, response_slot, callback, user_data, start_us);
     }
 
-    if (!build_request_plan(state, request, &route_plan, &lock_plan)) {
-        set_response_error(response_slot, request->request_id, CMD_STATUS_BAD_REQUEST, "request planning failed", state->response_body_capacity);
-        callback(processor, request, &response_slot->response, user_data);
+    if (!plan_request_or_respond(state,
+                                 processor,
+                                 request,
+                                 response_slot,
+                                 callback,
+                                 user_data,
+                                 &route_plan,
+                                 &lock_plan)) {
         return 0;
     }
 
-    if (should_inline_execute(state)) {
-        return submit_sql_inline(state, processor, request, response_slot, callback, user_data, start_us);
-    }
-
-    return enqueue_planned_job(state,
-                               processor,
-                               request,
-                               response_slot,
-                               callback,
-                               user_data,
-                               &route_plan,
-                               &lock_plan);
+    return dispatch_sql_request(state,
+                                processor,
+                                request,
+                                response_slot,
+                                callback,
+                                user_data,
+                                &route_plan,
+                                &lock_plan,
+                                start_us);
 }
 
 static int processor_make_error_response(CmdProcessorContext *context, const char *request_id, CmdStatusCode status, const char *error_message, CmdResponse **out_response) {
@@ -198,9 +290,7 @@ static void processor_release_request(CmdProcessorContext *context, CmdRequest *
     if (!slot) return;
     db_mutex_lock(&state->request_mutex);
     reset_request_slot(slot);
-    if (state->current_request_slots_in_use > 0) state->current_request_slots_in_use--;
-    slot->next_free = state->request_free_head;
-    state->request_free_head = (int)(slot - state->request_slots);
+    push_request_slot_free_list(state, slot);
     db_mutex_unlock(&state->request_mutex);
 }
 
@@ -212,9 +302,7 @@ static void processor_release_response(CmdProcessorContext *context, CmdResponse
     if (!slot) return;
     db_mutex_lock(&state->response_mutex);
     reset_response_slot(slot);
-    if (state->current_response_slots_in_use > 0) state->current_response_slots_in_use--;
-    slot->next_free = state->response_free_head;
-    state->response_free_head = (int)(slot - state->response_slots);
+    push_response_slot_free_list(state, slot);
     db_mutex_unlock(&state->response_mutex);
 }
 
