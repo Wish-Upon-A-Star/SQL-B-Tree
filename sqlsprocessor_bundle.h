@@ -9,6 +9,7 @@
 #include "parser.c"
 #include "bptree.c"
 #include "cmd_processor/cmd_processor.c"
+#include "cmd_processor/cmd_processor_sync_bridge.c"
 #include "cmd_processor/engine_cmd_processor_support.c"
 #include "cmd_processor/engine_cmd_processor_planner.c"
 #include "cmd_processor/engine_cmd_processor_runtime.c"

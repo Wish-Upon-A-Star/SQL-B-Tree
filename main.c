@@ -13,8 +13,8 @@
 #include "parser.h"
 #include "executor.h"
 #include "cmd_processor/cmd_processor.h"
+#include "cmd_processor/cmd_processor_sync_bridge.h"
 #include "cmd_processor/engine_cmd_processor.h"
-#include "platform_threads.h"
 #include "bench_memtrack.h"
 
 static void configure_console_encoding(void);
@@ -53,14 +53,6 @@ static int execute_sql_file(const char *filename);
 static int ensure_cmd_processor(void);
 static void shutdown_cmd_processor(void);
 static void next_request_id(char buffer[64]);
-
-typedef struct {
-    db_mutex_t mutex;
-    db_cond_t cv;
-    CmdRequest *request;
-    CmdResponse *response;
-    int done;
-} SyncSubmitResult;
 
 static CmdProcessor *g_cmd_processor = NULL;
 
@@ -113,21 +105,6 @@ static void next_request_id(char buffer[64]) {
     snprintf(buffer, 64, "req-%llu-%llu",
              (unsigned long long)now,
              (unsigned long long)counter);
-}
-
-static void sync_submit_callback(CmdProcessor *processor,
-                                 CmdRequest *request,
-                                 CmdResponse *response,
-                                 void *user_data) {
-    SyncSubmitResult *result = (SyncSubmitResult *)user_data;
-    (void)processor;
-    if (!result) return;
-    db_mutex_lock(&result->mutex);
-    result->request = request;
-    result->response = response;
-    result->done = 1;
-    db_cond_broadcast(&result->cv);
-    db_mutex_unlock(&result->mutex);
 }
 
 static void dispatch_statement(const Statement *stmt) {
@@ -342,7 +319,6 @@ static void execute_sql_text(const char *sql) {
     CmdStatusCode set_status;
     const char *normalized_sql = skip_utf8_bom_and_space(sql);
     char request_id[64];
-    SyncSubmitResult submit_result;
 
     if (*normalized_sql == '\0') return;
     if (!ensure_cmd_processor()) {
@@ -363,36 +339,14 @@ static void execute_sql_text(const char *sql) {
                                               &response) != 0) {
             printf("[오류] 요청 검증 실패를 응답으로 변환하지 못했습니다.\n");
             cmd_processor_release_request(g_cmd_processor, request);
-            return;
+                return;
         }
     } else {
-        int mutex_ready;
-        int cv_ready;
-
-        memset(&submit_result, 0, sizeof(submit_result));
-        mutex_ready = db_mutex_init(&submit_result.mutex);
-        cv_ready = mutex_ready ? db_cond_init(&submit_result.cv) : 0;
-        if (!mutex_ready || !cv_ready) {
-            printf("[오류] 내부 동기화 객체를 초기화하지 못했습니다.\n");
-            if (cv_ready) db_cond_destroy(&submit_result.cv);
-            if (mutex_ready) db_mutex_destroy(&submit_result.mutex);
-            cmd_processor_release_request(g_cmd_processor, request);
-            return;
-        }
-        if (cmd_processor_submit(g_cmd_processor, request, sync_submit_callback, &submit_result) != 0) {
+        if (cmd_processor_submit_sync(g_cmd_processor, request, &response) != 0) {
             printf("[오류] SQL 실행 중 내부 오류가 발생했습니다.\n");
-            db_cond_destroy(&submit_result.cv);
-            db_mutex_destroy(&submit_result.mutex);
             cmd_processor_release_request(g_cmd_processor, request);
             return;
         }
-        db_mutex_lock(&submit_result.mutex);
-        while (!submit_result.done) db_cond_wait(&submit_result.cv, &submit_result.mutex);
-        response = submit_result.response;
-        request = submit_result.request;
-        db_mutex_unlock(&submit_result.mutex);
-        db_cond_destroy(&submit_result.cv);
-        db_mutex_destroy(&submit_result.mutex);
     }
 
     if (set_status == CMD_STATUS_OK && !response) {
