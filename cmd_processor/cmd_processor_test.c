@@ -19,6 +19,58 @@ typedef struct {
     int failed;
 } WorkerArg;
 
+typedef struct {
+    int called;
+    int release_in_callback;
+    char request_id[64];
+    CmdStatusCode status;
+    int ok;
+    CmdBodyFormat body_format;
+    char body[4096];
+    size_t body_len;
+    char error_message[4096];
+    int saw_response;
+} CallbackCapture;
+
+static void init_capture(CallbackCapture *capture, int release_in_callback) {
+    memset(capture, 0, sizeof(*capture));
+    capture->release_in_callback = release_in_callback;
+    capture->body_format = CMD_BODY_NONE;
+}
+
+static void capture_callback(CmdProcessor *processor,
+                             CmdRequest *request,
+                             CmdResponse *response,
+                             void *user_data) {
+    CallbackCapture *capture = (CallbackCapture *)user_data;
+
+    if (!capture) return;
+    capture->called++;
+
+    if (response) {
+        capture->saw_response = 1;
+        snprintf(capture->request_id, sizeof(capture->request_id), "%s", response->request_id);
+        capture->status = response->status;
+        capture->ok = response->ok;
+        capture->body_format = response->body_format;
+        capture->body_len = response->body_len;
+        if (response->body) {
+            snprintf(capture->body, sizeof(capture->body), "%s", response->body);
+        }
+        if (response->error_message) {
+            snprintf(capture->error_message,
+                     sizeof(capture->error_message),
+                     "%s",
+                     response->error_message);
+        }
+    }
+
+    if (capture->release_in_callback) {
+        if (response) cmd_processor_release_response(processor, response);
+        if (request) cmd_processor_release_request(processor, request);
+    }
+}
+
 static int test_status_strings(void) {
     CHECK(strcmp(cmd_status_to_string(CMD_STATUS_OK), "OK") == 0);
     CHECK(strcmp(cmd_status_to_string(CMD_STATUS_BAD_REQUEST), "BAD_REQUEST") == 0);
@@ -50,23 +102,22 @@ static int test_default_context(void) {
 static int test_ping(void) {
     CmdProcessor *processor = NULL;
     CmdRequest *request = NULL;
-    CmdResponse *response = NULL;
+    CallbackCapture capture;
 
+    init_capture(&capture, 1);
     CHECK(mock_cmd_processor_create(NULL, &processor) == 0);
     CHECK(cmd_processor_acquire_request(processor, &request) == 0);
     CHECK(cmd_processor_set_ping_request(processor, request, "ping-1") == CMD_STATUS_OK);
-    CHECK(cmd_processor_process(processor, request, &response) == 0);
-    CHECK(response != NULL);
-    CHECK(strcmp(response->request_id, "ping-1") == 0);
-    CHECK(response->status == CMD_STATUS_OK);
-    CHECK(response->ok == 1);
-    CHECK(response->body_format == CMD_BODY_TEXT);
-    CHECK(response->body != NULL);
-    CHECK(strcmp(response->body, "pong") == 0);
-    CHECK(response->body_len == 4);
-    CHECK(response->error_message == NULL);
-    cmd_processor_release_response(processor, response);
-    cmd_processor_release_request(processor, request);
+    CHECK(cmd_processor_submit(processor, request, capture_callback, &capture) == 0);
+    CHECK(capture.called == 1);
+    CHECK(capture.saw_response == 1);
+    CHECK(strcmp(capture.request_id, "ping-1") == 0);
+    CHECK(capture.status == CMD_STATUS_OK);
+    CHECK(capture.ok == 1);
+    CHECK(capture.body_format == CMD_BODY_TEXT);
+    CHECK(strcmp(capture.body, "pong") == 0);
+    CHECK(capture.body_len == 4);
+    CHECK(capture.error_message[0] == '\0');
     cmd_processor_shutdown(processor);
     return 0;
 }
@@ -74,26 +125,24 @@ static int test_ping(void) {
 static int test_sql_json_echo_and_copy(void) {
     CmdProcessor *processor = NULL;
     CmdRequest *request = NULL;
-    CmdResponse *response = NULL;
+    CallbackCapture capture;
     char sql[] = "SELECT * FROM users;";
     const char *expected = "{\"mock\":true,\"sql\":\"SELECT * FROM users;\"}";
 
+    init_capture(&capture, 1);
     CHECK(mock_cmd_processor_create(NULL, &processor) == 0);
     CHECK(cmd_processor_acquire_request(processor, &request) == 0);
     CHECK(cmd_processor_set_sql_request(processor, request, "sql-1", sql) == CMD_STATUS_OK);
     strcpy(sql, "CHANGED");
     CHECK(strcmp(request->sql, "SELECT * FROM users;") == 0);
-    CHECK(cmd_processor_process(processor, request, &response) == 0);
-    CHECK(response != NULL);
-    CHECK(strcmp(response->request_id, "sql-1") == 0);
-    CHECK(response->status == CMD_STATUS_OK);
-    CHECK(response->ok == 1);
-    CHECK(response->body_format == CMD_BODY_JSON);
-    CHECK(response->body != NULL);
-    CHECK(strcmp(response->body, expected) == 0);
-    CHECK(response->body_len == strlen(expected));
-    cmd_processor_release_response(processor, response);
-    cmd_processor_release_request(processor, request);
+    CHECK(cmd_processor_submit(processor, request, capture_callback, &capture) == 0);
+    CHECK(capture.called == 1);
+    CHECK(strcmp(capture.request_id, "sql-1") == 0);
+    CHECK(capture.status == CMD_STATUS_OK);
+    CHECK(capture.ok == 1);
+    CHECK(capture.body_format == CMD_BODY_JSON);
+    CHECK(strcmp(capture.body, expected) == 0);
+    CHECK(capture.body_len == strlen(expected));
     cmd_processor_shutdown(processor);
     return 0;
 }
@@ -101,18 +150,17 @@ static int test_sql_json_echo_and_copy(void) {
 static int test_json_escape(void) {
     CmdProcessor *processor = NULL;
     CmdRequest *request = NULL;
-    CmdResponse *response = NULL;
+    CallbackCapture capture;
     const char *expected = "{\"mock\":true,\"sql\":\"SELECT \\\"x\\\" \\\\ \\n\"}";
 
+    init_capture(&capture, 1);
     CHECK(mock_cmd_processor_create(NULL, &processor) == 0);
     CHECK(cmd_processor_acquire_request(processor, &request) == 0);
     CHECK(cmd_processor_set_sql_request(processor, request, "escape", "SELECT \"x\" \\ \n") == CMD_STATUS_OK);
-    CHECK(cmd_processor_process(processor, request, &response) == 0);
-    CHECK(response != NULL);
-    CHECK(strcmp(response->body, expected) == 0);
-    CHECK(response->body_len == strlen(expected));
-    cmd_processor_release_response(processor, response);
-    cmd_processor_release_request(processor, request);
+    CHECK(cmd_processor_submit(processor, request, capture_callback, &capture) == 0);
+    CHECK(capture.called == 1);
+    CHECK(strcmp(capture.body, expected) == 0);
+    CHECK(capture.body_len == strlen(expected));
     cmd_processor_shutdown(processor);
     return 0;
 }
@@ -166,14 +214,15 @@ static int test_error_response_helper(void) {
 static int test_rejects_foreign_request(void) {
     CmdProcessor *processor = NULL;
     CmdRequest request;
-    CmdResponse *response = NULL;
+    CallbackCapture capture;
 
+    init_capture(&capture, 0);
     memset(&request, 0, sizeof(request));
     request.sql = "SELECT 1;";
 
     CHECK(mock_cmd_processor_create(NULL, &processor) == 0);
-    CHECK(cmd_processor_process(processor, &request, &response) == -1);
-    CHECK(response == NULL);
+    CHECK(cmd_processor_submit(processor, &request, capture_callback, &capture) == -1);
+    CHECK(capture.called == 0);
     cmd_processor_shutdown(processor);
     return 0;
 }
@@ -207,19 +256,18 @@ static int test_request_pool_reuse(void) {
 static int expect_mock_status(const char *sql, CmdStatusCode status) {
     CmdProcessor *processor = NULL;
     CmdRequest *request = NULL;
-    CmdResponse *response = NULL;
+    CallbackCapture capture;
 
+    init_capture(&capture, 1);
     CHECK(mock_cmd_processor_create(NULL, &processor) == 0);
     CHECK(cmd_processor_acquire_request(processor, &request) == 0);
     CHECK(cmd_processor_set_sql_request(processor, request, "status", sql) == CMD_STATUS_OK);
-    CHECK(cmd_processor_process(processor, request, &response) == 0);
-    CHECK(response != NULL);
-    CHECK(response->status == status);
-    CHECK(response->ok == 0);
-    CHECK(response->body_format == CMD_BODY_NONE);
-    CHECK(response->error_message != NULL);
-    cmd_processor_release_response(processor, response);
-    cmd_processor_release_request(processor, request);
+    CHECK(cmd_processor_submit(processor, request, capture_callback, &capture) == 0);
+    CHECK(capture.called == 1);
+    CHECK(capture.status == status);
+    CHECK(capture.ok == 0);
+    CHECK(capture.body_format == CMD_BODY_NONE);
+    CHECK(capture.error_message[0] != '\0');
     cmd_processor_shutdown(processor);
     return 0;
 }
@@ -230,10 +278,11 @@ static void *worker_main(void *arg_ptr) {
 
     for (i = 0; i < 200; i++) {
         CmdRequest *request = NULL;
-        CmdResponse *response = NULL;
+        CallbackCapture capture;
         char request_id[64];
         char sql[128];
 
+        init_capture(&capture, 1);
         snprintf(request_id, sizeof(request_id), "t%d-%d", arg->thread_index, i);
         snprintf(sql, sizeof(sql), "SELECT %d FROM worker_%d;", i, arg->thread_index);
 
@@ -246,32 +295,27 @@ static void *worker_main(void *arg_ptr) {
             cmd_processor_release_request(arg->processor, request);
             return NULL;
         }
-        if (cmd_processor_process(arg->processor, request, &response) != 0 || !response) {
+        if (cmd_processor_submit(arg->processor, request, capture_callback, &capture) != 0) {
             arg->failed = 1;
             cmd_processor_release_request(arg->processor, request);
             return NULL;
         }
-        if (strcmp(response->request_id, request_id) != 0 ||
-            response->status != CMD_STATUS_OK ||
-            response->ok != 1 ||
-            response->body_format != CMD_BODY_JSON ||
-            !response->body ||
-            strstr(response->body, sql) == NULL ||
-            response->body_len != strlen(response->body)) {
+        if (capture.called != 1 ||
+            strcmp(capture.request_id, request_id) != 0 ||
+            capture.status != CMD_STATUS_OK ||
+            capture.ok != 1 ||
+            capture.body_format != CMD_BODY_JSON ||
+            strstr(capture.body, sql) == NULL ||
+            capture.body_len != strlen(capture.body)) {
             arg->failed = 1;
-            cmd_processor_release_response(arg->processor, response);
-            cmd_processor_release_request(arg->processor, request);
             return NULL;
         }
-
-        cmd_processor_release_response(arg->processor, response);
-        cmd_processor_release_request(arg->processor, request);
     }
 
     return NULL;
 }
 
-static int test_concurrent_process_calls(void) {
+static int test_concurrent_submit_calls(void) {
     enum { THREAD_COUNT = 4 };
     CmdProcessorContext context;
     CmdProcessor *processor = NULL;
@@ -313,7 +357,7 @@ int main(void) {
     CHECK(expect_mock_status("MOCK_BUSY", CMD_STATUS_BUSY) == 0);
     CHECK(expect_mock_status("MOCK_TIMEOUT", CMD_STATUS_TIMEOUT) == 0);
     CHECK(expect_mock_status("MOCK_PROCESSING_ERROR", CMD_STATUS_PROCESSING_ERROR) == 0);
-    CHECK(test_concurrent_process_calls() == 0);
+    CHECK(test_concurrent_submit_calls() == 0);
 
     printf("[ok] cmd_processor checks passed\n");
     return 0;

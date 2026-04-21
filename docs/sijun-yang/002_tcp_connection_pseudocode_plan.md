@@ -28,7 +28,7 @@ TCP 계층은 사용자별 TCP connection을 맺고, JSON line 요청을 읽어 
 
 - TCP 계층은 DB 실행 구조를 만들지 않는다.
 - 다중 in-flight를 진짜로 지원하려면 `CmdProcessor`가 요청 제출 후 나중에 응답을 돌려줄 수 있어야 한다.
-- `CmdProcessor.process()`가 blocking 함수라면 같은 connection의 요청 처리는 순차 처리로 축소된다.
+- `CmdProcessor.submit()`이 내부적으로 blocking 처리만 한다면 같은 connection의 요청 처리는 순차 처리로 축소된다.
 
 ## 3. 주요 상태
 
@@ -180,7 +180,7 @@ def processor로_요청을_전달한다(연결, 요청):
     CmdProcessor에_요청을_제출한다(processor, cmd_request)
 ```
 
-동기 `CmdProcessor.process()`만 사용할 수 있다면 마지막 줄은 아래 의미가 된다.
+동기 처리기만 사용할 수 있다면 마지막 줄은 아래 의미가 된다.
 
 ```python
 응답 = CmdProcessor가_요청을_처리할_때까지_기다린다(cmd_request)

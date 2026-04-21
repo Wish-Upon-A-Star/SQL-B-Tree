@@ -4,12 +4,12 @@
 
 이 문서는 API/TCP 계층에서 알아야 할 connection 동시성 개념을 간단히 정리한다.
 
-DB 내부 구현, SQL 실행 방식, B+ Tree lock 정책은 DB 구현 담당자의 책임이다. API/TCP 계층은 여러 클라이언트 요청을 받아 `CmdProcessor.process()`까지 전달하는 역할에 집중한다.
+DB 내부 구현, SQL 실행 방식, B+ Tree lock 정책은 DB 구현 담당자의 책임이다. API/TCP 계층은 여러 클라이언트 요청을 받아 `CmdProcessor.submit()`까지 전달하는 역할에 집중한다.
 
 ```text
 TCP client
         -> TCP server
-        -> CmdProcessor.process()
+        -> CmdProcessor.submit()
         -> DB 구현체
 ```
 
@@ -111,9 +111,9 @@ connection reader
 TCP 계층은 여러 connection에서 여러 요청을 `CmdProcessor`까지 전달할 수 있게 한다.
 
 ```text
-connection A -> request 1 -> CmdProcessor.process()
-connection A -> request 2 -> CmdProcessor.process()
-connection B -> request 3 -> CmdProcessor.process()
+connection A -> request 1 -> CmdProcessor.submit()
+connection A -> request 2 -> CmdProcessor.submit()
+connection B -> request 3 -> CmdProcessor.submit()
 ```
 
 실제 SQL 실행을 병렬로 할지, lock으로 직렬화할지는 DB 구현체가 결정한다.
@@ -122,7 +122,7 @@ connection B -> request 3 -> CmdProcessor.process()
 
 ### 5.1 CmdProcessor 동시 호출 계약
 
-- 여러 connection과 여러 in-flight 요청 때문에 `CmdProcessor.process()`는 동시에 호출될 수 있다.
+- 여러 connection과 여러 in-flight 요청 때문에 `CmdProcessor.submit()`은 동시에 호출될 수 있다.
 - DB 구현체는 이 동시 호출을 안전하게 처리해야 한다.
 - 병렬 처리가 어렵다면 내부에서 직렬화하거나 `BUSY`, `TIMEOUT` 같은 상태를 반환할 수 있다.
 

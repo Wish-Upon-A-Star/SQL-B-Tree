@@ -83,15 +83,19 @@ CmdStatusCode cmd_processor_set_ping_request(CmdProcessor *processor,
     return CMD_STATUS_OK;
 }
 
-int cmd_processor_process(CmdProcessor *processor,
-                          CmdRequest *request,
-                          CmdResponse **out_response) {
-    if (out_response) *out_response = NULL;
-    if (!processor_is_usable(processor) || !processor->process || !request || !out_response) {
+int cmd_processor_submit(CmdProcessor *processor,
+                         CmdRequest *request,
+                         CmdProcessorResponseCallback callback,
+                         void *user_data) {
+    if (!processor_is_usable(processor) || !processor->submit || !request || !callback) {
         return -1;
     }
 
-    return processor->process(processor->context, request, out_response);
+    return processor->submit(processor,
+                             processor->context,
+                             request,
+                             callback,
+                             user_data);
 }
 
 int cmd_processor_make_error_response(CmdProcessor *processor,

@@ -117,6 +117,21 @@ typedef struct {
     void *shared_state;
 } CmdProcessorContext;
 
+struct CmdProcessor;
+
+/**
+ * @brief 비동기 요청 처리 완료 시 호출되는 callback.
+ *
+ * request와 response는 모두 CmdProcessor 소유다. callback 구현체는 응답을
+ * 직렬화하거나 필요한 내용을 복사한 뒤, public release API로 request와
+ * response를 반환해야 한다. response가 NULL이면 submit 이후 치명적 처리
+ * 실패로 본다.
+ */
+typedef void (*CmdProcessorResponseCallback)(struct CmdProcessor *processor,
+                                             CmdRequest *request,
+                                             CmdResponse *response,
+                                             void *user_data);
+
 /**
  * @brief CmdProcessor 구현체 vtable과 context 묶음.
  *
@@ -133,12 +148,14 @@ typedef struct CmdProcessor {
     int (*acquire_request)(CmdProcessorContext *context,
                            CmdRequest **out_request);
     /**
-     * @brief 요청을 처리하고 processor-owned CmdResponse를 반환한다.
-     * @return API 호출 자체가 수행되면 0, API 사용 오류나 치명적 오류면 0이 아닌 값.
+     * @brief 요청을 제출하고 완료 시 callback으로 processor-owned CmdResponse를 전달한다.
+     * @return 제출 자체가 성공하면 0, API 사용 오류나 제출 실패면 0이 아닌 값.
      */
-    int (*process)(CmdProcessorContext *context,
-                   CmdRequest *request,
-                   CmdResponse **out_response);
+    int (*submit)(struct CmdProcessor *processor,
+                  CmdProcessorContext *context,
+                  CmdRequest *request,
+                  CmdProcessorResponseCallback callback,
+                  void *user_data);
     /**
      * @brief frontend validation 실패 등을 processor-owned 오류 응답으로 만든다.
      * @return 성공 시 0, response slot 확보 실패 등 API 실패 시 0이 아닌 값.
@@ -154,7 +171,7 @@ typedef struct CmdProcessor {
     void (*release_request)(CmdProcessorContext *context,
                             CmdRequest *request);
     /**
-     * @brief process() 또는 make_error_response()로 얻은 응답 slot을 반환한다.
+     * @brief submit() callback 또는 make_error_response()로 얻은 응답 slot을 반환한다.
      */
     void (*release_response)(CmdProcessorContext *context,
                              CmdResponse *response);
@@ -209,16 +226,18 @@ CmdStatusCode cmd_processor_set_ping_request(CmdProcessor *processor,
                                              const char *request_id);
 
 /**
- * @brief 요청을 처리하고 processor-owned 응답 객체를 받는다.
+ * @brief 요청을 제출하고 완료 시 callback으로 응답 객체를 받는다.
  *
  * @param processor 사용할 processor.
  * @param request 처리할 요청 객체.
- * @param out_response 성공 시 응답 객체 포인터를 받는다.
- * @return API 호출 자체가 수행되면 0, API 실패 시 -1.
+ * @param callback 완료 시 호출할 callback.
+ * @param user_data callback에 그대로 전달할 호출자 context.
+ * @return 제출 성공 시 0, 실패 시 -1.
  */
-int cmd_processor_process(CmdProcessor *processor,
-                          CmdRequest *request,
-                          CmdResponse **out_response);
+int cmd_processor_submit(CmdProcessor *processor,
+                         CmdRequest *request,
+                         CmdProcessorResponseCallback callback,
+                         void *user_data);
 
 /**
  * @brief frontend validation 오류를 processor-owned 응답 객체로 만든다.

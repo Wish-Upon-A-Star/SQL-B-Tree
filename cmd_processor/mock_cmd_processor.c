@@ -244,9 +244,9 @@ static int mock_acquire_request(CmdProcessorContext *context,
     return -1;
 }
 
-static int mock_process(CmdProcessorContext *context,
-                        CmdRequest *request,
-                        CmdResponse **out_response) {
+static int mock_build_response(CmdProcessorContext *context,
+                               CmdRequest *request,
+                               CmdResponse **out_response) {
     MockCmdProcessorState *state;
     MockResponseSlot *slot;
     int request_index;
@@ -346,6 +346,23 @@ static int mock_process(CmdProcessorContext *context,
                       echo_len,
                       state->response_capacity);
     *out_response = &slot->response;
+    return 0;
+}
+
+static int mock_submit(CmdProcessor *processor,
+                       CmdProcessorContext *context,
+                       CmdRequest *request,
+                       CmdProcessorResponseCallback callback,
+                       void *user_data) {
+    CmdResponse *response = NULL;
+    int rc;
+
+    if (!processor || !callback) return -1;
+
+    rc = mock_build_response(context, request, &response);
+    if (rc != 0) return -1;
+
+    callback(processor, request, response, user_data);
     return 0;
 }
 
@@ -501,7 +518,7 @@ int mock_cmd_processor_create(const CmdProcessorContext *base_context,
     /* Public CmdProcessor wrapper가 호출할 mock callback들을 연결한다. */
     state->processor.context = &state->context;
     state->processor.acquire_request = mock_acquire_request;
-    state->processor.process = mock_process;
+    state->processor.submit = mock_submit;
     state->processor.make_error_response = mock_make_error_response;
     state->processor.release_request = mock_release_request;
     state->processor.release_response = mock_release_response;
