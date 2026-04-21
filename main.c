@@ -107,6 +107,27 @@ static void copy_trimmed(char *dst, size_t dst_size, const char *start, const ch
 static int starts_with_keyword(const char *text, const char *keyword);
 static const char *skip_utf8_bom_and_space(const char *sql);
 static void dispatch_statement(const Statement *stmt);
+typedef enum {
+    APP_MODE_EXEC_FILE,
+    APP_MODE_GENERATE_JUNGLE,
+    APP_MODE_BENCHMARK,
+    APP_MODE_BENCHMARK_JUNGLE
+} AppMode;
+
+typedef struct {
+    AppMode mode;
+    int quiet;
+    int count;
+    const char *dataset_output;
+    char filename[256];
+} AppConfig;
+
+static void init_app_config(AppConfig *config);
+static int consume_flag(const char *arg, const char *flag);
+static int parse_count_arg(int argc, char *argv[], int index, int fallback);
+static int read_input_filename(AppConfig *config);
+static int parse_app_config(int argc, char *argv[], AppConfig *config);
+static int run_app(const AppConfig *config);
 static int parse_fast_insert_sql(const char *sql);
 static int parse_fast_update_sql(const char *sql);
 static int parse_fast_delete_sql(const char *sql);
@@ -172,6 +193,86 @@ static void dispatch_statement(const Statement *stmt) {
             return;
         default:
             return;
+    }
+}
+
+static void init_app_config(AppConfig *config) {
+    memset(config, 0, sizeof(*config));
+    config->mode = APP_MODE_EXEC_FILE;
+    config->count = 1000000;
+}
+
+static int consume_flag(const char *arg, const char *flag) {
+    return arg && strcmp(arg, flag) == 0;
+}
+
+static int parse_count_arg(int argc, char *argv[], int index, int fallback) {
+    return (index < argc) ? atoi(argv[index]) : fallback;
+}
+
+static int read_input_filename(AppConfig *config) {
+    printf("입력 SQL 파일 경로: ");
+    return scanf("%255s", config->filename) == 1;
+}
+
+static int parse_app_config(int argc, char *argv[], AppConfig *config) {
+    int argi = 1;
+
+    init_app_config(config);
+
+    if (argi < argc && consume_flag(argv[argi], "--quiet")) {
+        config->quiet = 1;
+        argi++;
+    }
+
+    if (argi < argc && consume_flag(argv[argi], "--generate-jungle")) {
+        config->mode = APP_MODE_GENERATE_JUNGLE;
+        config->count = parse_count_arg(argc, argv, argi + 1, 1000000);
+        config->dataset_output = (argi + 2 < argc) ? argv[argi + 2] : NULL;
+        return 1;
+    }
+
+    if (argi < argc && consume_flag(argv[argi], "--benchmark")) {
+        config->mode = APP_MODE_BENCHMARK;
+        config->count = parse_count_arg(argc, argv, argi + 1, 1000000);
+        return 1;
+    }
+
+    if (argi < argc && consume_flag(argv[argi], "--benchmark-jungle")) {
+        config->mode = APP_MODE_BENCHMARK_JUNGLE;
+        config->count = parse_count_arg(argc, argv, argi + 1, 1000000);
+        return 1;
+    }
+
+    if (argi < argc) {
+        strncpy(config->filename, argv[argi], sizeof(config->filename) - 1);
+        config->filename[sizeof(config->filename) - 1] = '\0';
+        return 1;
+    }
+
+    return read_input_filename(config);
+}
+
+static int run_app(const AppConfig *config) {
+    if (config->quiet) {
+        set_executor_quiet(1);
+    }
+
+    switch (config->mode) {
+        case APP_MODE_GENERATE_JUNGLE:
+            generate_jungle_dataset(config->count, config->dataset_output);
+            return 0;
+        case APP_MODE_BENCHMARK:
+            run_bplus_benchmark(config->count);
+            return 0;
+        case APP_MODE_BENCHMARK_JUNGLE:
+            run_jungle_benchmark(config->count);
+            return 0;
+        case APP_MODE_EXEC_FILE:
+        default:
+            if (execute_sql_file(config->filename) != 0) return 1;
+            close_all_tables();
+            return 0;
     }
 }
 
@@ -359,55 +460,19 @@ static int execute_sql_file(const char *filename) {
 
 /* SQL 파일에서 ';'로 구분되는 SQL 문장을 순서대로 실행합니다. */
 int main(int argc, char *argv[]) {
-    char filename[256];
-    int argi = 1;
+    AppConfig config;
 
     configure_console_encoding();
 #if defined(BENCH_MEMTRACK)
     atexit(bench_memtrack_report);
 #endif
 
-    if (argi < argc && strcmp(argv[argi], "--quiet") == 0) {
-        set_executor_quiet(1);
-        argi++;
-    }
-
-    if (argi < argc && strcmp(argv[argi], "--generate-jungle") == 0) {
-        int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
-        const char *output = (argi + 2 < argc) ? argv[argi + 2] : NULL;
-        generate_jungle_dataset(count, output);
-        return 0;
-    }
-
-    if (argi < argc && strcmp(argv[argi], "--benchmark") == 0) {
-        int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
-        run_bplus_benchmark(count);
-        return 0;
-    }
-    if (argi < argc && strcmp(argv[argi], "--benchmark-jungle") == 0) {
-        int count = (argi + 1 < argc) ? atoi(argv[argi + 1]) : 1000000;
-        run_jungle_benchmark(count);
-        return 0;
-    }
-
-    if (argi < argc) {
-        strncpy(filename, argv[argi], 255);
-        filename[255] = '\0';
-    } else {
-        printf("입력 SQL 파일 경로: ");
-        if (scanf("%255s", filename) != 1) return 1;
-    }
-
-    if (execute_sql_file(filename) != 0) return 1;
-    close_all_tables();
-    return 0;
+    if (!parse_app_config(argc, argv, &config)) return 1;
+    return run_app(&config);
 }
 
 /*
  * 일부 IDE/에디터는 "현재 파일만 컴파일" 방식으로 main.c 하나만 빌드합니다.
- * 그 경우에도 바로 실행되도록 구현 파일을 여기서 함께 포함합니다.
+ * 그 빌드 경로는 별도 번들 파일이 담당하고, main.c는 엔트리포인트 흐름만 남깁니다.
  */
-#include "lexer.c"
-#include "parser.c"
-#include "bptree.c"
-#include "executor.c"
+#include "sqlsprocessor_bundle.h"

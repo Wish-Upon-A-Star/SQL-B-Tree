@@ -14,6 +14,8 @@
 #define DELTA_LINE_SIZE (RECORD_SIZE + 128)
 #define TABLE_FILE_BUFFER_SIZE (1024 * 1024)
 
+typedef struct SnapshotMeta SnapshotMeta;
+
 TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
 static unsigned long long g_table_access_seq = 0;
@@ -100,6 +102,11 @@ static int scan_select_file_rows(TableCache *tc, long start_offset,
                                  const char *tail_trace, const char *full_trace,
                                  int (*visitor)(TableCache *, const char *, void *), void *ctx);
 static int read_csv_row_at_offset(TableCache *tc, long offset, char *line, size_t line_size);
+static int read_snapshot_meta(TableCache *tc, FILE *f, SnapshotMeta *meta,
+                              int allow_v1, int require_delta_absent);
+static int read_snapshot_id_pairs(TableCache *tc, FILE *f, int active_count, BPlusPair **id_pairs_out);
+static int read_snapshot_uk_indexes(TableCache *tc, FILE *f, int active_count,
+                                    UniqueIndex *new_indexes[MAX_UKS]);
 static void reset_deleted_flags(TableCache *tc, int *delete_flags, int old_count);
 static void release_deleted_slots(TableCache *tc, int *delete_flags, int old_count);
 static void clear_slot_storage(TableCache *tc, int slot_id);
@@ -2431,6 +2438,26 @@ typedef struct {
     int exists;
 } FileStamp;
 
+typedef struct SnapshotMeta {
+    int snapshot_v2;
+    int csv_exists;
+    long csv_size;
+    long csv_mtime;
+    int delta_exists;
+    long delta_size;
+    long delta_mtime;
+    int col_count;
+    int pk_idx;
+    int uk_count;
+    int uk_indices[MAX_UKS];
+    int record_count;
+    int active_count;
+    int cache_truncated;
+    int tail_count;
+    long next_auto_id;
+    long next_row_id;
+} SnapshotMeta;
+
 static FileStamp get_file_stamp(const char *filename) {
     struct stat st;
     FileStamp stamp = {0, 0, 0};
@@ -2620,91 +2647,206 @@ static int read_expected_line(FILE *f, char *line, size_t line_size) {
     return 1;
 }
 
-static int load_index_snapshot(TableCache *tc) {
+static int read_snapshot_meta(TableCache *tc, FILE *f, SnapshotMeta *meta,
+                              int allow_v1, int require_delta_absent) {
     char filename[300];
     char csv_filename[300];
     char delta_filename[300];
     char line[DELTA_LINE_SIZE];
-    FILE *f;
     FileStamp csv_stamp;
     FileStamp delta_stamp;
-    int csv_exists;
-    long csv_size;
-    long csv_mtime;
-    int delta_exists;
-    long delta_size;
-    long delta_mtime;
-    int col_count;
-    int pk_idx;
-    int uk_count;
-    int uk_indices[MAX_UKS] = {0};
-    int record_count;
-    int active_count;
-    int cache_truncated;
-    int tail_count;
-    long next_auto_id;
-    long next_row_id;
+    int i;
+
+    if (!tc || !f || !meta) return 0;
+    memset(meta, 0, sizeof(*meta));
+
+    snprintf(csv_filename, sizeof(csv_filename), "%s.csv", tc->table_name);
+    get_delta_filename(tc, delta_filename, sizeof(delta_filename));
+    csv_stamp = get_file_stamp(csv_filename);
+    delta_stamp = get_file_stamp(delta_filename);
+    if (require_delta_absent && delta_stamp.exists) return 0;
+
+    if (!read_expected_line(f, line, sizeof(line))) return 0;
+    if (strcmp(line, "SQLPROC_IDX_V2") == 0) {
+        meta->snapshot_v2 = 1;
+    } else if (allow_v1 && strcmp(line, "SQLPROC_IDX_V1") == 0) {
+        meta->snapshot_v2 = 0;
+    } else {
+        return 0;
+    }
+
+    if (!read_expected_line(f, line, sizeof(line)) ||
+        sscanf(line, "TABLE %255s", filename) != 1 ||
+        strcmp(filename, tc->table_name) != 0) {
+        return 0;
+    }
+    if (!read_expected_line(f, line, sizeof(line)) ||
+        sscanf(line, "CSV %d %ld %ld", &meta->csv_exists, &meta->csv_size, &meta->csv_mtime) != 3) {
+        return 0;
+    }
+    if (!read_expected_line(f, line, sizeof(line)) ||
+        sscanf(line, "DELTA %d %ld %ld", &meta->delta_exists, &meta->delta_size, &meta->delta_mtime) != 3) {
+        return 0;
+    }
+    if (meta->csv_exists != csv_stamp.exists ||
+        meta->csv_size != csv_stamp.size ||
+        meta->csv_mtime != csv_stamp.mtime ||
+        meta->delta_exists != delta_stamp.exists ||
+        meta->delta_size != delta_stamp.size ||
+        meta->delta_mtime != delta_stamp.mtime) {
+        return 0;
+    }
+    if (require_delta_absent && meta->delta_exists) return 0;
+
+    if (!read_expected_line(f, line, sizeof(line))) return 0;
+    {
+        char *p = line;
+        if (strncmp(p, "SCHEMA ", 7) != 0) return 0;
+        p += 7;
+        if (sscanf(p, "%d %d %d", &meta->col_count, &meta->pk_idx, &meta->uk_count) != 3) return 0;
+        for (i = 0; i < 3; i++) {
+            while (*p && !isspace((unsigned char)*p)) p++;
+            while (isspace((unsigned char)*p)) p++;
+        }
+        for (i = 0; i < meta->uk_count && i < MAX_UKS; i++) {
+            if (sscanf(p, "%d", &meta->uk_indices[i]) != 1) return 0;
+            while (*p && !isspace((unsigned char)*p)) p++;
+            while (isspace((unsigned char)*p)) p++;
+        }
+    }
+    if (meta->col_count != tc->col_count || meta->pk_idx != tc->pk_idx || meta->uk_count != tc->uk_count) {
+        return 0;
+    }
+    for (i = 0; i < meta->uk_count; i++) {
+        if (meta->uk_indices[i] != tc->uk_indices[i]) return 0;
+    }
+
+    if (!read_expected_line(f, line, sizeof(line)) ||
+        sscanf(line, "ROWS %d %d %d %d %ld %ld",
+               &meta->record_count, &meta->active_count, &meta->cache_truncated,
+               &meta->tail_count, &meta->next_auto_id, &meta->next_row_id) != 6) {
+        return 0;
+    }
+    return 1;
+}
+
+static int read_snapshot_id_pairs(TableCache *tc, FILE *f, int active_count, BPlusPair **id_pairs_out) {
+    char line[DELTA_LINE_SIZE];
+    BPlusPair *id_pairs = NULL;
     int id_count;
+    int i;
+
+    if (!tc || !f || !id_pairs_out) return 0;
+    *id_pairs_out = NULL;
+
+    if (!read_expected_line(f, line, sizeof(line)) || sscanf(line, "ID %d", &id_count) != 1) return 0;
+    if (id_count != active_count) return 0;
+    if (id_count > 0) {
+        id_pairs = (BPlusPair *)calloc((size_t)id_count, sizeof(BPlusPair));
+        if (!id_pairs) return 0;
+    }
+    for (i = 0; i < id_count; i++) {
+        if (!read_expected_line(f, line, sizeof(line)) ||
+            sscanf(line, "%ld\t%d", &id_pairs[i].key, &id_pairs[i].row_index) != 2 ||
+            !slot_is_active(tc, id_pairs[i].row_index)) {
+            free(id_pairs);
+            return 0;
+        }
+    }
+    *id_pairs_out = id_pairs;
+    return id_count;
+}
+
+static int read_snapshot_uk_indexes(TableCache *tc, FILE *f, int active_count,
+                                    UniqueIndex *new_indexes[MAX_UKS]) {
+    char line[DELTA_LINE_SIZE];
     int section_count;
-    int snapshot_v2 = 0;
+    int i;
+
+    if (!tc || !f || !new_indexes) return 0;
+    if (!read_expected_line(f, line, sizeof(line)) ||
+        sscanf(line, "UKSECTIONS %d", &section_count) != 1 ||
+        section_count != tc->uk_count) {
+        return 0;
+    }
+
+    for (i = 0; i < tc->uk_count; i++) {
+        BPlusStringPair *pairs = NULL;
+        int col_idx;
+        int count;
+        int j;
+
+        if (!read_expected_line(f, line, sizeof(line)) ||
+            sscanf(line, "UK %d %d", &col_idx, &count) != 2 ||
+            col_idx != tc->uk_indices[i] || count < 0 || count > active_count) {
+            return 0;
+        }
+        new_indexes[i] = unique_index_create(col_idx);
+        if (!new_indexes[i]) return 0;
+        if (count > 0) {
+            pairs = (BPlusStringPair *)calloc((size_t)count, sizeof(BPlusStringPair));
+            if (!pairs) return 0;
+        }
+        for (j = 0; j < count; j++) {
+            char *tab;
+            int row_index;
+
+            if (!read_expected_line(f, line, sizeof(line))) {
+                free(pairs);
+                return 0;
+            }
+            tab = strchr(line, '\t');
+            if (!tab) {
+                free(pairs);
+                return 0;
+            }
+            *tab++ = '\0';
+            row_index = atoi(line);
+            if (!slot_is_active(tc, row_index)) {
+                free(pairs);
+                return 0;
+            }
+            pairs[j].row_index = row_index;
+            pairs[j].key = dup_string(tab);
+            if (!pairs[j].key) {
+                free(pairs);
+                return 0;
+            }
+        }
+        if (!bptree_string_build_from_sorted(new_indexes[i]->tree, pairs, count)) {
+            for (j = 0; j < count; j++) free(pairs[j].key);
+            free(pairs);
+            return 0;
+        }
+        for (j = 0; j < count; j++) free(pairs[j].key);
+        free(pairs);
+    }
+
+    return read_expected_line(f, line, sizeof(line)) && strcmp(line, "END") == 0;
+}
+
+static int load_index_snapshot(TableCache *tc) {
+    char filename[300];
+    char line[DELTA_LINE_SIZE];
+    FILE *f;
+    SnapshotMeta meta;
     int i;
     BPlusPair *id_pairs = NULL;
     UniqueIndex *new_indexes[MAX_UKS] = {0};
+    int id_count;
 
     if (!tc || strlen(tc->table_name) == 0 || tc->cache_truncated) return 0;
     get_index_filename(tc, filename, sizeof(filename));
     f = fopen(filename, "r");
     if (!f) return 0;
 
-    snprintf(csv_filename, sizeof(csv_filename), "%s.csv", tc->table_name);
-    get_delta_filename(tc, delta_filename, sizeof(delta_filename));
-    csv_stamp = get_file_stamp(csv_filename);
-    delta_stamp = get_file_stamp(delta_filename);
-
-    if (!read_expected_line(f, line, sizeof(line))) goto fail;
-    if (strcmp(line, "SQLPROC_IDX_V2") == 0) snapshot_v2 = 1;
-    else if (strcmp(line, "SQLPROC_IDX_V1") != 0) goto fail;
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "TABLE %255s", csv_filename) != 1 ||
-        strcmp(csv_filename, tc->table_name) != 0) goto fail;
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "CSV %d %ld %ld", &csv_exists, &csv_size, &csv_mtime) != 3) goto fail;
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "DELTA %d %ld %ld", &delta_exists, &delta_size, &delta_mtime) != 3) goto fail;
-    if (csv_exists != csv_stamp.exists || csv_size != csv_stamp.size || csv_mtime != csv_stamp.mtime ||
-        delta_exists != delta_stamp.exists || delta_size != delta_stamp.size ||
-        delta_mtime != delta_stamp.mtime) {
+    if (!read_snapshot_meta(tc, f, &meta, 1, 0)) goto fail;
+    if (meta.record_count != tc->record_count || meta.active_count != tc->active_count ||
+        meta.cache_truncated != tc->cache_truncated || meta.tail_count != tc->tail_count) {
         goto fail;
     }
 
-    if (!read_expected_line(f, line, sizeof(line))) goto fail;
-    {
-        char *p = line;
-        if (strncmp(p, "SCHEMA ", 7) != 0) goto fail;
-        p += 7;
-        if (sscanf(p, "%d %d %d", &col_count, &pk_idx, &uk_count) != 3) goto fail;
-        for (i = 0; i < 3; i++) {
-            while (*p && !isspace((unsigned char)*p)) p++;
-            while (isspace((unsigned char)*p)) p++;
-        }
-        for (i = 0; i < uk_count && i < MAX_UKS; i++) {
-            if (sscanf(p, "%d", &uk_indices[i]) != 1) goto fail;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            while (isspace((unsigned char)*p)) p++;
-        }
-    }
-    if (col_count != tc->col_count || pk_idx != tc->pk_idx || uk_count != tc->uk_count) goto fail;
-    for (i = 0; i < uk_count; i++) {
-        if (uk_indices[i] != tc->uk_indices[i]) goto fail;
-    }
-
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "ROWS %d %d %d %d %ld %ld", &record_count, &active_count, &cache_truncated,
-               &tail_count, &next_auto_id, &next_row_id) != 6) goto fail;
-    if (record_count != tc->record_count || active_count != tc->active_count ||
-        cache_truncated != tc->cache_truncated || tail_count != tc->tail_count) goto fail;
-
-    if (snapshot_v2) {
+    if (meta.snapshot_v2) {
         int slot_count;
         if (!read_expected_line(f, line, sizeof(line)) ||
             sscanf(line, "SLOTS %d", &slot_count) != 1 ||
@@ -2716,75 +2858,9 @@ static int load_index_snapshot(TableCache *tc) {
         }
     }
 
-    if (!read_expected_line(f, line, sizeof(line)) || sscanf(line, "ID %d", &id_count) != 1) goto fail;
-    if (id_count != tc->active_count) goto fail;
-    if (id_count > 0) {
-        id_pairs = (BPlusPair *)calloc((size_t)id_count, sizeof(BPlusPair));
-        if (!id_pairs) goto fail;
-    }
-    for (i = 0; i < id_count; i++) {
-        if (!read_expected_line(f, line, sizeof(line)) ||
-            sscanf(line, "%ld\t%d", &id_pairs[i].key, &id_pairs[i].row_index) != 2 ||
-            !slot_is_active(tc, id_pairs[i].row_index)) {
-            goto fail;
-        }
-    }
-
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "UKSECTIONS %d", &section_count) != 1 ||
-        section_count != tc->uk_count) goto fail;
-    for (i = 0; i < tc->uk_count; i++) {
-        BPlusStringPair *pairs = NULL;
-        int col_idx;
-        int count;
-        int j;
-
-        if (!read_expected_line(f, line, sizeof(line)) ||
-            sscanf(line, "UK %d %d", &col_idx, &count) != 2 ||
-            col_idx != tc->uk_indices[i] || count < 0 || count > tc->active_count) {
-            goto fail;
-        }
-        new_indexes[i] = unique_index_create(col_idx);
-        if (!new_indexes[i]) goto fail;
-        if (count > 0) {
-            pairs = (BPlusStringPair *)calloc((size_t)count, sizeof(BPlusStringPair));
-            if (!pairs) goto fail;
-        }
-        for (j = 0; j < count; j++) {
-            char *tab;
-            int row_index;
-
-            if (!read_expected_line(f, line, sizeof(line))) {
-                free(pairs);
-                goto fail;
-            }
-            tab = strchr(line, '\t');
-            if (!tab) {
-                free(pairs);
-                goto fail;
-            }
-            *tab++ = '\0';
-            row_index = atoi(line);
-            if (!slot_is_active(tc, row_index)) {
-                free(pairs);
-                goto fail;
-            }
-            pairs[j].row_index = row_index;
-            pairs[j].key = dup_string(tab);
-            if (!pairs[j].key) {
-                free(pairs);
-                goto fail;
-            }
-        }
-        if (!bptree_string_build_from_sorted(new_indexes[i]->tree, pairs, count)) {
-            for (j = 0; j < count; j++) free(pairs[j].key);
-            free(pairs);
-            goto fail;
-        }
-        for (j = 0; j < count; j++) free(pairs[j].key);
-        free(pairs);
-    }
-    if (!read_expected_line(f, line, sizeof(line)) || strcmp(line, "END") != 0) goto fail;
+    id_count = read_snapshot_id_pairs(tc, f, tc->active_count, &id_pairs);
+    if (id_count < 0) goto fail;
+    if (!read_snapshot_uk_indexes(tc, f, tc->active_count, new_indexes)) goto fail;
 
     if (!bptree_build_from_sorted(tc->id_index, id_pairs, id_count)) goto fail;
     if (tc->pk_idx == -1) {
@@ -2797,8 +2873,8 @@ static int load_index_snapshot(TableCache *tc) {
         tc->uk_indexes[i] = new_indexes[i];
         new_indexes[i] = NULL;
     }
-    tc->next_auto_id = next_auto_id;
-    tc->next_row_id = next_row_id;
+    tc->next_auto_id = meta.next_auto_id;
+    tc->next_row_id = meta.next_row_id;
     free(id_pairs);
     fclose(f);
     INFO_PRINTF("[index] loaded B+ tree index snapshot for table '%s'.\n", tc->table_name);
@@ -2815,100 +2891,35 @@ fail:
 
 static int load_table_parse_snapshot(TableCache *tc) {
     char filename[300];
-    char csv_filename[300];
-    char delta_filename[300];
     char line[DELTA_LINE_SIZE];
     FILE *f;
-    FileStamp csv_stamp;
-    FileStamp delta_stamp;
-    int csv_exists;
-    long csv_size;
-    long csv_mtime;
-    int delta_exists;
-    long delta_size;
-    long delta_mtime;
-    int col_count;
-    int pk_idx;
-    int uk_count;
-    int uk_indices[MAX_UKS] = {0};
-    int record_count;
-    int active_count;
-    int cache_truncated;
-    int tail_count;
-    long next_auto_id;
-    long next_row_id;
+    SnapshotMeta meta;
     int slot_count;
-    int id_count;
-    int section_count;
     int i;
     int active_seen = 0;
     BPlusPair *id_pairs = NULL;
     UniqueIndex *new_indexes[MAX_UKS] = {0};
+    int id_count;
 
     if (!tc || strlen(tc->table_name) == 0) return 0;
     get_index_filename(tc, filename, sizeof(filename));
     f = fopen(filename, "r");
     if (!f) return 0;
 
-    snprintf(csv_filename, sizeof(csv_filename), "%s.csv", tc->table_name);
-    get_delta_filename(tc, delta_filename, sizeof(delta_filename));
-    csv_stamp = get_file_stamp(csv_filename);
-    delta_stamp = get_file_stamp(delta_filename);
-    if (delta_stamp.exists) goto fail;
-
-    if (!read_expected_line(f, line, sizeof(line)) || strcmp(line, "SQLPROC_IDX_V2") != 0) goto fail;
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "TABLE %255s", csv_filename) != 1 ||
-        strcmp(csv_filename, tc->table_name) != 0) goto fail;
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "CSV %d %ld %ld", &csv_exists, &csv_size, &csv_mtime) != 3) goto fail;
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "DELTA %d %ld %ld", &delta_exists, &delta_size, &delta_mtime) != 3) goto fail;
-    if (csv_exists != csv_stamp.exists || csv_size != csv_stamp.size || csv_mtime != csv_stamp.mtime ||
-        delta_exists != delta_stamp.exists || delta_size != delta_stamp.size ||
-        delta_mtime != delta_stamp.mtime) {
+    if (!read_snapshot_meta(tc, f, &meta, 0, 1)) goto fail;
+    if (!meta.snapshot_v2 || meta.record_count < 0 || meta.record_count > MAX_RECORDS ||
+        meta.active_count < 0 || meta.cache_truncated || meta.tail_count != 0) {
         goto fail;
     }
-    if (delta_exists) goto fail;
-
-    if (!read_expected_line(f, line, sizeof(line))) goto fail;
-    {
-        char *p = line;
-        if (strncmp(p, "SCHEMA ", 7) != 0) goto fail;
-        p += 7;
-        if (sscanf(p, "%d %d %d", &col_count, &pk_idx, &uk_count) != 3) goto fail;
-        for (i = 0; i < 3; i++) {
-            while (*p && !isspace((unsigned char)*p)) p++;
-            while (isspace((unsigned char)*p)) p++;
-        }
-        for (i = 0; i < uk_count && i < MAX_UKS; i++) {
-            if (sscanf(p, "%d", &uk_indices[i]) != 1) goto fail;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            while (isspace((unsigned char)*p)) p++;
-        }
-    }
-    if (col_count != tc->col_count || pk_idx != tc->pk_idx || uk_count != tc->uk_count) goto fail;
-    for (i = 0; i < uk_count; i++) {
-        if (uk_indices[i] != tc->uk_indices[i]) goto fail;
-    }
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "ROWS %d %d %d %d %ld %ld", &record_count, &active_count,
-               &cache_truncated, &tail_count, &next_auto_id, &next_row_id) != 6) {
-        goto fail;
-    }
-    if (record_count < 0 || record_count > MAX_RECORDS || active_count < 0 ||
-        cache_truncated || tail_count != 0) {
-        goto fail;
-    }
-    if (!ensure_record_capacity(tc, record_count)) goto fail;
-    tc->record_count = record_count;
+    if (!ensure_record_capacity(tc, meta.record_count)) goto fail;
+    tc->record_count = meta.record_count;
     tc->active_count = 0;
     tc->cache_truncated = 0;
     tc->tail_count = 0;
 
     if (!read_expected_line(f, line, sizeof(line)) ||
         sscanf(line, "SLOTS %d", &slot_count) != 1 ||
-        slot_count != record_count) {
+        slot_count != meta.record_count) {
         goto fail;
     }
     for (i = 0; i < slot_count; i++) {
@@ -2935,87 +2946,22 @@ static int load_table_parse_snapshot(TableCache *tc) {
         if (active) active_seen++;
         else if (!push_free_slot(tc, i)) goto fail;
     }
-    if (active_seen != active_count) goto fail;
+    if (active_seen != meta.active_count) goto fail;
     tc->active_count = active_seen;
 
-    if (!read_expected_line(f, line, sizeof(line)) || sscanf(line, "ID %d", &id_count) != 1) goto fail;
-    if (id_count != active_count) goto fail;
-    if (id_count > 0) {
-        id_pairs = (BPlusPair *)calloc((size_t)id_count, sizeof(BPlusPair));
-        if (!id_pairs) goto fail;
-    }
-    for (i = 0; i < id_count; i++) {
-        if (!read_expected_line(f, line, sizeof(line)) ||
-            sscanf(line, "%ld\t%d", &id_pairs[i].key, &id_pairs[i].row_index) != 2 ||
-            !slot_is_active(tc, id_pairs[i].row_index)) {
-            goto fail;
-        }
-    }
+    id_count = read_snapshot_id_pairs(tc, f, active_seen, &id_pairs);
+    if (id_count < 0) goto fail;
     if (!bptree_build_from_sorted(tc->id_index, id_pairs, id_count)) goto fail;
 
-    if (!read_expected_line(f, line, sizeof(line)) ||
-        sscanf(line, "UKSECTIONS %d", &section_count) != 1 ||
-        section_count != tc->uk_count) goto fail;
-    for (i = 0; i < tc->uk_count; i++) {
-        BPlusStringPair *pairs = NULL;
-        int col_idx;
-        int count;
-        int j;
-
-        if (!read_expected_line(f, line, sizeof(line)) ||
-            sscanf(line, "UK %d %d", &col_idx, &count) != 2 ||
-            col_idx != tc->uk_indices[i] || count < 0 || count > active_count) {
-            goto fail;
-        }
-        new_indexes[i] = unique_index_create(col_idx);
-        if (!new_indexes[i]) goto fail;
-        if (count > 0) {
-            pairs = (BPlusStringPair *)calloc((size_t)count, sizeof(BPlusStringPair));
-            if (!pairs) goto fail;
-        }
-        for (j = 0; j < count; j++) {
-            char *tab;
-            int row_index;
-
-            if (!read_expected_line(f, line, sizeof(line))) {
-                free(pairs);
-                goto fail;
-            }
-            tab = strchr(line, '\t');
-            if (!tab) {
-                free(pairs);
-                goto fail;
-            }
-            *tab++ = '\0';
-            row_index = atoi(line);
-            if (!slot_is_active(tc, row_index)) {
-                free(pairs);
-                goto fail;
-            }
-            pairs[j].row_index = row_index;
-            pairs[j].key = dup_string(tab);
-            if (!pairs[j].key) {
-                free(pairs);
-                goto fail;
-            }
-        }
-        if (!bptree_string_build_from_sorted(new_indexes[i]->tree, pairs, count)) {
-            for (j = 0; j < count; j++) free(pairs[j].key);
-            free(pairs);
-            goto fail;
-        }
-        for (j = 0; j < count; j++) free(pairs[j].key);
-        free(pairs);
-    }
-    if (!read_expected_line(f, line, sizeof(line)) || strcmp(line, "END") != 0) goto fail;
+    if (!read_snapshot_uk_indexes(tc, f, active_seen, new_indexes)) goto fail;
 
     for (i = 0; i < tc->uk_count; i++) {
         unique_index_destroy(tc->uk_indexes[i]);
         tc->uk_indexes[i] = new_indexes[i];
         new_indexes[i] = NULL;
     }
-    tc->next_auto_id = next_auto_id;
-    tc->next_row_id = next_row_id;
+    tc->next_auto_id = meta.next_auto_id;
+    tc->next_row_id = meta.next_row_id;
     free(id_pairs);
     fclose(f);
     if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
