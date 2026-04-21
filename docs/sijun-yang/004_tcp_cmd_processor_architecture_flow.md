@@ -52,56 +52,23 @@
 
 ## 3. 전체 구조
 
-```mermaid
-flowchart LR
-    subgraph Clients[이미 열려 있는 사용자 connection]
-        A1[User A<br/>connection A-1]
-        A2[User A<br/>connection A-2]
-        B1[User B<br/>connection B-1]
-    end
+![TCPCmdProcessor 전체 구조](./diagrams/004_tcp_cmd_processor_architecture_flow.svg)
 
-    subgraph TCP[TCPCmdProcessor]
-        S1[connection session A-1]
-        S2[connection session A-2]
-        S3[connection session B-1]
-        Intake[요청 수신/검증<br/>JSON line -> CmdRequest]
-        Inflight[in-flight 관리<br/>connection/client별 제한]
-        Callback[응답 callback 처리<br/>CmdResponse -> JSON line]
-    end
-
-    Processor["CmdProcessor 경계<br/>submit request + callback + context"]
-    DB[DB 구현체<br/>black box]
-
-    A1 <--> S1
-    A2 <--> S2
-    B1 <--> S3
-
-    S1 -- request + context A-1 --> Intake
-    S2 -- request + context A-2 --> Intake
-    S3 -- request + context B-1 --> Intake
-
-    Intake --> Inflight
-    Inflight --> Processor
-    Processor --> DB
-    DB -. 처리 결과 .-> Processor
-    Processor -. callback .-> Callback
-
-    Callback -. context A-1 .-> S1
-    Callback -. context A-2 .-> S2
-    Callback -. context B-1 .-> S3
-```
+DOT 원본은 [diagrams/004_tcp_cmd_processor_architecture_flow.dot](./diagrams/004_tcp_cmd_processor_architecture_flow.dot)에 둔다.
 
 이 그림은 connection 수락이 끝나고, 여러 사용자의 connection이 이미 `TCPCmdProcessor` 안에 등록된 상태를 기준으로 한다. listen/accept 과정은 연결을 이 상태로 올려놓는 앞단이며, 전체 요청 흐름을 설명하는 이 절에서는 제외한다.
 
-핵심은 열린 connection마다 독립적인 세션이 있고, 각 세션에서 들어온 요청이 공통 `CmdProcessor` 경계로 위임된다는 점이다. TCP 계층은 요청을 DB가 이해할 수 있는 공통 요청 모델로 바꾸고, 나중에 callback이 오면 처음 요청이 들어온 connection으로 응답을 되돌려 보낸다.
+핵심은 connection 자체가 DBMS 안으로 이동하는 것이 아니라는 점이다. `사용자 TCP connections` 블록은 서버 밖의 열린 connection들을 나타내고, `DBMS` 블록 안에는 `TCPCmdProcessor`와 `DB black box`가 있다. `TCPCmdProcessor` 내부의 `connection layer`는 사용자 connection과 1:1로 대응하는 server-side socket session을 관리하고, `metadata state`는 session 목록과 client별 제한을 보조 상태로 관리한다.
+
+이동하는 것은 connection이 아니라 request와 response다. 요청 방향에서는 session이 JSON line을 읽고, `req / res adapter`가 기본 검증과 in-flight 등록을 끝낸 뒤 `CmdRequest`와 callback context를 `CmdProcessor` 경계로 넘긴다. 응답 방향에서는 DB 처리 결과가 callback으로 돌아오고, callback context가 가리키는 원래 session에 JSON line 응답을 쓴다.
 
 | 영역 | 책임 |
 | --- | --- |
-| 열린 connection 세션 | 사용자별 TCP 연결을 독립적으로 유지하고, 요청을 읽고 응답을 쓴다. |
-| 요청 수신/검증 | JSON line을 읽어 `id`, `op`, `sql` 같은 기본 형식을 확인한다. |
-| in-flight 관리 | 아직 응답이 돌아오지 않은 요청을 connection/client 단위로 추적한다. |
-| `CmdProcessor` 경계 | 검증된 요청을 DB 처리 계층으로 넘기는 유일한 위임 지점이다. |
-| 응답 callback 처리 | `CmdResponse`를 JSON line으로 바꾸고 원래 connection에 돌려준다. |
+| connection layer | 이미 연결된 사용자 session들을 유지한다. |
+| metadata state | session 목록과 client별 connection/in-flight 제한을 관리한다. |
+| req / res adapter | request를 `CmdRequest`로 바꾸고, callback response를 원래 session의 JSON line으로 바꾼다. |
+| `CmdProcessor` | 검증된 요청을 DB 처리 계층으로 넘기는 공통 인터페이스다. |
+| DB | TCP 계층에서 내부를 알지 않는 처리 계층이다. |
 
 `TCPCmdProcessor`는 `CmdProcessor`를 소유하지 않는다. 서버 종료 시 TCP 자원은 정리하지만, `cmd_processor_shutdown()` 호출 여부는 processor 소유자가 결정한다.
 

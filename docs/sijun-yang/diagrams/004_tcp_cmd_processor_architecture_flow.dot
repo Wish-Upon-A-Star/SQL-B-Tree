@@ -1,0 +1,136 @@
+digraph TcpCmdProcessor {
+    graph [
+        rankdir=LR,
+        compound=true,
+        nodesep=0.65,
+        ranksep=1.0,
+        splines=ortho,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.12,0.08"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_users {
+        label="사용자 TCP connections";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        { rank=same; user_a1; user_a2; user_b1; }
+
+        user_a1 [label="A-1"];
+        user_a2 [label="A-2"];
+        user_b1 [label="B-1"];
+    }
+
+    subgraph cluster_dbms {
+        label="DBMS";
+        style="rounded,filled";
+        color="#94a3b8";
+        fillcolor="#f1f5f9";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=20;
+
+        subgraph cluster_tcp {
+            label="TCPCmdProcessor";
+            style="rounded,filled";
+            color="#93c5fd";
+            fillcolor="#eff6ff";
+            fontname="Pretendard";
+            fontsize=13;
+            margin=18;
+
+            subgraph cluster_connection_layer {
+                label="connection layer";
+                style="rounded,filled";
+                color="#bfdbfe";
+                fillcolor="#ffffff";
+                fontname="Pretendard";
+                fontsize=12;
+                margin=14;
+
+                { rank=same; tcp_a1; tcp_a2; tcp_b1; }
+
+                tcp_a1 [label="socket A-1"];
+                tcp_a2 [label="socket A-2"];
+                tcp_b1 [label="socket B-1"];
+            }
+
+            subgraph cluster_adapter {
+                label="req / res adapter";
+                style="rounded,filled";
+                color="#bae6fd";
+                fillcolor="#ffffff";
+                fontname="Pretendard";
+                fontsize=12;
+                margin=14;
+
+                req [label="request"];
+                callback_context [label="context"];
+                res [label="response"];
+            }
+
+            subgraph cluster_metadata {
+                label="metadata state";
+                style="rounded,filled";
+                color="#cbd5e1";
+                fillcolor="#ffffff";
+                fontname="Pretendard";
+                fontsize=12;
+                margin=14;
+
+                connection_list [label="connections"];
+                client_counters [label="client counters"];
+                in_flight_ids [label="in-flight ids"];
+            }
+        }
+
+        subgraph cluster_db {
+            label="DB";
+            style="rounded,filled";
+            color="#cbd5e1";
+            fillcolor="#ffffff";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            db_black_box [label="black box"];
+        }
+    }
+
+    user_a1 -> tcp_a1 [dir=both, weight=10];
+    user_a2 -> tcp_a2 [dir=both, weight=10];
+    user_b1 -> tcp_b1 [dir=both, weight=10];
+
+    tcp_a1 -> req [weight=10];
+    tcp_a2 -> req [weight=10];
+    tcp_b1 -> req [weight=10];
+
+    req -> callback_context;
+    callback_context -> db_black_box [xlabel="submit"];
+
+    db_black_box -> res [style=dashed, xlabel="callback", constraint=false];
+    res -> tcp_a1 [style=dashed, constraint=false];
+    res -> tcp_a2 [style=dashed, constraint=false];
+    res -> tcp_b1 [style=dashed, constraint=false];
+}
