@@ -1,6 +1,6 @@
 #include "tcp_cmd_processor.h"
 
-#include "../cmd_processor/mock_cmd_processor.h"
+#include "mock_cmd_processor.h"
 #include "../thirdparty/cjson/cJSON.h"
 
 #include <arpa/inet.h>

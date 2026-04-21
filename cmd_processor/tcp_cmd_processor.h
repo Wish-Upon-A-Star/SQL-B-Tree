@@ -1,7 +1,7 @@
 #ifndef TCP_CMD_PROCESSOR_H
 #define TCP_CMD_PROCESSOR_H
 
-#include "../cmd_processor/cmd_processor.h"
+#include "cmd_processor.h"
 
 #ifndef TCP_DEFAULT_HOST
 #define TCP_DEFAULT_HOST "127.0.0.1"
