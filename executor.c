@@ -1,4 +1,4 @@
-#include <ctype.h>
+﻿#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +10,7 @@
 
 #include "executor.h"
 #include "bptree.h"
+#include "jungle_benchmark.h"
 
 #define DELTA_LINE_SIZE (RECORD_SIZE + 128)
 #define TABLE_FILE_BUFFER_SIZE (1024 * 1024)
@@ -20,10 +21,6 @@ TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
 static unsigned long long g_table_access_seq = 0;
 static int g_executor_quiet = 0;
-static const char *const JUNGLE_BENCHMARK_CSV = "jungle_benchmark_users.csv";
-static const char *const JUNGLE_BENCHMARK_TABLE = "jungle_benchmark_users";
-static const char *const JUNGLE_BENCHMARK_HEADER =
-    "id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round\n";
 
 #define INFO_PRINTF(...) do { if (!g_executor_quiet) printf(__VA_ARGS__); } while (0)
 
@@ -65,6 +62,11 @@ static int close_delta_batch(TableCache *tc);
 static int load_index_snapshot(TableCache *tc);
 static int save_index_snapshot(TableCache *tc);
 static void remove_index_snapshot(TableCache *tc);
+static int parse_table_header(TableCache *tc, FILE *f);
+static int load_rows_into_cache(TableCache *tc, const char *name, FILE *f,
+                                int has_delta_log, long *file_next_auto_id_out);
+static int finalize_indexes_and_recovery(TableCache *tc, const char *name, FILE *f,
+                                         int has_delta_log, long file_next_auto_id);
 static int load_table_contents(TableCache *tc, const char *name, FILE *f);
 static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_idx,
                                      const WhereCondition *lookup_cond, int set_idx, const char *set_value, int uses_pk_lookup,
@@ -132,11 +134,6 @@ static int compare_bplus_string_pair(const void *a, const void *b) {
     return strcmp(pa->key, pb->key);
 }
 
-static int path_exists(const char *filename) {
-    struct stat st;
-
-    return filename && stat(filename, &st) == 0;
-}
 
 static int clamp_record_count(int record_count, int minimum) {
     if (record_count < minimum) record_count = minimum;
@@ -204,221 +201,6 @@ static int find_pk_row(TableCache *tc, const char *value, int *row_index) {
     return 1;
 }
 
-static const char *jungle_track_for_id(int id) {
-    static const char *const tracks[] = {
-        "sw_ai_lab", "game_lab", "game_tech_lab"
-    };
-    return tracks[(id - 1) % 3];
-}
-
-static const char *jungle_background_for_id(int id) {
-    int bucket = (id - 1) % 100;
-
-    if (bucket < 62) return "student";
-    if (bucket < 74) return "newgrad";
-    if (bucket < 86) return "incumbent";
-    if (bucket < 95) return "switcher";
-    return "selftaught";
-}
-
-static int jungle_pretest_for_id(int id) {
-    long long mixed = (long long)id * 73LL + (long long)((id - 1) % 97) * 19LL + 17LL;
-    return 35 + (int)(mixed % 66LL);
-}
-
-static void build_jungle_history(int id, const char *background, char *buffer, size_t buffer_size) {
-    static const char *const majors[] = {
-        "cs", "software", "ai", "game", "math", "physics",
-        "stats", "design", "ee", "business", "english", "biology"
-    };
-    static const char *const incumbent_roles[] = {
-        "backend", "frontend", "data", "infra", "qa", "game_client", "game_server"
-    };
-    static const char *const switcher_roles[] = {
-        "designer", "teacher", "marketer", "pm", "sales", "mechanical", "accounting"
-    };
-    static const char *const selftaught_routes[] = {
-        "selftaught", "bootcamp", "indie", "academy"
-    };
-    int major_idx = ((id - 1) / 3) % (int)(sizeof(majors) / sizeof(majors[0]));
-
-    if (strcmp(background, "student") == 0) {
-        int grade = ((id - 1) / 7) % 4 + 1;
-        snprintf(buffer, buffer_size, "major_%s_grade_%d", majors[major_idx], grade);
-        return;
-    }
-
-    if (strcmp(background, "newgrad") == 0) {
-        snprintf(buffer, buffer_size, "major_%s_graduate", majors[major_idx]);
-        return;
-    }
-
-    if (strcmp(background, "incumbent") == 0) {
-        int role_idx = ((id - 1) / 5) % (int)(sizeof(incumbent_roles) / sizeof(incumbent_roles[0]));
-        int years = ((id - 1) / 11) % 6 + 1;
-        snprintf(buffer, buffer_size, "%s_%dy", incumbent_roles[role_idx], years);
-        return;
-    }
-
-    if (strcmp(background, "switcher") == 0) {
-        int role_idx = ((id - 1) / 9) % (int)(sizeof(switcher_roles) / sizeof(switcher_roles[0]));
-        int years = ((id - 1) / 13) % 8 + 1;
-        snprintf(buffer, buffer_size, "%s_%dy", switcher_roles[role_idx], years);
-        return;
-    }
-
-    {
-        int route_idx = ((id - 1) / 17) % (int)(sizeof(selftaught_routes) / sizeof(selftaught_routes[0]));
-        int months = ((((id - 1) / 19) % 9) + 1) * 6;
-        snprintf(buffer, buffer_size, "%s_%dm", selftaught_routes[route_idx], months);
-    }
-}
-
-static void build_jungle_github(int id, const char *background, char *buffer, size_t buffer_size) {
-    int bucket = (int)(((long long)id * 29LL + 7LL) % 100LL);
-
-    if ((strcmp(background, "student") == 0 && bucket < 18) ||
-        (strcmp(background, "newgrad") == 0 && bucket < 8) ||
-        (strcmp(background, "switcher") == 0 && bucket < 10) ||
-        (strcmp(background, "selftaught") == 0 && bucket < 6)) {
-        snprintf(buffer, buffer_size, "none");
-        return;
-    }
-
-    snprintf(buffer, buffer_size, "gh_%07d", id);
-}
-
-static const char *jungle_status_for_id(int id, int pretest) {
-    if (id % 113 == 0) return "withdrawn";
-    if (pretest >= 98) return "final_pass";
-    if (pretest >= 90) return "final_wait";
-    if (pretest >= 80) return "interview_wait";
-    if (pretest >= 65) return "pretest_pass";
-    if (pretest >= 50) return "submitted";
-    return "rejected";
-}
-
-static void build_jungle_email(int id, char *buffer, size_t buffer_size) {
-    snprintf(buffer, buffer_size, "jungle%07d@apply.kr", id);
-}
-
-static void build_jungle_phone(int id, char *buffer, size_t buffer_size) {
-    snprintf(buffer, buffer_size, "010-%04d-%04d", id / 10000, id % 10000);
-}
-
-static void build_jungle_name(int id, char *buffer, size_t buffer_size) {
-    static const char *const surnames[] = {
-        "김", "이", "박", "최", "정", "강", "조", "윤", "장", "임",
-        "한", "오", "서", "신", "권", "황", "안", "송", "전", "홍"
-    };
-    static const char *const first_syllables[] = {
-        "민", "서", "지", "도", "하", "수", "예", "시",
-        "현", "준", "유", "주", "다", "윤", "태", "선",
-        "건", "채", "승", "정", "호", "은", "재", "가",
-        "나", "라", "마", "소", "아", "연", "원", "진",
-        "혜", "규", "한", "슬", "보", "새", "강", "온",
-        "루", "단", "류", "리", "해", "별", "솔", "율"
-    };
-    static const char *const second_syllables[] = {
-        "준", "연", "후", "윤", "린", "민", "아", "우",
-        "서", "진", "수", "영", "원", "호", "혜", "현",
-        "지", "인", "온", "별", "율", "나", "리", "빈",
-        "솔", "람", "훈", "석", "비", "담", "새", "균",
-        "채", "한", "태", "경", "슬", "주", "재", "강",
-        "선", "도", "희", "휘", "록", "봄", "혁", "화"
-    };
-    int surname_count = (int)(sizeof(surnames) / sizeof(surnames[0]));
-    int first_count = (int)(sizeof(first_syllables) / sizeof(first_syllables[0]));
-    int second_count = (int)(sizeof(second_syllables) / sizeof(second_syllables[0]));
-    int surname_idx = (id - 1) % surname_count;
-    int given_combo = ((id - 1) / surname_count) % (first_count * second_count);
-    int first_idx = given_combo / second_count;
-    int second_idx = given_combo % second_count;
-
-    snprintf(buffer, buffer_size, "%s%s%s",
-             surnames[surname_idx], first_syllables[first_idx], second_syllables[second_idx]);
-}
-
-static void build_jungle_row_data(int id, char *buffer, size_t buffer_size) {
-    const char *track = jungle_track_for_id(id);
-    const char *background = jungle_background_for_id(id);
-    int pretest = jungle_pretest_for_id(id);
-    const char *status = jungle_status_for_id(id, pretest);
-    char email[64];
-    char phone[32];
-    char name[64];
-    char history[64];
-    char github[32];
-
-    build_jungle_email(id, email, sizeof(email));
-    build_jungle_phone(id, phone, sizeof(phone));
-    build_jungle_name(id, name, sizeof(name));
-    build_jungle_history(id, background, history, sizeof(history));
-    build_jungle_github(id, background, github, sizeof(github));
-    snprintf(buffer, buffer_size, "%s,%s,%s,%s,%s,%s,%d,%s,%s,2026_spring",
-             email, phone, name, track, background, history, pretest, github, status);
-}
-
-static void build_jungle_csv_record(int id, char *buffer, size_t buffer_size) {
-    const char *track = jungle_track_for_id(id);
-    const char *background = jungle_background_for_id(id);
-    int pretest = jungle_pretest_for_id(id);
-    const char *status = jungle_status_for_id(id, pretest);
-    char email[64];
-    char phone[32];
-    char name[64];
-    char history[64];
-    char github[32];
-
-    build_jungle_email(id, email, sizeof(email));
-    build_jungle_phone(id, phone, sizeof(phone));
-    build_jungle_name(id, name, sizeof(name));
-    build_jungle_history(id, background, history, sizeof(history));
-    build_jungle_github(id, background, github, sizeof(github));
-    snprintf(buffer, buffer_size, "%d,%s,%s,%s,%s,%s,%s,%d,%s,%s,2026_spring",
-             id, email, phone, name, track, background, history, pretest, github, status);
-}
-
-void generate_jungle_dataset(int record_count, const char *filename) {
-    FILE *f;
-    int i;
-    const char *output = (filename && filename[0]) ? filename : JUNGLE_BENCHMARK_CSV;
-
-    record_count = clamp_record_count(record_count <= 0 ? 1000000 : record_count, 1);
-    if (path_exists(output)) {
-        printf("[safe-stop] dataset file already exists: %s\n", output);
-        printf("[notice] No CSV files were overwritten. Choose a new filename or remove it manually.\n");
-        return;
-    }
-
-    f = fopen(output, "wb");
-    if (!f) {
-        printf("[error] dataset file could not be created: %s\n", output);
-        return;
-    }
-    if (fputs(JUNGLE_BENCHMARK_HEADER, f) == EOF) {
-        fclose(f);
-        printf("[error] dataset header could not be written: %s\n", output);
-        return;
-    }
-
-    for (i = 1; i <= record_count; i++) {
-        char row[512];
-        build_jungle_csv_record(i, row, sizeof(row));
-        if (fputs(row, f) == EOF || fputc('\n', f) == EOF) {
-            fclose(f);
-            printf("[error] dataset write failed at row %d.\n", i);
-            return;
-        }
-    }
-
-    if (fclose(f) != 0) {
-        printf("[error] dataset file close failed: %s\n", output);
-        return;
-    }
-
-    printf("[ok] jungle applicant dataset generated: %s (%d rows)\n", output, record_count);
-}
 
 static int unique_index_insert(TableCache *tc, UniqueIndex *index, const char *key, int row_index) {
     int existing_row;
@@ -2977,26 +2759,17 @@ fail:
     return 0;
 }
 
-static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
+static int parse_table_header(TableCache *tc, FILE *f) {
     char header[RECORD_SIZE];
-    char line[RECORD_SIZE];
-    long line_number = 1;
-    long file_next_auto_id = 1;
-    int has_delta_log;
 
-    reset_table_cache(tc);
-    if (!tc->id_index) return 0;
-    strncpy(tc->table_name, name, sizeof(tc->table_name) - 1);
-    tc->file = f;
-    touch_table(tc);
-    has_delta_log = delta_log_exists(tc);
+    if (!fgets(header, sizeof(header), f)) return 1;
+    if ((unsigned char)header[0] == 0xEF &&
+        (unsigned char)header[1] == 0xBB &&
+        (unsigned char)header[2] == 0xBF) {
+        memmove(header, header + 3, strlen(header + 3) + 1);
+    }
 
-    if (fgets(header, sizeof(header), f)) {
-        if ((unsigned char)header[0] == 0xEF &&
-            (unsigned char)header[1] == 0xBB &&
-            (unsigned char)header[2] == 0xBF) {
-            memmove(header, header + 3, strlen(header + 3) + 1);
-        }
+    {
         char *token = strtok(header, ",\r\n");
         int idx = 0;
 
@@ -3028,12 +2801,16 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
             idx++;
         }
         tc->col_count = idx;
-        if (!ensure_uk_indexes(tc)) return 0;
     }
 
-    if (load_table_parse_snapshot(tc)) {
-        return 1;
-    }
+    return ensure_uk_indexes(tc);
+}
+
+static int load_rows_into_cache(TableCache *tc, const char *name, FILE *f,
+                                int has_delta_log, long *file_next_auto_id_out) {
+    char line[RECORD_SIZE];
+    long line_number = 1;
+    long file_next_auto_id = 1;
 
     while (1) {
         char *nl;
@@ -3089,6 +2866,12 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
             tc->cache_truncated = 1;
         }
     }
+    *file_next_auto_id_out = file_next_auto_id;
+    return 1;
+}
+
+static int finalize_indexes_and_recovery(TableCache *tc, const char *name, FILE *f,
+                                         int has_delta_log, long file_next_auto_id) {
     if (has_delta_log && tc->active_count == 0 && tc->tail_count == 0) {
         if (!clear_delta_log(tc)) {
             printf("[error] failed to clear stale delta log for empty table '%s'.\n", name);
@@ -3131,6 +2914,23 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
         tc->append_offset = ftell(f);
     }
     return 1;
+}
+
+static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
+    long file_next_auto_id = 1;
+    int has_delta_log;
+
+    reset_table_cache(tc);
+    if (!tc->id_index) return 0;
+    strncpy(tc->table_name, name, sizeof(tc->table_name) - 1);
+    tc->file = f;
+    touch_table(tc);
+    has_delta_log = delta_log_exists(tc);
+
+    if (!parse_table_header(tc, f)) return 0;
+    if (load_table_parse_snapshot(tc)) return 1;
+    if (!load_rows_into_cache(tc, name, f, has_delta_log, &file_next_auto_id)) return 0;
+    return finalize_indexes_and_recovery(tc, name, f, has_delta_log, file_next_auto_id);
 }
 
 TableCache *get_table(const char *name) {
@@ -5018,22 +4818,6 @@ static void set_eq_select_value(Statement *stmt, const char *value) {
     }
 }
 
-static int ensure_jungle_benchmark_artifacts_absent(void) {
-    const char *artifacts[] = {
-        JUNGLE_BENCHMARK_CSV,
-        "jungle_benchmark_users.delta",
-        "jungle_benchmark_users.idx"
-    };
-    int i;
-
-    for (i = 0; i < (int)(sizeof(artifacts) / sizeof(artifacts[0])); i++) {
-        if (!path_exists(artifacts[i])) continue;
-        printf("[safe-stop] jungle benchmark artifact already exists: %s\n", artifacts[i]);
-        printf("[notice] No files were deleted. Remove or rename the artifact manually, then rerun --benchmark-jungle.\n");
-        return 0;
-    }
-    return 1;
-}
 
 void run_jungle_benchmark(int record_count) {
     FILE *f;
@@ -5058,7 +4842,7 @@ void run_jungle_benchmark(int record_count) {
     close_all_tables();
     open_table_count = 0;
 
-    if (!ensure_jungle_benchmark_artifacts_absent()) return;
+    if (!jungle_ensure_artifacts_absent()) return;
 
     f = fopen(JUNGLE_BENCHMARK_CSV, "wb");
     if (!f) {

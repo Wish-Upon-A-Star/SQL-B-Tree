@@ -8,6 +8,7 @@
 #include "lexer.c"
 #include "parser.c"
 #include "bptree.c"
+#include "jungle_benchmark.c"
 #include "executor.c"
 
 #endif
