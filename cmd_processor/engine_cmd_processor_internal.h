@@ -26,6 +26,11 @@
 
 typedef struct CmdJob CmdJob;
 
+/*
+ * Request planning stays intentionally shallow in v1. The goal is to classify
+ * the request, derive a stable shard key, and compute a conservative lock set
+ * without turning this layer into a second SQL engine.
+ */
 typedef enum {
     ENGINE_REQUEST_CLASS_READ = 1,
     ENGINE_REQUEST_CLASS_WRITE = 2,
@@ -82,6 +87,11 @@ typedef struct {
     int next_free;
 } RequestSlot;
 
+/*
+ * ResponseSlot uses a single reusable message buffer for both success bodies
+ * and error text. The public response points into this owned buffer until the
+ * frontend releases the slot.
+ */
 typedef struct {
     CmdResponse response;
     char *message_buffer;
@@ -139,6 +149,10 @@ typedef struct {
     EngineCmdProcessorStats values;
 } MetricsSink;
 
+/*
+ * CmdJob is the queue payload. Request/response storage stays in slots, while
+ * the job carries the execution snapshot that workers need after enqueue.
+ */
 struct CmdJob {
     CmdProcessor *processor;
     CmdRequest *request;
@@ -225,6 +239,11 @@ ResponseSlot *response_slot_from_response(EngineCmdProcessorState *state, CmdRes
 void set_response_error(ResponseSlot *slot, const char *request_id, CmdStatusCode status, const char *message, size_t error_capacity);
 void set_response_body(ResponseSlot *slot, const char *request_id, CmdBodyFormat body_format, const char *body, size_t body_len, size_t body_capacity);
 int engine_execute_sql(EngineCmdProcessorState *state, CmdRequest *request, ResponseSlot *response_slot);
+int execute_planned_request(EngineCmdProcessorState *state,
+                            CmdRequest *request,
+                            ResponseSlot *response_slot,
+                            const LockPlan *lock_plan,
+                            ExecutionStats *stats);
 db_thread_return_t DB_THREAD_CALL worker_main(void *arg_ptr);
 
 #endif
