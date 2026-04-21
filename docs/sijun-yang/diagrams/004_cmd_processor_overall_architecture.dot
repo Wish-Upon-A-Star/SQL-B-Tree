@@ -2,9 +2,10 @@ digraph CmdProcessorOverallArchitecture {
     graph [
         rankdir=LR,
         compound=true,
-        nodesep=0.65,
-        ranksep=0.9,
+        nodesep=0.55,
+        ranksep=0.85,
         splines=line,
+        newrank=true,
         pad=0.2,
         bgcolor="transparent"
     ];
@@ -35,15 +36,11 @@ digraph CmdProcessorOverallArchitecture {
         fontsize=13;
         margin=18;
 
-        tcp [label="TCP clients\nJSON line"];
-        tcp_adapter [label="TCPCmdProcessor\nJSONL <-> CmdRequest"];
-        cli [label="CLI / file 실행\nmain.c"];
-        sync_bridge [label="submit_sync bridge\ncallback -> blocking wait"];
-        tests [label="tests"];
+        frontends [label="TCP / console / tests\n외부 요청과 응답"];
     }
 
     subgraph cluster_contract {
-        label="공통 계약";
+        label="CmdProcessor 공통 계약";
         style="rounded,filled";
         color="#93c5fd";
         fillcolor="#eff6ff";
@@ -51,9 +48,9 @@ digraph CmdProcessorOverallArchitecture {
         fontsize=13;
         margin=18;
 
-        api [label="CmdProcessor interface\nacquire / set / submit\ncallback / release", fillcolor="#ffffff"];
-        request [label="CmdRequest\nid + type + sql"];
-        response [label="CmdResponse\nstatus + body + counts"];
+        request [label="CmdRequest"];
+        api [label="CmdProcessor interface\nacquire / submit / release"];
+        response [label="CmdResponse"];
     }
 
     subgraph cluster_impls {
@@ -65,9 +62,9 @@ digraph CmdProcessorOverallArchitecture {
         fontsize=13;
         margin=18;
 
-        engine [label="EngineCmdProcessor\nslots + queues + workers"];
-        repl [label="REPLCmdProcessor\nsync SQL eval"];
-        mock [label="MockCmdProcessor\ncontract tests"];
+        engine [label="EngineCmdProcessor\nqueue + worker model"];
+        repl [label="REPLCmdProcessor\nsync model"];
+        mock [label="MockCmdProcessor\ntest model"];
     }
 
     subgraph cluster_db {
@@ -79,34 +76,25 @@ digraph CmdProcessorOverallArchitecture {
         fontsize=13;
         margin=18;
 
-        planner [label="planner cache\nroute + lock plan"];
-        locks [label="lock manager\nread / write lock"];
-        parser [label="parser\nparse_statement()"];
-        executor [label="executor\nexecutor_execute_statement()"];
-        storage [label="tables / B+Tree\nCSV + delta + index"];
+        db_black_box [label="DB BlackBox"];
     }
 
-    tcp -> tcp_adapter;
-    tcp_adapter -> api [label="CmdRequest + callback", ltail=cluster_frontends, lhead=cluster_contract];
-    cli -> sync_bridge;
-    sync_bridge -> api [label="submit_sync"];
-    tests -> api;
+    { rank=same; request; api; response; }
+    { rank=same; engine; repl; mock; }
 
-    api -> request;
-    api -> response;
-    request -> engine [label="vtable dispatch", ltail=cluster_contract, lhead=cluster_impls];
-    request -> repl [label="vtable dispatch"];
-    request -> mock [label="vtable dispatch"];
+    frontends -> request [label="요청", weight=10];
 
-    engine -> planner [label="SQL plan", ltail=cluster_impls, lhead=cluster_db];
-    planner -> locks;
-    locks -> parser;
-    repl -> parser [label="sql_repl_eval()", ltail=cluster_impls, lhead=cluster_db];
-    parser -> executor;
-    executor -> storage [dir=both];
+    request -> api [label="요청 제출", weight=10];
+    api -> engine [weight=10];
+    api -> repl [weight=10];
+    api -> mock [weight=10];
 
-    executor -> response [label="CmdResponse", ltail=cluster_db, lhead=cluster_contract];
-    response -> tcp_adapter [label="callback"];
-    response -> sync_bridge [label="callback"];
-    response -> tests [label="callback"];
+    engine -> db_black_box [label="SQL 처리", weight=10];
+    repl -> db_black_box [label="SQL 처리", weight=10];
+
+    engine -> response [style=dashed, constraint=false];
+    repl -> response [style=dashed, constraint=false];
+    mock -> response [style=dashed, constraint=false];
+
+    response -> frontends [style=dashed, label="응답", constraint=false];
 }

@@ -3,8 +3,9 @@ digraph TcpMultiRequestInflightFlow {
         rankdir=TB,
         compound=true,
         nodesep=0.55,
-        ranksep=0.65,
-        splines=ortho,
+        ranksep=0.8,
+        splines=line,
+        newrank=true,
         pad=0.2,
         bgcolor="transparent"
     ];
@@ -26,65 +27,46 @@ digraph TcpMultiRequestInflightFlow {
         arrowsize=0.7
     ];
 
-    subgraph cluster_client {
-        label="client";
+    subgraph cluster_r1 {
+        label="r1: 느린 요청";
         style="rounded,filled";
         color="#cbd5e1";
         fillcolor="#f8fafc";
         fontname="Pretendard";
         fontsize=13;
-        margin=14;
+        margin=18;
 
-        send_r1 [label="send r1\nsql delay"];
-        send_r2 [label="send r2\nsql fast"];
-        recv_r2 [label="receive response\nid=r2"];
-        recv_r1 [label="receive response\nid=r1"];
+        r1_start [label="client send r1\nTCP register r1"];
+        r1_proc [label="CmdProcessor\nr1 처리 중"];
+        r1_cb [label="callback r1\n나중"];
+        r1_done [label="TCP write r1\nclient receive r1\nin-flight []"];
     }
 
-    subgraph cluster_tcp {
-        label="TCPConnection";
+    subgraph cluster_r2 {
+        label="r2: 빠른 요청";
         style="rounded,filled";
         color="#93c5fd";
         fillcolor="#eff6ff";
         fontname="Pretendard";
         fontsize=13;
-        margin=14;
+        margin=18;
 
-        read_r1 [label="read JSON line r1"];
-        add_r1 [label="inflight_ids\n[r1]"];
-        submit_r1 [label="submit r1"];
-        read_r2 [label="read JSON line r2"];
-        add_r2 [label="inflight_ids\n[r2, r1]"];
-        submit_r2 [label="submit r2"];
-        write_r2 [label="write response r2\nremove r2"];
-        left_r1 [label="inflight_ids\n[r1]"];
-        write_r1 [label="write response r1\nremove r1"];
-        empty [label="inflight_ids\n[]"];
-    }
-
-    subgraph cluster_processor {
-        label="CmdProcessor";
-        style="rounded,filled";
-        color="#bae6fd";
-        fillcolor="#f0f9ff";
-        fontname="Pretendard";
-        fontsize=13;
-        margin=14;
-
-        run_r1 [label="r1 처리 중\n느린 요청"];
-        run_r2 [label="r2 처리\n빠른 요청"];
-        cb_r2 [label="callback r2 먼저"];
-        cb_r1 [label="callback r1 나중"];
+        r2_start [label="client send r2\nTCP register r2\nin-flight [r2, r1]"];
+        r2_proc [label="CmdProcessor\nr2 처리"];
+        r2_cb [label="callback r2\n먼저"];
+        r2_done [label="TCP write r2\nclient receive r2\nin-flight [r1]"];
     }
 
     note [label="응답 순서는 완료 순서\n클라이언트는 id로 매칭", fillcolor="#fefce8", color="#facc15"];
 
-    send_r1 -> read_r1 -> add_r1 -> submit_r1 -> run_r1;
-    send_r2 -> read_r2 -> add_r2 -> submit_r2 -> run_r2;
-    run_r2 -> cb_r2 -> write_r2 -> recv_r2;
-    write_r2 -> left_r1;
-    run_r1 -> cb_r1 -> write_r1 -> recv_r1;
-    write_r1 -> empty;
-    note -> recv_r2 [style=dashed, constraint=false];
-    note -> recv_r1 [style=dashed, constraint=false];
+    { rank=same; r1_start; r1_proc; r1_cb; r1_done; }
+    { rank=same; r2_start; r2_proc; r2_cb; r2_done; note; }
+
+    r1_start -> r1_proc -> r1_cb -> r1_done;
+    r2_start -> r2_proc -> r2_cb -> r2_done;
+
+    r1_start -> r2_start [style=dotted, arrowhead=none, label="같은 connection"];
+    r2_cb -> r1_cb [style=dotted, arrowhead=none, label="r2가 먼저 완료"];
+    note -> r2_done [style=dashed, constraint=false];
+    note -> r1_done [style=dashed, constraint=false];
 }

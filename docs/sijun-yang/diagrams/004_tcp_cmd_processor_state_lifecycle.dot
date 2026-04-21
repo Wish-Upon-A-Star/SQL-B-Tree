@@ -1,10 +1,11 @@
 digraph TcpCmdProcessorStateLifecycle {
     graph [
-        rankdir=LR,
+        rankdir=TB,
         compound=true,
         nodesep=0.55,
-        ranksep=0.85,
+        ranksep=0.75,
         splines=line,
+        newrank=true,
         pad=0.2,
         bgcolor="transparent"
     ];
@@ -26,7 +27,24 @@ digraph TcpCmdProcessorStateLifecycle {
         arrowsize=0.7
     ];
 
-    subgraph cluster_tcp {
+    subgraph cluster_lifecycle {
+        label="request / response lifecycle";
+        style="rounded,filled";
+        color="#94a3b8";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        read_validate [label="JSON line\nread + validate"];
+        register [label="in-flight 등록\n중복 / limit 검사"];
+        submit [label="CmdRequest 생성\nCmdProcessor 제출"];
+        processor [label="CmdProcessor 구현체\nEngine / REPL / Mock"];
+        callback [label="response callback"];
+        write_cleanup [label="JSON 응답 write\nin-flight 제거\nrequest/response release"];
+    }
+
+    subgraph cluster_server_state {
         label="TCPCmdProcessor state";
         style="rounded,filled";
         color="#93c5fd";
@@ -35,12 +53,10 @@ digraph TcpCmdProcessorStateLifecycle {
         fontsize=13;
         margin=18;
 
-        server_fields [label="listen_fd / actual_port\nstopping / active_clients\nprocessor*"];
-        connections [label="connections\nTCPConnection linked list"];
-        counters [label="client_counters\nTCPClientCounter linked list"];
+        server_state [label="listen fd / port\nconnections\nclient counters\nprocessor pointer"];
     }
 
-    subgraph cluster_connection {
+    subgraph cluster_connection_state {
         label="TCPConnection state";
         style="rounded,filled";
         color="#bae6fd";
@@ -49,49 +65,20 @@ digraph TcpCmdProcessorStateLifecycle {
         fontsize=13;
         margin=18;
 
-        conn_fields [label="client_fd / client_key\nclosing / ref_count\nstate_mutex / write_mutex"];
-        inflight [label="inflight_ids\nid linked list"];
-        inflight_count [label="inflight_count"];
+        connection_state [label="client fd / client key\nin-flight ids\nwrite mutex\nref count"];
     }
 
-    subgraph cluster_request {
-        label="request lifecycle";
-        style="rounded,filled";
-        color="#cbd5e1";
-        fillcolor="#f8fafc";
-        fontname="Pretendard";
-        fontsize=13;
-        margin=18;
+    { rank=same; read_validate; register; }
+    { rank=same; submit; processor; callback; }
+    { rank=same; write_cleanup; }
+    { rank=same; server_state; connection_state; }
 
-        json [label="JSON line\n{id, op, sql}"];
-        parse [label="parse + validate\nid/op/sql"];
-        register [label="register_inflight()\n중복/limit 검사"];
-        acquire [label="cmd_processor_acquire_request()"];
-        set_request [label="set_sql_request()\nor set_ping_request()"];
-        submit [label="cmd_processor_submit()\ncallback user_data=connection"];
-        callback [label="tcp_response_callback()"];
-        write [label="write_json_line()\nwrite_mutex"];
-        remove [label="remove_inflight()\ncount 감소"];
-        release [label="release response/request\nconnection_release()"];
-    }
+    read_validate -> register -> submit -> processor;
+    processor -> callback [style=dashed, label="완료"];
+    callback -> write_cleanup;
 
-    cmd [label="CmdProcessor 구현체\nEngine / REPL / Mock", fillcolor="#ffffff", color="#64748b"];
-
-    server_fields -> connections;
-    server_fields -> counters;
-    connections -> conn_fields;
-    conn_fields -> inflight;
-    conn_fields -> inflight_count;
-
-    json -> parse -> register -> acquire -> set_request -> submit -> cmd;
-    register -> inflight [label="id 추가", lhead=cluster_connection];
-    register -> inflight_count [label="+1"];
-    register -> counters [label="client inflight +1", lhead=cluster_tcp];
-    cmd -> callback [label="response callback"];
-    callback -> write;
-    callback -> remove;
-    remove -> inflight [label="id 제거"];
-    remove -> inflight_count [label="-1"];
-    remove -> counters [label="client inflight -1"];
-    write -> release;
+    register -> server_state [style=dotted, arrowhead=none, constraint=false];
+    register -> connection_state [style=dotted, arrowhead=none, constraint=false];
+    write_cleanup -> server_state [style=dotted, arrowhead=none, constraint=false];
+    write_cleanup -> connection_state [style=dotted, arrowhead=none, constraint=false];
 }
