@@ -16,6 +16,7 @@
 #define TABLE_FILE_BUFFER_SIZE (1024 * 1024)
 
 typedef struct SnapshotMeta SnapshotMeta;
+typedef struct MutationLookupPlan MutationLookupPlan;
 
 TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
@@ -23,6 +24,13 @@ static unsigned long long g_table_access_seq = 0;
 static int g_executor_quiet = 0;
 
 #define INFO_PRINTF(...) do { if (!g_executor_quiet) printf(__VA_ARGS__); } while (0)
+
+struct MutationLookupPlan {
+    int condition_index;
+    int where_idx;
+    int uses_pk_lookup;
+    int uses_uk_lookup;
+};
 
 void set_executor_quiet(int quiet) {
     g_executor_quiet = quiet ? 1 : 0;
@@ -103,6 +111,7 @@ static int execute_delete_scan(TableCache *tc, Statement *stmt);
 static int scan_select_file_rows(TableCache *tc, long start_offset,
                                  const char *tail_trace, const char *full_trace,
                                  int (*visitor)(TableCache *, const char *, void *), void *ctx);
+static void build_mutation_lookup_plan(TableCache *tc, Statement *stmt, MutationLookupPlan *plan);
 static int read_csv_row_at_offset(TableCache *tc, long offset, char *line, size_t line_size);
 static int read_snapshot_meta(TableCache *tc, FILE *f, SnapshotMeta *meta,
                               int allow_v1, int require_delta_absent);
@@ -3421,6 +3430,29 @@ static int choose_index_condition(TableCache *tc, Statement *stmt, int allow_ran
     if (where_idx) *where_idx = best_col;
     return 1;
 }
+
+static void build_mutation_lookup_plan(TableCache *tc, Statement *stmt, MutationLookupPlan *plan) {
+    int index_cond = -1;
+    int index_col = -1;
+
+    memset(plan, 0, sizeof(*plan));
+    plan->condition_index = -1;
+    plan->where_idx = -1;
+
+    choose_index_condition(tc, stmt, 0, &index_cond, &index_col);
+    plan->condition_index = index_cond;
+    plan->where_idx = (index_col != -1)
+        ? index_col
+        : condition_column_index(tc, &stmt->where_conditions[0]);
+    plan->uses_pk_lookup = (index_cond != -1 &&
+                            index_col == tc->pk_idx &&
+                            stmt->where_conditions[index_cond].type == WHERE_EQ);
+    plan->uses_uk_lookup = (index_cond != -1 &&
+                            !plan->uses_pk_lookup &&
+                            get_uk_slot(tc, index_col) != -1 &&
+                            stmt->where_conditions[index_cond].type == WHERE_EQ);
+}
+
 static int print_range_row_visitor(long key, int row_index, void *ctx) {
     RangePrintContext *range_ctx = (RangePrintContext *)ctx;
     (void)key;
@@ -4607,13 +4639,9 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
 
 void execute_update(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
-    int where_idx = -1;
-    int index_cond = -1;
-    int index_col = -1;
+    MutationLookupPlan lookup;
     int set_idx;
     char set_value[256];
-    int uses_pk_lookup = 0;
-    int uses_uk_lookup = 0;
     int rebuild_uk_needed;
     int result;
 
@@ -4623,9 +4651,8 @@ void execute_update(Statement *stmt) {
         printf("[error] UPDATE failed: WHERE condition is required.\n");
         return;
     }
-    choose_index_condition(tc, stmt, 0, &index_cond, &index_col);
-    where_idx = index_col != -1 ? index_col : condition_column_index(tc, &stmt->where_conditions[0]);
-    if (where_idx == -1) {
+    build_mutation_lookup_plan(tc, stmt, &lookup);
+    if (lookup.where_idx == -1) {
         printf("[error] UPDATE failed: WHERE or SET column does not exist.\n");
         return;
     }
@@ -4633,16 +4660,12 @@ void execute_update(Statement *stmt) {
         return;
     }
 
-    uses_pk_lookup = (index_cond != -1 && index_col == tc->pk_idx &&
-                      stmt->where_conditions[index_cond].type == WHERE_EQ);
-    uses_uk_lookup = (index_cond != -1 && !uses_pk_lookup && get_uk_slot(tc, index_col) != -1 &&
-                      stmt->where_conditions[index_cond].type == WHERE_EQ);
     if (tc->cache_truncated) {
-        if (uses_pk_lookup && stmt->where_count == 1 && !rebuild_uk_needed) {
+        if (lookup.uses_pk_lookup && stmt->where_count == 1 && !rebuild_uk_needed) {
             long pk_key;
             long tail_offset;
 
-            if (!parse_long_value(stmt->where_conditions[index_cond].val, &pk_key)) {
+            if (!parse_long_value(stmt->where_conditions[lookup.condition_index].val, &pk_key)) {
                 INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
                 return;
             }
@@ -4652,14 +4675,14 @@ void execute_update(Statement *stmt) {
                 return;
             }
             {
-                int result = execute_update_single_row(tc, stmt, index_col, &stmt->where_conditions[index_cond],
+                int result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
                                                        set_idx, set_value,
-                                                       uses_pk_lookup, uses_uk_lookup, rebuild_uk_needed);
+                                                       lookup.uses_pk_lookup, lookup.uses_uk_lookup, rebuild_uk_needed);
                 if (result == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
                 return;
             }
         }
-        if (uses_uk_lookup) {
+        if (lookup.uses_uk_lookup) {
             INFO_PRINTF("[notice] UPDATE on uncached table uses CSV scan fallback because tail rows have no UK offset index.\n");
         }
         if (!rewrite_truncated_update(tc, stmt, set_idx, set_value)) {
@@ -4668,10 +4691,10 @@ void execute_update(Statement *stmt) {
         return;
     }
 
-    if (uses_pk_lookup || uses_uk_lookup) {
-        result = execute_update_single_row(tc, stmt, index_col, &stmt->where_conditions[index_cond],
+    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup) {
+        result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
                                            set_idx, set_value,
-                                           uses_pk_lookup, uses_uk_lookup, rebuild_uk_needed);
+                                           lookup.uses_pk_lookup, lookup.uses_uk_lookup, rebuild_uk_needed);
         if (result == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
         return;
     }
@@ -4703,10 +4726,7 @@ int execute_update_id_fast(const char *table_name, const char *set_col, const ch
 
 void execute_delete(Statement *stmt) {
     TableCache *tc = get_table(stmt->table_name);
-    int index_cond = -1;
-    int index_col = -1;
-    int uses_pk_lookup = 0;
-    int uses_uk_lookup = 0;
+    MutationLookupPlan lookup;
     int result;
 
     if (!tc) return;
@@ -4715,18 +4735,13 @@ void execute_delete(Statement *stmt) {
         printf("[error] DELETE failed: WHERE condition is required.\n");
         return;
     }
-    choose_index_condition(tc, stmt, 0, &index_cond, &index_col);
-
-    uses_pk_lookup = (index_cond != -1 && index_col == tc->pk_idx &&
-                      stmt->where_conditions[index_cond].type == WHERE_EQ);
-    uses_uk_lookup = (index_cond != -1 && !uses_pk_lookup && get_uk_slot(tc, index_col) != -1 &&
-                      stmt->where_conditions[index_cond].type == WHERE_EQ);
+    build_mutation_lookup_plan(tc, stmt, &lookup);
     if (tc->cache_truncated) {
-        if (uses_pk_lookup && stmt->where_count == 1) {
+        if (lookup.uses_pk_lookup && stmt->where_count == 1) {
             long pk_key;
             long tail_offset;
 
-            if (!parse_long_value(stmt->where_conditions[index_cond].val, &pk_key)) {
+            if (!parse_long_value(stmt->where_conditions[lookup.condition_index].val, &pk_key)) {
                 INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
                 return;
             }
@@ -4736,8 +4751,8 @@ void execute_delete(Statement *stmt) {
                 return;
             }
         }
-        if (!uses_pk_lookup) {
-            if (uses_uk_lookup) {
+        if (!lookup.uses_pk_lookup) {
+            if (lookup.uses_uk_lookup) {
                 INFO_PRINTF("[notice] DELETE on uncached table uses CSV scan fallback because tail rows have no UK offset index.\n");
             }
             if (!rewrite_truncated_delete(tc, stmt)) {
@@ -4746,9 +4761,9 @@ void execute_delete(Statement *stmt) {
             return;
         }
     }
-    if (uses_pk_lookup || uses_uk_lookup) {
-        result = execute_delete_single_row(tc, stmt, index_col,
-                                           &stmt->where_conditions[index_cond], uses_pk_lookup);
+    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup) {
+        result = execute_delete_single_row(tc, stmt, lookup.where_idx,
+                                           &stmt->where_conditions[lookup.condition_index], lookup.uses_pk_lookup);
         if (result == 0) INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
         return;
     }
