@@ -1,0 +1,122 @@
+digraph ReadmeProjectOverallFlow {
+    graph [
+        rankdir=LR,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.85,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_entry {
+        label="진입점";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        cli [label="CLI SQL file\nmain.c"];
+        tcp [label="TCP JSONL API\nTCPCmdProcessor"];
+        tests [label="tests / benchmark\nMakefile + test.sh"];
+    }
+
+    subgraph cluster_processor {
+        label="요청 처리 계층";
+        style="rounded,filled";
+        color="#93c5fd";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        cmd_contract [label="CmdProcessor contract\nCmdRequest / CmdResponse"];
+        engine [label="EngineCmdProcessor\nqueue + worker + lock plan"];
+        repl [label="REPLCmdProcessor\nsync evaluation"];
+    }
+
+    subgraph cluster_sql {
+        label="SQL 실행 계층";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        parser [label="lexer.c / parser.c\nSQL -> Statement"];
+        executor [label="executor.c\nCRUD execution plan"];
+        table_cache [label="TableCache\nslot / row cache / tail"];
+    }
+
+    subgraph cluster_storage {
+        label="저장소와 인덱스";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#ffffff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        bptree [label="bptree.c\nPK numeric + UK string"];
+        csv [label="*.csv\nbase table"];
+        delta [label="*.delta\nappend-only mutation log"];
+        snapshot [label="*.idx\nindex / parse snapshot"];
+    }
+
+    subgraph cluster_output {
+        label="결과";
+        style="rounded,filled";
+        color="#d9f99d";
+        fillcolor="#f7fee7";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        response [label="CLI text / JSON response"];
+        report [label="artifacts/bench\nreport.json / report.md"];
+    }
+
+    cli -> cmd_contract [label="SQL request", weight=10];
+    tcp -> cmd_contract [label="JSONL -> request", weight=10];
+    tests -> cmd_contract [label="API story", weight=8];
+    tests -> report [label="score run", style=dashed, constraint=false];
+
+    cmd_contract -> engine [label="async path", weight=10];
+    cmd_contract -> repl [label="sync path", weight=6];
+
+    engine -> parser [label="parse", weight=10];
+    repl -> parser [label="parse", weight=6];
+    parser -> executor [label="Statement", weight=10];
+    executor -> table_cache [label="load / mutate / query", weight=10];
+
+    table_cache -> bptree [label="index lookup / range", weight=10];
+    table_cache -> csv [label="read / append / rewrite", weight=10];
+    table_cache -> delta [label="UPDATE / DELETE", weight=7];
+    table_cache -> snapshot [label="fast reopen", weight=7];
+
+    bptree -> table_cache [label="slot id", style=dashed, constraint=false];
+    executor -> response [label="row_count / affected_count / body", weight=10];
+    response -> tcp [style=dashed, label="same id", constraint=false];
+    response -> cli [style=dashed, constraint=false];
+}

@@ -1,326 +1,114 @@
-﻿# SQL-B-Tree
+# 미니 DBMS - API 서버
 
-C 기반 미니 DB 프로젝트다. CSV 파일을 테이블처럼 사용하며 `INSERT`, `SELECT`, `UPDATE`, `DELETE`를 처리한다.  
-이 브랜치는 발표용 서술보다 **현재 코드 구조와 실제 실행 흐름**이 바로 보이도록 README를 다시 정리한 버전이다.
+이 프로젝트는 **C로 구현한 미니 DBMS - API 서버**다. 외부 클라이언트가 TCP socket으로 JSONL 요청을 보내면, 서버는 그 요청을 내부 DB 엔진으로 전달하고 기존 SQL 처리기와 B+ Tree 인덱스로 결과를 반환한다.
 
-## 현재 코드 기준 핵심 요약
+## 1. 개요
 
-- `PK(id)`와 `UK(email, phone)`는 B+ Tree 인덱스로 처리
-- `github` exact-match는 보조 인덱스 경로 지원
-- 인덱스가 없는 일반 컬럼은 선형 탐색 유지
-- 최대 2,000,000행까지 cache prefix를 메모리에 유지
-- 그 이후 row는 uncached tail로 남기고 필요할 때만 CSV 경로로 접근
-- `UPDATE` / `DELETE`는 delta log 기반 변경분 기록
-- 삭제 후에도 B+ Tree가 stale해지지 않도록 stable slot id 사용
-- `CmdProcessor` 기반 worker thread 실행 경로 지원
-- 엔진 `SELECT` 응답 body는 binary rowset 형식 지원
-- 정글 데이터셋 생성기, 벤치 도구, 점수 계산 도구까지 포함
-
-## 파일 구조
-
-현재 읽기 시작점은 아래 순서가 가장 낫다.
-
-### 1. 진입부
-
-- [main.c](main.c)
-  - CLI 옵션 파싱
-  - SQL 실행과 데이터 생성 모드 분기
-  - SQL 파일 실행 진입점
-- [stress_main.c](stress_main.c)
-  - 스트레스 테스트 전용 외부 진입점
-  - `--benchmark`, `--benchmark-jungle` 실행기
-- [bench_memtrack.h](bench_memtrack.h)
-  - `BENCH_MEMTRACK` 빌드 시 메모리 추적 후킹
-- [sqlsprocessor_bundle.h](sqlsprocessor_bundle.h)
-  - IDE에서 `main.c` 하나만 직접 컴파일할 때 구현 파일 결합 담당
-
-### 2. 파싱 계층
-
-- [lexer.c](lexer.c)
-- [parser.c](parser.c)
-- [parser.h](parser.h)
-
-역할:
-- SQL 문자열 -> 토큰
-- 토큰 -> `Statement`
-
-### 3. 실행 계층
-
-- [executor.c](executor.c)
-- [executor.h](executor.h)
-
-역할:
-- `Statement` 실행
-- `TableCache` 관리
-- CSV / delta / snapshot / index 연동
-
-### 4. 인덱스 계층
-
-- [bptree.c](bptree.c)
-- [bptree.h](bptree.h)
-
-역할:
-- PK 숫자 B+ Tree
-- UK 문자열 B+ Tree
-- exact lookup / range lookup
-
-### 5. 벤치/데이터셋 보조
-
-- [jungle_benchmark.c](jungle_benchmark.c)
-- [jungle_benchmark.h](jungle_benchmark.h)
-- [benchmark_runner.c](benchmark_runner.c)
-- [bench_workload_generator.c](bench_workload_generator.c)
-- [bench_formula_test.c](bench_formula_test.c)
-
-## 실행 흐름
+### 전체 구조
 
 ```mermaid
 flowchart LR
-    A["SQL file / CLI option"] --> B["main.c"]
-    B --> C["lexer.c / parser.c"]
-    C --> D["Statement"]
-    D --> E["executor.c"]
-    E --> F["TableCache"]
-    F --> G["PK / UK B+ Tree"]
-    F --> H["CSV / delta / snapshot"]
+    A["외부 클라이언트"] --> B["TCP API 서버"]
+    B --> C["요청 추적 / Thread Pool"]
+    C --> D["DB 실행 보호"]
+    D --> E["SQL 처리기 + B+ Tree"]
+    E --> F["JSON 응답"]
 ```
 
-즉 지금 구조는
+- C 언어로 미니 DBMS API 서버를 구현했다.
+- 외부 클라이언트는 TCP connection으로 JSONL 요청을 보내 DBMS 기능을 사용할 수 있다.
+- 요청은 Thread Pool 흐름으로 처리되어 여러 클라이언트 요청을 동시에 받을 수 있다.
+- 내부 DB 엔진은 이전 차수에서 구현한 SQL 처리기와 B+ Tree 인덱스를 재사용한다.
+- 테스트와 부하 시연으로 기능, 엣지 케이스, 동시 요청 흐름을 검증한다.
 
-1. `main.c`가 입력 방식과 실행 모드를 정리하고
-2. `parser`가 SQL을 `Statement`로 바꾸고
-3. `executor`가 실제 데이터/인덱스를 건드리는 방식이다.
+**핵심은 동시 요청을 두 단계로 나눠 처리한 것이다. API는 요청을 추적하고, DB는 공유 데이터의 일관성을 보장한다.**
 
-멀티스레드 API 서버 경로에서는 여기에 `cmd_processor/*` 계층이 앞단에 추가된다.
+## 2. API
 
-- frontend가 `CmdRequest`를 생성
-- planner가 route/lock plan을 결정
-- shard queue에 적재
-- worker thread가 parse + executor 실행
-- `CmdResponse`를 frontend로 반환
+TCP 서버는 SQL을 직접 실행하지 않는다. 외부 요청을 수신해 DB 처리 계층으로 넘기는 경계 역할을 한다.
 
-## 빌드
+### API 서버 아키텍처
 
-### 기본 빌드
+![TCP 기반 전체 요청 흐름](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.svg)
 
-```powershell
-gcc -O2 -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe
-```
+DOT 원본: [004_tcp_cmd_processor_architecture_flow.dot](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.dot)
 
-또는:
+- 외부 클라이언트는 TCP connection을 열고 JSONL 한 줄로 SQL 요청을 보낸다.
+- API 서버는 요청을 받으면 request id를 기록하고, 응답이 끝날 때까지 추적한다.
+- SQL은 API 서버에서 직접 실행하지 않고 DB 처리 계층으로 전달한다.
+- DB 처리 결과가 돌아오면 같은 request id를 붙여 원래 connection에 응답한다.
+- 그래서 응답 순서가 바뀌어도 클라이언트는 자기 요청의 결과를 찾을 수 있다.
+- 잘못된 JSON, 필수 필드 누락, 중복 id 등 DB까지 전달할 필요가 없는 요청은 API 계층에서 먼저 차단한다.
+
+### API 계층의 동시성
+
+- 여러 클라이언트 connection과 여러 in-flight 요청이 동시에 존재할 수 있다.
+- 여기서의 동시성은 DB 내부의 lock 문제가 아니라, 동시에 들어온 네트워크 요청을 누락 없이 올바른 응답에 매칭하는 문제다.
+
+**즉, API 계층의 동시성은 DB lock이 아닌 요청 추적과 응답 매칭의 문제다.**
+
+## 3. DB
+
+API가 요청을 동시에 받아들이면, DB 계층은 공유 데이터에 대한 접근 순서를 제어해야 한다.
+
+![DB Storage Model](docs/sijun-yang/diagrams/DB.png)
+
+### API와 DB 실행 경계
+- API 계층은 SQL을 직접 실행하지 않는다.
+- SQL 요청은 DB 처리 계층으로 넘어가며, 이 계층이 실행 흐름 전체를 책임진다.
+- 그 안에서 기존 SQL 처리기와 B+ Tree 인덱스가 실제 DB 기능을 수행한다.
+- 이 경계 덕분에 TCP 연결 관리와 DB 상태 관리가 명확히 분리된다.
+
+### DB단 동시성 처리
+
+API 동시성과 공존한다. 이 장에서는 queue, worker, lock plan, `engine_mutex`를 거쳐 SQL이 실행되는 흐름을 설명한다.
+
+![DB 동시성 처리 흐름](docs/sijun-yang/diagrams/readme_db_concurrency_flow.svg)
+
+DOT 원본: [readme_db_concurrency_flow.dot](docs/sijun-yang/diagrams/readme_db_concurrency_flow.dot)
+
+- API에서 넘어온 SQL은 바로 실행되지 않고, EngineCmdProcessor에서 실행 계획을 먼저 수립한다.
+- 실행 계획은 두 가지를 결정한다. SELECT는 READ, INSERT/UPDATE/DELETE는 WRITE로 분류하고, table 기준으로 어느 worker queue에 넣을지 고른다.
+- 동시에 table 단위 lock plan을 만든다. 읽기끼리는 병렬로 허용하고, 쓰기는 충돌 가능한 요청을 직렬화한다.
+- worker는 queue에서 job을 꺼낸 뒤 lock plan에 따라 lock을 획득한 경우에만 SQL 실행 구간으로 진입한다.
+- 현재 구현은 parser/executor/TableCache의 전역 상태를 고려해 실행 구간을 engine_mutex로 한 번 더 감싼다.
+
+**API는 병렬로 요청을 접수하고, DB는 lock plan과 engine_mutex를 통해 안전한 요청만 내부 엔진으로 들여보낸다.**
+
+
+## 4. 성능
+
+이 장의 수치와 그래프는 추후 추가한다. 지금 README에는 발표에서 연결할 지표만 남긴다.
+
+- B+ Tree 조회와 scan 조회를 비교해 인덱스 효과를 보여준다.
+- 동시에 대기 중이던 요청 수로 API 계층의 병렬 요청 상황을 보여준다.
+- queue depth로 요청이 실제로 worker queue에 쌓였다는 근거를 보여준다.
+- queue wait, lock wait, exec time으로 DB 처리 계층에서 시간이 어디에 쓰였는지 설명한다.
+- stress test 처리량으로 여러 클라이언트 요청을 실제로 받아냈다는 점을 보여준다.
+
+발표용 검증 흐름은 아래 순서가 자연스럽다.
 
 ```bash
-make
+./test.sh
+./test.sh --stress
+make test-cmd-processor-scale-score
 ```
 
-### 메모리 추적 빌드
-
-```powershell
-gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe
-```
-
-`BENCH_MEMTRACK_REPORT=1` 환경에서 실행하면 requested heap 기준 peak/current 값을 출력한다.
-
-## 기본 사용법
-
-### SQL 파일 실행
-
-```powershell
-.\sqlsprocessor.exe demo_bptree.sql
-```
-
-### quiet 모드
-
-```powershell
-.\sqlsprocessor.exe --quiet demo_bptree.sql
-```
-
-### 정글 데이터셋 생성
-
-```powershell
-.\sqlsprocessor.exe --generate-jungle 1000000
-.\sqlsprocessor.exe --generate-jungle 1000000 my_jungle_demo.csv
-```
-
-### 기본 벤치
-
-```powershell
-.\stress_runner.exe --benchmark 1000000
-```
-
-### SQL 경로 기반 정글 벤치
-
-```powershell
-.\stress_runner.exe --benchmark-jungle 1000000
-```
-
-## 현재 인덱스 동작
-
-### exact lookup
-
-- `WHERE id = ...` -> PK B+ Tree
-- `WHERE email = ...` / `WHERE phone = ...` -> UK B+ Tree
-
-### range lookup
-
-- `WHERE id BETWEEN a AND b` -> PK B+ Tree range scan
-- `WHERE email BETWEEN a AND b` -> UK 문자열 B+ Tree range scan
-
-### non-index 조건
-
-- 예: `WHERE name = ...`
-- 선형 탐색
-
-즉 발표에서 비교하기 가장 좋은 조합은:
-
-- `id` / `email` / `phone` : 인덱스 경로
-- `name` : scan 경로
-
-## 저장 구조
-
-### CSV
-
-기본 테이블 파일.
-
-### delta log
-
-`<table>.delta`
-
-- `UPDATE` / `DELETE` 변경분만 append
-- 테이블 reopen 시 replay
-- 일정 크기 이상 커지면 compaction
-
-### snapshot
-
-`<table>.idx`
-
-- schema / rows / PK/UK index snapshot
-- reopen 시 빠른 복구에 사용
-
-### binary snapshot
-
-`<table>.idxb`
-
-- large table preload 속도를 줄이기 위한 binary snapshot
-- mixed TCP benchmark에서 startup 비용 절감에 사용
-
-## 메모리 모델
-
-현재 cache prefix 방식은 아래처럼 동작한다.
-
-- 앞쪽 최대 2,000,000행만 `TableCache`에 캐시
-- tail은 CSV에 남김
-- PK exact lookup은 tail도 offset 인덱스로 바로 찾음
-- non-index 조회는 cache + tail scan
-
-즉 “전체를 무조건 메모리에 올리지 않는다”가 현재 구조의 핵심이다.
-
-## UPDATE / DELETE 현재 구조
-
-현재 코드는 아래 성격으로 정리돼 있다.
-
-- lookup 판단: 공통 mutation lookup plan
-- cached row 수정/삭제: slot id 기준 처리
-- uncached tail PK row: delta log 기반 처리
-- over-limit table 일반 조건: rewrite fallback
-
-즉 단순히 row 배열을 밀어붙이는 구조가 아니라,
-
-- `stable slot id`
-- `delta append`
-- `tail fallback`
-
-조합으로 유지된다.
-
-## 정글 데이터셋
-
-기본 파일:
-
-- `jungle_benchmark_users.csv`
-
-기본 스키마:
-
-```csv
-id(PK),email(UK),phone(UK),name,track(NN),background,history,pretest,github,status,round
-```
-
-비교 포인트:
-
-- `id` : PK 인덱스
-- `email` : UK 인덱스
-- `phone` : UK 인덱스
-- `name` : 선형 탐색
-
-## 시나리오와 워크로드
-
-### 시나리오 SQL
-
-- `scenario_jungle_regression.sql`
-- `scenario_jungle_range_and_replay.sql`
-- `scenario_jungle_update_constraints.sql`
-
-### 생성 워크로드
-
-```bash
-make generate-jungle-sql
-```
-
-생성 위치:
-
-- `generated_sql/jungle_insert_score.sql`
-- `generated_sql/jungle_update_score.sql`
-- `generated_sql/jungle_delete_score.sql`
-- 기타 smoke / regression / correctness SQL
-
-## 현재 참고 문서
-
-- `docs/STRESS_TESTING_KO.md`
-  - 엔진/동시성/외부 TCP mixed CRUD 테스트 방법 정리
-- `docs/multithread-optimization-plan.md`
-  - DB + worker 최적화와 현재 병목 정리
-- `docs/DB_WORKER_CURRENT_STATE_KO.md`
-  - 팀 인수인계 기준 현재 상태 요약
-
-## 점수/벤치 도구
-
-### bench-score
-
-```bash
-make bench-score
-```
-
-현재 Makefile은 `bench_score_exec.conf`를 사용해 실행 파일 스펙을 읽고,  
-`benchmark_runner`가 SQL 생성 -> correctness -> `stress_runner` benchmark -> report 생성까지 담당한다.
-
-결과 산출물:
-
-- `artifacts/bench/report.json`
-- `artifacts/bench/report.md`
-
-## Make Targets
-
-```bash
-make
-make demo-bptree
-make generate-jungle
-make demo-jungle
-make scenario-jungle-regression
-make scenario-jungle-range-and-replay
-make scenario-jungle-update-constraints
-make generate-jungle-sql
-make benchmark
-make benchmark-jungle
-make bench-smoke
-make bench-score
-make bench-report
-make bench-clean
-```
-
-스트레스 테스트 운영 가이드는 [docs/STRESS_TESTING_KO.md](docs/STRESS_TESTING_KO.md) 에 정리했다.
-
-## 발표 때 설명하기 좋은 포인트
-
-1. `PK/UK는 B+ Tree`, 일반 컬럼은 scan으로 비교 기준 유지
-2. 대용량에서는 `cache prefix + uncached tail + tail PK offset`으로 메모리 사용량 제어
-3. 쓰기 경로는 `stable slot id + delta log`로 전체 rewrite를 줄임
-4. 벤치/점수 도구까지 같이 들어 있어 결과를 반복 재현 가능
+`./test.sh`는 API 기능과 엣지 케이스를 보여주고, `./test.sh --stress`는 여러 클라이언트가 outstanding 요청을 유지하는 장면을 보여준다. `make test-cmd-processor-scale-score`는 queue wait, lock wait, exec time을 숫자로 확인하는 용도다.
+
+
+## 파일 구조
+
+| 위치 | 역할 |
+| --- | --- |
+| `main.c` | CLI 옵션, SQL 파일 읽기, EngineCmdProcessor 초기화 |
+| `lexer.c`, `parser.c` | SQL text를 `Statement`로 변환 |
+| `executor.c`, `executor.h` | CRUD 실행, TableCache, CSV/delta/snapshot/index 연동 |
+| `bptree.c`, `bptree.h` | 숫자 PK B+ Tree, 문자열 UK B+ Tree |
+| `types.h` | `Statement`, `TableCache`, token, column metadata |
+| `cmd_processor/` | 공통 요청 처리 계약, Engine/REPL/TCP/Mock 구현 |
+| `thirdparty/cjson/` | TCP JSON request/response 처리 |
+| `benchmark_runner.c` | correctness/benchmark/report 실행기 |
+| `bench_workload_generator.c` | 벤치 SQL workload 생성 |
+| `tests/api_story_test.c` | 발표용 TCP API story test runner |
+| `docs/sijun-yang/004_cmd_processor_architecture_flow.md` | CmdProcessor/TCP 상세 발표 문서 |
