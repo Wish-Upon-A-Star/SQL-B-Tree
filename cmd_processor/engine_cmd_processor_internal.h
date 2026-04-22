@@ -13,6 +13,7 @@
 #include "../executor.h"
 #include "../parser.h"
 #include "../platform_threads.h"
+#include "../thirdparty/cjson/cJSON.h"
 
 #define ENGINE_DEFAULT_NAME "engine_cmd_processor"
 #define ENGINE_DEFAULT_MAX_SQL_LEN 4096u
@@ -22,7 +23,7 @@
 #define ENGINE_DEFAULT_QUEUE_CAPACITY 64
 #define ENGINE_DEFAULT_PLANNER_CACHE_CAPACITY 128
 #define ENGINE_MAX_TABLES_PER_PLAN 4
-#define ENGINE_LOCK_BUCKETS 32
+#define ENGINE_LOCK_BUCKETS 128
 
 typedef struct CmdJob CmdJob;
 
@@ -173,7 +174,6 @@ typedef struct {
     db_mutex_t state_mutex;
     db_mutex_t request_mutex;
     db_mutex_t response_mutex;
-    db_mutex_t engine_mutex;
     int running;
     RequestSlot *request_slots;
     ResponseSlot *response_slots;
@@ -188,6 +188,8 @@ typedef struct {
     unsigned long long current_response_slots_in_use;
     unsigned long long peak_request_slots_in_use;
     unsigned long long peak_response_slots_in_use;
+    unsigned long long current_concurrent_executions;
+    unsigned long long max_concurrent_executions;
     WorkQueue *queues;
     db_thread_t *threads;
     int thread_count;

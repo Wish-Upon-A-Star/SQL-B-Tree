@@ -26,6 +26,12 @@ bench_formula_test
 docs/CMD_PROCESSOR_IMPLEMENTATION_HARNESS_KO.md
 docs/CMD_PROCESSOR_READABILITY_SCORE_HARNESS_KO.md
 docs/CMD_PROCESSOR_READABILITY_SCORE_SHEET.md
+scripts/__pycache__/
+*.idxb
+tcp_mix_*.csv
+tcp_mix_*.log
+tcp_sql_server
+parser_probe_tmp.c
 
 # Created by https://www.toptal.com/developers/gitignore/api/jetbrains+all
 # Edit at https://www.toptal.com/developers/gitignore?templates=jetbrains+all

@@ -2,3 +2,4 @@ id(PK),email(UK),phone(UK),pwd(NN),name
 1,admin@test.com,010-1111,pass123,Admin
 2,user1@test.com,010-2222,qwerty,UserOne
 3,user2@test.com,010-3333,hello123,UserTwo
+900001,tcp-user@test.com,010-9999,pw9999,TcpUser

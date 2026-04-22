@@ -1,0 +1,39 @@
+{
+  "artifact_type": "figma-code-flow",
+  "metadata": {
+    "title": "CLI SQL Sync Request Path",
+    "scope": "single synchronous SQL request path from main.c to worker response",
+    "audience": "new developer and presentation reviewer"
+  },
+  "gates": {
+    "entry_exit_defined": true,
+    "control_flow_complete": true,
+    "state_externalized": true,
+    "pseudocode_present": true,
+    "branch_labels_complete": true,
+    "evidence_links_present": true,
+    "terminology_matches_code": true
+  },
+  "ratings": {
+    "semantic_fidelity": 5,
+    "traceability": 5,
+    "state_visibility": 5,
+    "branch_loop_coverage": 5,
+    "layout_clarity": 5,
+    "pseudocode_quality": 5,
+    "exception_path_quality": 5,
+    "evidence_quality": 5
+  },
+  "metrics": {
+    "primary_step_count": 12,
+    "crossing_count": 1,
+    "max_outgoing_edges_per_node": 3,
+    "max_words_per_node": 10,
+    "legend_item_count": 4,
+    "unsupported_claim_count": 0
+  },
+  "notes": [
+    "Scope excludes ping path, TCP framing, and dormant fast SQL helper functions.",
+    "Branches covered: validation, planning, parse, execute, and response formatting."
+  ]
+}

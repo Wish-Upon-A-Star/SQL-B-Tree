@@ -31,14 +31,16 @@
 
 #if defined(_WIN32)
 #define DEFAULT_SQLPROCESSOR_CMD ".\\sqlsprocessor.exe"
+#define DEFAULT_STRESS_CMD ".\\stress_runner.exe"
 #define DEFAULT_BENCH_GENERATOR_CMD ".\\bench_workload_generator.exe"
-#define DEFAULT_BUILD_CMD "gcc -O2 -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe"
-#define DEFAULT_MEMTRACK_BUILD_CMD "gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe"
+#define DEFAULT_BUILD_CMD "gcc -O2 -fdiagnostics-color=always -g main.c -o sqlsprocessor.exe && gcc -O2 -fdiagnostics-color=always -g stress_main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c -o stress_runner.exe"
+#define DEFAULT_MEMTRACK_BUILD_CMD "gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.exe && gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK stress_main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c -o stress_runner.exe"
 #else
 #define DEFAULT_SQLPROCESSOR_CMD "./sqlsprocessor"
+#define DEFAULT_STRESS_CMD "./stress_runner"
 #define DEFAULT_BENCH_GENERATOR_CMD "./bench_workload_generator"
-#define DEFAULT_BUILD_CMD "make -B build CFLAGS='-O2 -fdiagnostics-color=always -g'"
-#define DEFAULT_MEMTRACK_BUILD_CMD "make -B build CFLAGS='-O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK'"
+#define DEFAULT_BUILD_CMD "make -B build stress-tools CFLAGS='-O2 -fdiagnostics-color=always -g'"
+#define DEFAULT_MEMTRACK_BUILD_CMD "make -B build stress-tools CFLAGS='-O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK'"
 #endif
 
 typedef struct {
@@ -56,6 +58,7 @@ typedef struct {
 
 typedef struct {
     char sql_exe[512];
+    char stress_exe[512];
     char generator_exe[512];
     char build_cmd[1024];
     char memtrack_build_cmd[1024];
@@ -140,11 +143,13 @@ static void init_exec_spec(BenchExecSpec *spec) {
     if (!spec) return;
     memset(spec, 0, sizeof(*spec));
     strncpy(spec->sql_exe, DEFAULT_SQLPROCESSOR_CMD, sizeof(spec->sql_exe) - 1);
+    strncpy(spec->stress_exe, DEFAULT_STRESS_CMD, sizeof(spec->stress_exe) - 1);
     strncpy(spec->generator_exe, DEFAULT_BENCH_GENERATOR_CMD, sizeof(spec->generator_exe) - 1);
     strncpy(spec->build_cmd, DEFAULT_BUILD_CMD, sizeof(spec->build_cmd) - 1);
     strncpy(spec->memtrack_build_cmd, DEFAULT_MEMTRACK_BUILD_CMD, sizeof(spec->memtrack_build_cmd) - 1);
     strncpy(spec->constraint_mode, "pkuk", sizeof(spec->constraint_mode) - 1);
     spec->sql_exe[sizeof(spec->sql_exe) - 1] = '\0';
+    spec->stress_exe[sizeof(spec->stress_exe) - 1] = '\0';
     spec->generator_exe[sizeof(spec->generator_exe) - 1] = '\0';
     spec->build_cmd[sizeof(spec->build_cmd) - 1] = '\0';
     spec->memtrack_build_cmd[sizeof(spec->memtrack_build_cmd) - 1] = '\0';
@@ -154,6 +159,15 @@ static void init_exec_spec(BenchExecSpec *spec) {
     if (env_sql && env_sql[0] != '\0') {
         strncpy(spec->sql_exe, env_sql, sizeof(spec->sql_exe) - 1);
         spec->sql_exe[sizeof(spec->sql_exe) - 1] = '\0';
+    }
+    {
+        const char *env_stress = getenv("SQLSPROCESSOR_STRESS_EXE");
+        if (env_stress && env_stress[0] != '\0') {
+            strncpy(spec->stress_exe, env_stress, sizeof(spec->stress_exe) - 1);
+            spec->stress_exe[sizeof(spec->stress_exe) - 1] = '\0';
+        }
+    }
+    if ((env_sql && env_sql[0] != '\0') || getenv("SQLSPROCESSOR_STRESS_EXE")) {
         spec->build_cmd[0] = '\0';
         spec->memtrack_build_cmd[0] = '\0';
     }
@@ -182,6 +196,9 @@ static void load_exec_spec(BenchExecSpec *spec, const char *path) {
         if (strcmp(key, "sql_exe") == 0) {
             strncpy(spec->sql_exe, value, sizeof(spec->sql_exe) - 1);
             spec->sql_exe[sizeof(spec->sql_exe) - 1] = '\0';
+        } else if (strcmp(key, "stress_exe") == 0) {
+            strncpy(spec->stress_exe, value, sizeof(spec->stress_exe) - 1);
+            spec->stress_exe[sizeof(spec->stress_exe) - 1] = '\0';
         } else if (strcmp(key, "generator_exe") == 0) {
             strncpy(spec->generator_exe, value, sizeof(spec->generator_exe) - 1);
             spec->generator_exe[sizeof(spec->generator_exe) - 1] = '\0';
@@ -667,15 +684,15 @@ int main(int argc, char **argv) {
 
             if (opt.memtrack) {
 #if defined(_WIN32)
-                snprintf(cmd, sizeof(cmd), "set BENCH_MEMTRACK_REPORT=1&& %s --benchmark %d 2>&1", spec.sql_exe, opt.rows);
+                snprintf(cmd, sizeof(cmd), "set BENCH_MEMTRACK_REPORT=1&& %s --benchmark %d 2>&1", spec.stress_exe, opt.rows);
 #else
-                snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 \"%s\" --benchmark %d 2>&1", spec.sql_exe, opt.rows);
+                snprintf(cmd, sizeof(cmd), "BENCH_MEMTRACK_REPORT=1 \"%s\" --benchmark %d 2>&1", spec.stress_exe, opt.rows);
 #endif
             } else {
 #if defined(_WIN32)
-                snprintf(cmd, sizeof(cmd), "%s --benchmark %d 2>&1", spec.sql_exe, opt.rows);
+                snprintf(cmd, sizeof(cmd), "%s --benchmark %d 2>&1", spec.stress_exe, opt.rows);
 #else
-                snprintf(cmd, sizeof(cmd), "\"%s\" --benchmark %d 2>&1", spec.sql_exe, opt.rows);
+                snprintf(cmd, sizeof(cmd), "\"%s\" --benchmark %d 2>&1", spec.stress_exe, opt.rows);
 #endif
             }
 

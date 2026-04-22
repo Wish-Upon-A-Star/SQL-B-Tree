@@ -1,12 +1,12 @@
 #include "tcp_cmd_processor.h"
 
-#include "../thirdparty/cjson/cJSON.h"
-
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +39,9 @@ typedef struct TCPConnection {
     int closing;
     size_t inflight_count;
     size_t ref_count;
+    size_t read_start;
+    size_t read_end;
+    char read_buffer[4096];
     pthread_t thread;
     pthread_mutex_t state_mutex;
     pthread_mutex_t write_mutex;
@@ -434,29 +437,188 @@ static int write_json_line(TCPConnection *connection, const char *json) {
     return rc;
 }
 
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} JSONBuffer;
+
+static int json_buffer_reserve(JSONBuffer *buffer, size_t extra) {
+    char *next;
+    size_t required;
+    size_t cap;
+
+    if (!buffer) return 0;
+    required = buffer->len + extra + 1;
+    if (required <= buffer->cap) return 1;
+
+    cap = buffer->cap ? buffer->cap : 256;
+    while (cap < required) {
+        if (cap > ((size_t)-1) / 2) {
+            cap = required;
+            break;
+        }
+        cap *= 2;
+    }
+
+    next = (char *)realloc(buffer->data, cap);
+    if (!next) return 0;
+    buffer->data = next;
+    buffer->cap = cap;
+    return 1;
+}
+
+static int json_buffer_append_bytes(JSONBuffer *buffer, const char *data, size_t len) {
+    if (!buffer || (!data && len != 0)) return 0;
+    if (!json_buffer_reserve(buffer, len)) return 0;
+    if (len > 0) memcpy(buffer->data + buffer->len, data, len);
+    buffer->len += len;
+    buffer->data[buffer->len] = '\0';
+    return 1;
+}
+
+static int json_buffer_append_cstr(JSONBuffer *buffer, const char *text) {
+    return json_buffer_append_bytes(buffer, text, text ? strlen(text) : 0);
+}
+
+static int json_buffer_append_char(JSONBuffer *buffer, char ch) {
+    return json_buffer_append_bytes(buffer, &ch, 1);
+}
+
+static int json_buffer_append_int(JSONBuffer *buffer, int value) {
+    char scratch[32];
+    int len;
+
+    len = snprintf(scratch, sizeof(scratch), "%d", value);
+    if (len < 0) return 0;
+    return json_buffer_append_bytes(buffer, scratch, (size_t)len);
+}
+
+static int json_buffer_append_escaped(JSONBuffer *buffer, const char *text, size_t text_len) {
+    size_t i;
+
+    if (!json_buffer_append_char(buffer, '"')) return 0;
+    for (i = 0; i < text_len; i++) {
+        unsigned char ch = (unsigned char)text[i];
+
+        switch (ch) {
+            case '\\':
+                if (!json_buffer_append_cstr(buffer, "\\\\")) return 0;
+                break;
+            case '"':
+                if (!json_buffer_append_cstr(buffer, "\\\"")) return 0;
+                break;
+            case '\b':
+                if (!json_buffer_append_cstr(buffer, "\\b")) return 0;
+                break;
+            case '\f':
+                if (!json_buffer_append_cstr(buffer, "\\f")) return 0;
+                break;
+            case '\n':
+                if (!json_buffer_append_cstr(buffer, "\\n")) return 0;
+                break;
+            case '\r':
+                if (!json_buffer_append_cstr(buffer, "\\r")) return 0;
+                break;
+            case '\t':
+                if (!json_buffer_append_cstr(buffer, "\\t")) return 0;
+                break;
+            default:
+                if (ch < 0x20) {
+                    char unicode_escape[7];
+                    int len = snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04x", ch);
+                    if (len < 0) return 0;
+                    if (!json_buffer_append_bytes(buffer, unicode_escape, (size_t)len)) return 0;
+                } else {
+                    if (!json_buffer_append_char(buffer, (char)ch)) return 0;
+                }
+                break;
+        }
+    }
+    return json_buffer_append_char(buffer, '"');
+}
+
+static int json_buffer_append_field_prefix(JSONBuffer *buffer,
+                                           int *first_field,
+                                           const char *name) {
+    if (!buffer || !first_field || !name) return 0;
+    if (!*first_field && !json_buffer_append_char(buffer, ',')) return 0;
+    *first_field = 0;
+    if (!json_buffer_append_escaped(buffer, name, strlen(name))) return 0;
+    return json_buffer_append_char(buffer, ':');
+}
+
+static int json_buffer_append_string_field(JSONBuffer *buffer,
+                                           int *first_field,
+                                           const char *name,
+                                           const char *value,
+                                           size_t value_len) {
+    if (!json_buffer_append_field_prefix(buffer, first_field, name)) return 0;
+    return json_buffer_append_escaped(buffer, value ? value : "", value ? value_len : 0);
+}
+
+static int json_buffer_append_bool_field(JSONBuffer *buffer,
+                                         int *first_field,
+                                         const char *name,
+                                         int value) {
+    if (!json_buffer_append_field_prefix(buffer, first_field, name)) return 0;
+    return json_buffer_append_cstr(buffer, value ? "true" : "false");
+}
+
+static int json_buffer_append_int_field(JSONBuffer *buffer,
+                                        int *first_field,
+                                        const char *name,
+                                        int value) {
+    if (!json_buffer_append_field_prefix(buffer, first_field, name)) return 0;
+    return json_buffer_append_int(buffer, value);
+}
+
+static char *json_buffer_finalize(JSONBuffer *buffer) {
+    if (!buffer) return NULL;
+    if (!buffer->data) {
+        buffer->data = (char *)calloc(1, 1);
+        if (!buffer->data) return NULL;
+        buffer->cap = 1;
+    }
+    buffer->data[buffer->len] = '\0';
+    return buffer->data;
+}
+
 static char *build_status_json(const char *request_id,
                                CmdStatusCode status,
                                const char *message) {
-    cJSON *root;
-    char *json;
+    JSONBuffer buffer = {0};
+    int first_field = 1;
     int ok;
     char error_message[TCP_ERROR_MESSAGE_MAX_BYTES + 1];
 
-    root = cJSON_CreateObject();
-    if (!root) return NULL;
-
     ok = status == CMD_STATUS_OK;
-    cJSON_AddStringToObject(root, "id", request_id ? request_id : "unknown");
-    cJSON_AddBoolToObject(root, "ok", ok ? 1 : 0);
-    cJSON_AddStringToObject(root, "status", cmd_status_to_string(status));
+    if (!json_buffer_append_char(&buffer, '{')) goto fail;
+    if (!json_buffer_append_string_field(&buffer,
+                                         &first_field,
+                                         "id",
+                                         request_id ? request_id : "unknown",
+                                         request_id ? strlen(request_id) : strlen("unknown"))) goto fail;
+    if (!json_buffer_append_bool_field(&buffer, &first_field, "ok", ok)) goto fail;
+    if (!json_buffer_append_string_field(&buffer,
+                                         &first_field,
+                                         "status",
+                                         cmd_status_to_string(status),
+                                         strlen(cmd_status_to_string(status)))) goto fail;
     if (!ok) {
         copy_cstr(error_message, sizeof(error_message), message ? message : "request failed");
-        cJSON_AddStringToObject(root, "error", error_message);
+        if (!json_buffer_append_string_field(&buffer,
+                                             &first_field,
+                                             "error",
+                                             error_message,
+                                             strlen(error_message))) goto fail;
     }
+    if (!json_buffer_append_char(&buffer, '}')) goto fail;
+    return json_buffer_finalize(&buffer);
 
-    json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    return json;
+fail:
+    free(buffer.data);
+    return NULL;
 }
 
 static int write_status_response(TCPConnection *connection,
@@ -469,49 +631,91 @@ static int write_status_response(TCPConnection *connection,
     json = build_status_json(request_id, status, message);
     if (json) {
         rc = write_json_line(connection, json);
-        cJSON_free(json);
+        free(json);
     }
     return rc;
 }
 
 static char *build_cmd_response_json(CmdResponse *response) {
-    cJSON *root;
-    cJSON *body_json;
+    JSONBuffer buffer = {0};
+    char *hex_body = NULL;
     char *json;
+    size_t i;
+    int first_field = 1;
 
     if (!response) return NULL;
-
-    root = cJSON_CreateObject();
-    if (!root) return NULL;
-
-    cJSON_AddStringToObject(root, "id", response->request_id);
-    cJSON_AddBoolToObject(root, "ok", response->ok ? 1 : 0);
-    cJSON_AddStringToObject(root, "status", cmd_status_to_string(response->status));
-    if (response->row_count != 0) cJSON_AddNumberToObject(root, "row_count", response->row_count);
-    if (response->affected_count != 0) {
-        cJSON_AddNumberToObject(root, "affected_count", response->affected_count);
-    }
+    if (!json_buffer_append_char(&buffer, '{')) goto fail;
+    if (!json_buffer_append_string_field(&buffer,
+                                         &first_field,
+                                         "id",
+                                         response->request_id,
+                                         strlen(response->request_id))) goto fail;
+    if (!json_buffer_append_bool_field(&buffer, &first_field, "ok", response->ok ? 1 : 0)) goto fail;
+    if (!json_buffer_append_string_field(&buffer,
+                                         &first_field,
+                                         "status",
+                                         cmd_status_to_string(response->status),
+                                         strlen(cmd_status_to_string(response->status)))) goto fail;
+    if (response->body_format == CMD_BODY_TEXT &&
+        !json_buffer_append_string_field(&buffer, &first_field, "body_format", "text", 4)) goto fail;
+    if (response->body_format == CMD_BODY_JSON &&
+        !json_buffer_append_string_field(&buffer, &first_field, "body_format", "json", 4)) goto fail;
+    if (response->body_format == CMD_BODY_BINARY &&
+        !json_buffer_append_string_field(&buffer, &first_field, "body_format", "binary", 6)) goto fail;
+    if (response->row_count != 0 &&
+        !json_buffer_append_int_field(&buffer, &first_field, "row_count", response->row_count)) goto fail;
+    if (response->affected_count != 0 &&
+        !json_buffer_append_int_field(&buffer,
+                                      &first_field,
+                                      "affected_count",
+                                      response->affected_count)) goto fail;
 
     if (response->body && response->body_len > 0) {
         if (response->body_format == CMD_BODY_TEXT) {
-            cJSON_AddStringToObject(root, "body", response->body);
+            if (!json_buffer_append_string_field(&buffer,
+                                                 &first_field,
+                                                 "body",
+                                                 response->body,
+                                                 response->body_len)) goto fail;
         } else if (response->body_format == CMD_BODY_JSON) {
-            body_json = cJSON_ParseWithLength(response->body, response->body_len);
-            if (!body_json) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!json_buffer_append_field_prefix(&buffer, &first_field, "body")) goto fail;
+            if (!json_buffer_append_bytes(&buffer, response->body, response->body_len)) goto fail;
+        } else if (response->body_format == CMD_BODY_BINARY) {
+            static const char kHex[] = "0123456789abcdef";
+            hex_body = (char *)calloc(response->body_len * 2 + 1, 1);
+            if (!hex_body) {
+                goto fail;
             }
-            cJSON_AddItemToObject(root, "body", body_json);
+            for (i = 0; i < response->body_len; i++) {
+                unsigned char byte = (unsigned char)response->body[i];
+                hex_body[i * 2] = kHex[(byte >> 4) & 0x0f];
+                hex_body[i * 2 + 1] = kHex[byte & 0x0f];
+            }
+            if (!json_buffer_append_string_field(&buffer,
+                                                 &first_field,
+                                                 "body_hex",
+                                                 hex_body,
+                                                 response->body_len * 2)) goto fail;
         }
     }
 
     if (!response->ok && response->error_message) {
-        cJSON_AddStringToObject(root, "error", response->error_message);
+        if (!json_buffer_append_string_field(&buffer,
+                                             &first_field,
+                                             "error",
+                                             response->error_message,
+                                             strlen(response->error_message))) goto fail;
     }
 
-    json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    if (!json_buffer_append_char(&buffer, '}')) goto fail;
+    json = json_buffer_finalize(&buffer);
+    free(hex_body);
     return json;
+
+fail:
+    free(buffer.data);
+    free(hex_body);
+    return NULL;
 }
 
 static void tcp_response_callback(CmdProcessor *processor,
@@ -529,7 +733,7 @@ static void tcp_response_callback(CmdProcessor *processor,
         json = build_cmd_response_json(response);
         if (json) {
             (void)write_json_line(connection, json);
-            cJSON_free(json);
+            free(json);
         } else {
             (void)write_status_response(connection,
                                         request_id,
@@ -562,50 +766,47 @@ static int read_json_line(TCPConnection *connection,
     if (!connection || !buffer || buffer_size == 0) return -1;
 
     while (!connection_is_closing(connection)) {
-        char ch;
-        ssize_t n;
-        int fd;
+        while (connection->read_start < connection->read_end) {
+            char ch = connection->read_buffer[connection->read_start++];
 
-        pthread_mutex_lock(&connection->state_mutex);
-        fd = connection->client_fd;
-        pthread_mutex_unlock(&connection->state_mutex);
-        if (fd < 0) return -1;
-
-        n = recv(fd, &ch, 1, 0);
-        if (n == 0) return -1;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-
-        if (ch == '\n') {
-            if (len > 0 && buffer[len - 1] == '\r') len--;
-            buffer[len] = '\0';
-            if (out_len) *out_len = len;
-            if (out_too_long) *out_too_long = too_long;
-            return too_long ? 1 : 0;
-        }
-
-        if (!too_long) {
-            if (len + 1 < buffer_size) {
-                buffer[len++] = ch;
-            } else {
-                too_long = 1;
+            if (ch == '\n') {
+                if (len > 0 && buffer[len - 1] == '\r') len--;
+                buffer[len] = '\0';
+                if (out_len) *out_len = len;
+                if (out_too_long) *out_too_long = too_long;
+                return too_long ? 1 : 0;
             }
+
+            if (!too_long) {
+                if (len + 1 < buffer_size) {
+                    buffer[len++] = ch;
+                } else {
+                    too_long = 1;
+                }
+            }
+        }
+
+        {
+            ssize_t n;
+            int fd;
+
+            pthread_mutex_lock(&connection->state_mutex);
+            fd = connection->client_fd;
+            pthread_mutex_unlock(&connection->state_mutex);
+            if (fd < 0) return -1;
+
+            n = recv(fd, connection->read_buffer, sizeof(connection->read_buffer), 0);
+            if (n == 0) return -1;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            connection->read_start = 0;
+            connection->read_end = (size_t)n;
         }
     }
 
     return -1;
-}
-
-static int get_string_field(cJSON *root, const char *name, const char **out_value) {
-    cJSON *item;
-
-    if (out_value) *out_value = NULL;
-    item = cJSON_GetObjectItemCaseSensitive(root, name);
-    if (!cJSON_IsString(item) || !item->valuestring) return 0;
-    if (out_value) *out_value = item->valuestring;
-    return 1;
 }
 
 static int parse_op(const char *op_value, TCPRequestOp *out_op) {
@@ -622,6 +823,162 @@ static int parse_op(const char *op_value, TCPRequestOp *out_op) {
         return 1;
     }
     return 0;
+}
+
+static const char *skip_json_ws(const char *cursor) {
+    while (cursor && *cursor && isspace((unsigned char)*cursor)) cursor++;
+    return cursor;
+}
+
+static int parse_hex_digit(char ch, unsigned value[static 1]) {
+    if (ch >= '0' && ch <= '9') {
+        *value = (unsigned)(ch - '0');
+        return 1;
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        *value = (unsigned)(10 + (ch - 'a'));
+        return 1;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        *value = (unsigned)(10 + (ch - 'A'));
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_json_string_inplace(const char **cursor_ptr,
+                                     char **out_value,
+                                     size_t *out_len) {
+    const char *cursor;
+    const char *src;
+    char *dst;
+
+    if (out_value) *out_value = NULL;
+    if (out_len) *out_len = 0;
+    if (!cursor_ptr || !*cursor_ptr) return 0;
+
+    cursor = skip_json_ws(*cursor_ptr);
+    if (*cursor != '"') return 0;
+
+    src = cursor + 1;
+    dst = (char *)cursor;
+    while (*src) {
+        if (*src == '"') {
+            *dst = '\0';
+            src++;
+            if (out_value) *out_value = (char *)cursor;
+            if (out_len) *out_len = (size_t)(dst - (char *)cursor);
+            *cursor_ptr = src;
+            return 1;
+        }
+        if (*src == '\\') {
+            src++;
+            if (*src == '\0') return 0;
+            switch (*src) {
+                case '"':
+                case '\\':
+                case '/':
+                    *dst++ = *src++;
+                    break;
+                case 'b':
+                    *dst++ = '\b';
+                    src++;
+                    break;
+                case 'f':
+                    *dst++ = '\f';
+                    src++;
+                    break;
+                case 'n':
+                    *dst++ = '\n';
+                    src++;
+                    break;
+                case 'r':
+                    *dst++ = '\r';
+                    src++;
+                    break;
+                case 't':
+                    *dst++ = '\t';
+                    src++;
+                    break;
+                case 'u': {
+                    unsigned codepoint = 0;
+                    unsigned digit;
+                    int i;
+                    src++;
+                    for (i = 0; i < 4; i++) {
+                        if (!parse_hex_digit(src[i], &digit)) return 0;
+                        codepoint = (codepoint << 4) | digit;
+                    }
+                    *dst++ = codepoint <= 0x7f ? (char)codepoint : '?';
+                    src += 4;
+                    break;
+                }
+                default:
+                    return 0;
+            }
+            continue;
+        }
+        *dst++ = *src++;
+    }
+    return 0;
+}
+
+static int parse_request_line(char *line,
+                              char *request_id,
+                              size_t request_id_size,
+                              TCPRequestOp *out_op,
+                              char **out_sql) {
+    const char *cursor;
+    char *key;
+    char *value;
+    size_t key_len;
+    size_t value_len;
+    int saw_id = 0;
+    int saw_op = 0;
+
+    if (out_sql) *out_sql = NULL;
+    if (!line || !request_id || request_id_size == 0 || !out_op) return 0;
+
+    cursor = skip_json_ws(line);
+    if (*cursor != '{') return 0;
+    cursor = skip_json_ws(cursor + 1);
+    if (*cursor == '}') return 0;
+
+    while (*cursor) {
+        if (!parse_json_string_inplace(&cursor, &key, &key_len)) return 0;
+        cursor = skip_json_ws(cursor);
+        if (*cursor != ':') return 0;
+        cursor = skip_json_ws(cursor + 1);
+        if (!parse_json_string_inplace(&cursor, &value, &value_len)) return 0;
+
+        if (key_len == 2 && strcmp(key, "id") == 0) {
+            if (value_len == 0) return -2;
+            if (value_len > TCP_REQUEST_ID_MAX_BYTES) return -3;
+            copy_cstr(request_id, request_id_size, value);
+            saw_id = 1;
+        } else if (key_len == 2 && strcmp(key, "op") == 0) {
+            if (value_len > TCP_OP_MAX_BYTES || !parse_op(value, out_op)) return -4;
+            saw_op = 1;
+        } else if (key_len == 3 && strcmp(key, "sql") == 0) {
+            if (out_sql) *out_sql = value;
+        }
+
+        cursor = skip_json_ws(cursor);
+        if (*cursor == ',') {
+            cursor = skip_json_ws(cursor + 1);
+            continue;
+        }
+        if (*cursor == '}') {
+            cursor = skip_json_ws(cursor + 1);
+            if (*cursor != '\0') return 0;
+            break;
+        }
+        return 0;
+    }
+
+    if (!saw_id) return -5;
+    if (!saw_op) return -6;
+    return 1;
 }
 
 static void submit_parsed_request(TCPConnection *connection,
@@ -688,80 +1045,73 @@ static void submit_parsed_request(TCPConnection *connection,
 }
 
 static void process_json_line(TCPConnection *connection,
-                              const char *line,
+                              char *line,
                               size_t line_len) {
-    cJSON *root;
-    const char *request_id;
-    const char *op_value;
-    const char *sql_value = NULL;
+    char request_id[TCP_REQUEST_ID_MAX_BYTES + 1];
+    char *sql_value = NULL;
     TCPRequestOp op;
+    int parse_rc;
 
-    root = cJSON_ParseWithLength(line, line_len);
-    if (!root || !cJSON_IsObject(root)) {
-        if (root) cJSON_Delete(root);
+    (void)line_len;
+    request_id[0] = '\0';
+
+    parse_rc = parse_request_line(line, request_id, sizeof(request_id), &op, &sql_value);
+    if (parse_rc == 0) {
         (void)write_status_response(connection,
                                     "unknown",
                                     CMD_STATUS_BAD_REQUEST,
                                     "invalid JSON object");
         return;
     }
-
-    if (!get_string_field(root, "id", &request_id)) {
+    if (parse_rc == -5) {
         (void)write_status_response(connection,
                                     "unknown",
                                     CMD_STATUS_BAD_REQUEST,
                                     "missing id");
-        cJSON_Delete(root);
         return;
     }
-    if (request_id[0] == '\0') {
+    if (parse_rc == -2) {
         (void)write_status_response(connection,
                                     "",
                                     CMD_STATUS_BAD_REQUEST,
                                     "empty id");
-        cJSON_Delete(root);
         return;
     }
-    if (strlen(request_id) > TCP_REQUEST_ID_MAX_BYTES) {
+    if (parse_rc == -3) {
         (void)write_status_response(connection,
                                     "unknown",
                                     CMD_STATUS_BAD_REQUEST,
                                     "id too long");
-        cJSON_Delete(root);
         return;
     }
-
-    if (!get_string_field(root, "op", &op_value)) {
+    if (parse_rc == -6) {
         (void)write_status_response(connection,
                                     request_id,
                                     CMD_STATUS_BAD_REQUEST,
                                     "missing op");
-        cJSON_Delete(root);
         return;
     }
-    if (strlen(op_value) > TCP_OP_MAX_BYTES || !parse_op(op_value, &op)) {
+    if (parse_rc == -4) {
         (void)write_status_response(connection,
                                     request_id,
                                     CMD_STATUS_BAD_REQUEST,
                                     "unknown op");
-        cJSON_Delete(root);
         return;
     }
+    if (parse_rc <= 0) return;
 
     if (op == TCP_REQUEST_OP_CLOSE) {
         (void)write_status_response(connection, request_id, CMD_STATUS_OK, NULL);
-        cJSON_Delete(root);
         connection_close_fd(connection);
         return;
     }
 
     if (op == TCP_REQUEST_OP_SQL) {
-        if (!get_string_field(root, "sql", &sql_value)) {
+        if (!sql_value) {
             (void)write_status_response(connection,
                                         request_id,
                                         CMD_STATUS_BAD_REQUEST,
                                         "missing sql");
-            cJSON_Delete(root);
             return;
         }
         if (strlen(sql_value) > connection->server->processor->context->max_sql_len) {
@@ -769,13 +1119,11 @@ static void process_json_line(TCPConnection *connection,
                                         request_id,
                                         CMD_STATUS_SQL_TOO_LONG,
                                         "sql too long");
-            cJSON_Delete(root);
             return;
         }
     }
 
     submit_parsed_request(connection, request_id, op, sql_value);
-    cJSON_Delete(root);
 }
 
 static void *connection_thread_main(void *arg) {

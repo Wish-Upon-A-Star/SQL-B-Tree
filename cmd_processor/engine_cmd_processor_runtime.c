@@ -49,10 +49,8 @@ static int execute_statement_or_respond(EngineCmdProcessorState *state,
                                         CmdRequest *request,
                                         ResponseSlot *response_slot,
                                         Statement *stmt,
-                                        int *matched_rows,
-                                        int *affected_rows,
-                                        long *generated_id) {
-    if (executor_execute_statement(stmt, matched_rows, affected_rows, generated_id)) return 1;
+                                        ExecutorResult *result) {
+    if (executor_execute_statement_with_result(stmt, result)) return 1;
 
     set_response_error(response_slot,
                        request->request_id,
@@ -62,25 +60,162 @@ static int execute_statement_or_respond(EngineCmdProcessorState *state,
     return 0;
 }
 
+typedef struct {
+    unsigned char *data;
+    size_t size;
+    size_t used;
+} BinaryBuffer;
+
+static int binary_buffer_append(BinaryBuffer *buffer, const void *data, size_t data_size) {
+    if (!buffer || !data) return 0;
+    if (buffer->used + data_size > buffer->size) return 0;
+    memcpy(buffer->data + buffer->used, data, data_size);
+    buffer->used += data_size;
+    return 1;
+}
+
+static int binary_buffer_append_u16(BinaryBuffer *buffer, uint16_t value) {
+    unsigned char bytes[2];
+    bytes[0] = (unsigned char)(value & 0xffu);
+    bytes[1] = (unsigned char)((value >> 8) & 0xffu);
+    return binary_buffer_append(buffer, bytes, sizeof(bytes));
+}
+
+static int binary_buffer_append_u32(BinaryBuffer *buffer, uint32_t value) {
+    unsigned char bytes[4];
+    bytes[0] = (unsigned char)(value & 0xffu);
+    bytes[1] = (unsigned char)((value >> 8) & 0xffu);
+    bytes[2] = (unsigned char)((value >> 16) & 0xffu);
+    bytes[3] = (unsigned char)((value >> 24) & 0xffu);
+    return binary_buffer_append(buffer, bytes, sizeof(bytes));
+}
+
+static int binary_buffer_append_text(BinaryBuffer *buffer, const char *text, size_t text_len) {
+    if (!binary_buffer_append_u32(buffer, (uint32_t)text_len)) return 0;
+    if (text_len == 0) return 1;
+    return binary_buffer_append(buffer, text, text_len);
+}
+
+static size_t estimate_select_binary_size(const ExecutorResult *result) {
+    size_t total = 16;
+    int row_index;
+    int col_index;
+
+    if (!result) return 0;
+    for (col_index = 0; col_index < result->select_column_count; col_index++) {
+        total += 2 + strlen(result->select_columns[col_index]);
+    }
+    for (row_index = 0; row_index < result->select_row_count; row_index++) {
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+
+        parse_csv_row(result->select_rows[row_index], fields, row_buf);
+        for (col_index = 0; col_index < result->select_column_count; col_index++) {
+            const char *field = fields[result->select_column_indices[col_index]];
+            total += 4 + strlen(field ? field : "");
+        }
+    }
+    return total;
+}
+
+static int build_select_result_binary(const ExecutorResult *result,
+                                      unsigned char *buffer,
+                                      size_t buffer_size,
+                                      size_t *out_size) {
+    BinaryBuffer writer;
+    int row_index;
+    int col_index;
+
+    if (out_size) *out_size = 0;
+    if (!result || !buffer || buffer_size == 0 || !out_size) return 0;
+
+    writer.data = buffer;
+    writer.size = buffer_size;
+    writer.used = 0;
+
+    if (!binary_buffer_append_u32(&writer, 0x31524442u) ||
+        !binary_buffer_append_u16(&writer, 1u) ||
+        !binary_buffer_append_u16(&writer, 0u) ||
+        !binary_buffer_append_u32(&writer, (uint32_t)result->select_row_count) ||
+        !binary_buffer_append_u16(&writer, (uint16_t)result->select_column_count) ||
+        !binary_buffer_append_u16(&writer, 0u)) {
+        return 0;
+    }
+
+    for (col_index = 0; col_index < result->select_column_count; col_index++) {
+        size_t name_len = strlen(result->select_columns[col_index]);
+        if (name_len > 0xffffu) return 0;
+        if (!binary_buffer_append_u16(&writer, (uint16_t)name_len) ||
+            (name_len > 0 && !binary_buffer_append(&writer, result->select_columns[col_index], name_len))) {
+            return 0;
+        }
+    }
+
+    for (row_index = 0; row_index < result->select_row_count; row_index++) {
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+
+        parse_csv_row(result->select_rows[row_index], fields, row_buf);
+        for (col_index = 0; col_index < result->select_column_count; col_index++) {
+            const char *field = fields[result->select_column_indices[col_index]];
+            size_t field_len = strlen(field ? field : "");
+            if (!binary_buffer_append_text(&writer, field ? field : "", field_len)) return 0;
+        }
+    }
+
+    *out_size = writer.used;
+    return 1;
+}
+
 static void set_statement_success_response(EngineCmdProcessorState *state,
                                            CmdRequest *request,
                                            ResponseSlot *response_slot,
                                            const Statement *stmt,
-                                           int matched_rows,
-                                           int affected_rows,
-                                           long generated_id) {
+                                           const ExecutorResult *result) {
     char body[256];
+    size_t binary_size = 0;
+    size_t required_size;
+
+    if (!stmt || !result) return;
 
     if (stmt->type == STMT_SELECT) {
-        snprintf(body, sizeof(body), "SELECT matched_rows=%d", matched_rows);
+        required_size = estimate_select_binary_size(result);
+        if (required_size == 0 || required_size > state->response_body_capacity) {
+            set_response_error(response_slot,
+                               request->request_id,
+                               CMD_STATUS_PROCESSING_ERROR,
+                               "response too large",
+                               state->response_body_capacity);
+            return;
+        }
+        if (!build_select_result_binary(result,
+                                        (unsigned char *)response_slot->message_buffer,
+                                        state->response_body_capacity,
+                                        &binary_size)) {
+            set_response_error(response_slot,
+                               request->request_id,
+                               CMD_STATUS_INTERNAL_ERROR,
+                               "response serialization failed",
+                               state->response_body_capacity);
+            return;
+        }
+        set_response_body(response_slot,
+                          request->request_id,
+                          CMD_BODY_BINARY,
+                          response_slot->message_buffer,
+                          binary_size,
+                          state->response_body_capacity);
+        response_slot->response.row_count = result->matched_rows;
+        response_slot->response.affected_count = result->affected_rows;
+        return;
     } else if (stmt->type == STMT_INSERT) {
-        snprintf(body, sizeof(body), "INSERT affected_rows=%d id=%ld", affected_rows, generated_id);
+        snprintf(body, sizeof(body), "INSERT affected_rows=%d id=%ld", result->affected_rows, result->generated_id);
     } else {
         snprintf(body,
                  sizeof(body),
                  "%s affected_rows=%d",
                  stmt->type == STMT_UPDATE ? "UPDATE" : "DELETE",
-                 affected_rows);
+                 result->affected_rows);
     }
 
     set_response_body(response_slot,
@@ -89,8 +224,8 @@ static void set_statement_success_response(EngineCmdProcessorState *state,
                       body,
                       strlen(body),
                       state->response_body_capacity);
-    response_slot->response.row_count = matched_rows;
-    response_slot->response.affected_count = affected_rows;
+    response_slot->response.row_count = result->matched_rows;
+    response_slot->response.affected_count = result->affected_rows;
 }
 
 static void record_completed_job_metrics(EngineCmdProcessorState *state, CmdJob *job) {
@@ -263,7 +398,7 @@ void set_response_body(ResponseSlot *slot, const char *request_id, CmdBodyFormat
                               const char *body, size_t body_len, size_t body_capacity) {
     init_response_common(slot, request_id, CMD_STATUS_OK, 1);
     if (body && body_len <= body_capacity) {
-        memcpy(slot->message_buffer, body, body_len);
+        memmove(slot->message_buffer, body, body_len);
         slot->message_buffer[body_len] = '\0';
         slot->response.body = slot->message_buffer;
         slot->response.body_len = body_len;
@@ -273,9 +408,7 @@ void set_response_body(ResponseSlot *slot, const char *request_id, CmdBodyFormat
 
 int engine_execute_sql(EngineCmdProcessorState *state, CmdRequest *request, ResponseSlot *response_slot) {
     Statement stmt;
-    int matched_rows = 0;
-    int affected_rows = 0;
-    long generated_id = 0;
+    ExecutorResult result;
 
     if (request->type == CMD_REQUEST_PING) {
         set_response_body(response_slot, request->request_id, CMD_BODY_TEXT, "pong", 4, state->response_body_capacity);
@@ -286,30 +419,25 @@ int engine_execute_sql(EngineCmdProcessorState *state, CmdRequest *request, Resp
         return 0;
     }
 
-    db_mutex_lock(&state->engine_mutex);
     if (!parse_statement_or_respond(state, request, response_slot, &stmt)) {
-        db_mutex_unlock(&state->engine_mutex);
         return 0;
     }
+    executor_result_init(&result);
     if (!execute_statement_or_respond(state,
                                       request,
                                       response_slot,
                                       &stmt,
-                                      &matched_rows,
-                                      &affected_rows,
-                                      &generated_id)) {
-        db_mutex_unlock(&state->engine_mutex);
+                                      &result)) {
+        executor_result_free(&result);
         return 0;
     }
-    db_mutex_unlock(&state->engine_mutex);
 
     set_statement_success_response(state,
                                    request,
                                    response_slot,
                                    &stmt,
-                                   matched_rows,
-                                   affected_rows,
-                                   generated_id);
+                                   &result);
+    executor_result_free(&result);
     return 1;
 }
 
@@ -334,8 +462,17 @@ int execute_planned_request(EngineCmdProcessorState *state,
     }
 
     exec_start_us = monotonic_us();
+    db_mutex_lock(&state->state_mutex);
+    state->current_concurrent_executions++;
+    if (state->current_concurrent_executions > state->max_concurrent_executions) {
+        state->max_concurrent_executions = state->current_concurrent_executions;
+    }
+    db_mutex_unlock(&state->state_mutex);
     engine_execute_sql(state, request, response_slot);
     stats->exec_us = monotonic_us() - exec_start_us;
+    db_mutex_lock(&state->state_mutex);
+    if (state->current_concurrent_executions > 0) state->current_concurrent_executions--;
+    db_mutex_unlock(&state->state_mutex);
     lock_manager_release(&state->lock_manager, lock_plan, handles);
     return 1;
 }

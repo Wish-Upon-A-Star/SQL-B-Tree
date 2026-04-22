@@ -24,9 +24,7 @@ static const char *skip_utf8_bom_and_space(const char *sql);
 static void dispatch_statement(const Statement *stmt);
 typedef enum {
     APP_MODE_EXEC_FILE,
-    APP_MODE_GENERATE_JUNGLE,
-    APP_MODE_BENCHMARK,
-    APP_MODE_BENCHMARK_JUNGLE
+    APP_MODE_GENERATE_JUNGLE
 } AppMode;
 
 typedef struct {
@@ -162,18 +160,6 @@ static int parse_app_config(int argc, char *argv[], AppConfig *config) {
         return 1;
     }
 
-    if (argi < argc && consume_flag(argv[argi], "--benchmark")) {
-        config->mode = APP_MODE_BENCHMARK;
-        config->count = parse_count_arg(argc, argv, argi + 1, 1000000);
-        return 1;
-    }
-
-    if (argi < argc && consume_flag(argv[argi], "--benchmark-jungle")) {
-        config->mode = APP_MODE_BENCHMARK_JUNGLE;
-        config->count = parse_count_arg(argc, argv, argi + 1, 1000000);
-        return 1;
-    }
-
     if (argi < argc) {
         strncpy(config->filename, argv[argi], sizeof(config->filename) - 1);
         config->filename[sizeof(config->filename) - 1] = '\0';
@@ -191,12 +177,6 @@ static int run_app(const AppConfig *config) {
     switch (config->mode) {
         case APP_MODE_GENERATE_JUNGLE:
             generate_jungle_dataset(config->count, config->dataset_output);
-            return 0;
-        case APP_MODE_BENCHMARK:
-            run_bplus_benchmark(config->count);
-            return 0;
-        case APP_MODE_BENCHMARK_JUNGLE:
-            run_jungle_benchmark(config->count);
             return 0;
         case APP_MODE_EXEC_FILE:
         default:
@@ -441,7 +421,7 @@ static int ensure_cmd_processor(void) {
 
     memset(&options, 0, sizeof(options));
     options.worker_count = 2;
-    options.shard_count = 1;
+    options.shard_count = 2;
     options.queue_capacity_per_shard = 64;
     options.planner_cache_capacity = 128;
 

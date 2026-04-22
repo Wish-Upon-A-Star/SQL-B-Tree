@@ -6,11 +6,14 @@ C 기반 미니 DB 프로젝트다. CSV 파일을 테이블처럼 사용하며 `
 ## 현재 코드 기준 핵심 요약
 
 - `PK(id)`와 `UK(email, phone)`는 B+ Tree 인덱스로 처리
+- `github` exact-match는 보조 인덱스 경로 지원
 - 인덱스가 없는 일반 컬럼은 선형 탐색 유지
 - 최대 2,000,000행까지 cache prefix를 메모리에 유지
 - 그 이후 row는 uncached tail로 남기고 필요할 때만 CSV 경로로 접근
 - `UPDATE` / `DELETE`는 delta log 기반 변경분 기록
 - 삭제 후에도 B+ Tree가 stale해지지 않도록 stable slot id 사용
+- `CmdProcessor` 기반 worker thread 실행 경로 지원
+- 엔진 `SELECT` 응답 body는 binary rowset 형식 지원
 - 정글 데이터셋 생성기, 벤치 도구, 점수 계산 도구까지 포함
 
 ## 파일 구조
@@ -21,8 +24,11 @@ C 기반 미니 DB 프로젝트다. CSV 파일을 테이블처럼 사용하며 `
 
 - [main.c](main.c)
   - CLI 옵션 파싱
-  - 실행 모드 분기
+  - SQL 실행과 데이터 생성 모드 분기
   - SQL 파일 실행 진입점
+- [stress_main.c](stress_main.c)
+  - 스트레스 테스트 전용 외부 진입점
+  - `--benchmark`, `--benchmark-jungle` 실행기
 - [bench_memtrack.h](bench_memtrack.h)
   - `BENCH_MEMTRACK` 빌드 시 메모리 추적 후킹
 - [sqlsprocessor_bundle.h](sqlsprocessor_bundle.h)
@@ -85,6 +91,14 @@ flowchart LR
 2. `parser`가 SQL을 `Statement`로 바꾸고
 3. `executor`가 실제 데이터/인덱스를 건드리는 방식이다.
 
+멀티스레드 API 서버 경로에서는 여기에 `cmd_processor/*` 계층이 앞단에 추가된다.
+
+- frontend가 `CmdRequest`를 생성
+- planner가 route/lock plan을 결정
+- shard queue에 적재
+- worker thread가 parse + executor 실행
+- `CmdResponse`를 frontend로 반환
+
 ## 빌드
 
 ### 기본 빌드
@@ -131,13 +145,13 @@ gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.e
 ### 기본 벤치
 
 ```powershell
-.\sqlsprocessor.exe --benchmark 1000000
+.\stress_runner.exe --benchmark 1000000
 ```
 
 ### SQL 경로 기반 정글 벤치
 
 ```powershell
-.\sqlsprocessor.exe --benchmark-jungle 1000000
+.\stress_runner.exe --benchmark-jungle 1000000
 ```
 
 ## 현재 인덱스 동작
@@ -182,6 +196,13 @@ gcc -O2 -fdiagnostics-color=always -g -DBENCH_MEMTRACK main.c -o sqlsprocessor.e
 
 - schema / rows / PK/UK index snapshot
 - reopen 시 빠른 복구에 사용
+
+### binary snapshot
+
+`<table>.idxb`
+
+- large table preload 속도를 줄이기 위한 binary snapshot
+- mixed TCP benchmark에서 startup 비용 절감에 사용
 
 ## 메모리 모델
 
@@ -251,6 +272,15 @@ make generate-jungle-sql
 - `generated_sql/jungle_delete_score.sql`
 - 기타 smoke / regression / correctness SQL
 
+## 현재 참고 문서
+
+- `docs/STRESS_TESTING_KO.md`
+  - 엔진/동시성/외부 TCP mixed CRUD 테스트 방법 정리
+- `docs/multithread-optimization-plan.md`
+  - DB + worker 최적화와 현재 병목 정리
+- `docs/DB_WORKER_CURRENT_STATE_KO.md`
+  - 팀 인수인계 기준 현재 상태 요약
+
 ## 점수/벤치 도구
 
 ### bench-score
@@ -260,7 +290,7 @@ make bench-score
 ```
 
 현재 Makefile은 `bench_score_exec.conf`를 사용해 실행 파일 스펙을 읽고,  
-`benchmark_runner`가 SQL 생성 -> correctness -> benchmark -> report 생성까지 담당한다.
+`benchmark_runner`가 SQL 생성 -> correctness -> `stress_runner` benchmark -> report 생성까지 담당한다.
 
 결과 산출물:
 
@@ -285,6 +315,8 @@ make bench-score
 make bench-report
 make bench-clean
 ```
+
+스트레스 테스트 운영 가이드는 [docs/STRESS_TESTING_KO.md](docs/STRESS_TESTING_KO.md) 에 정리했다.
 
 ## 발표 때 설명하기 좋은 포인트
 
