@@ -23,6 +23,89 @@ flowchart LR
 
 **핵심은 동시 요청을 두 단계로 나눠 처리한 것이다. API는 요청을 추적하고, DB는 공유 데이터의 일관성을 보장한다.**
 
+## 발표용 최소 시연
+
+발표 환경은 VS Code devcontainer/Linux 기준으로 고정한다. 준비 단계와 발표 실행 단계를 분리해서, 발표 중에는 빌드/fixture 생성/warmup 없이 준비된 workload만 실행한다.
+
+### 1. 발표 전 준비
+
+```sh
+make demo-score-prepare
+```
+
+기본값은 발표용으로 `1M rows / 200k mixed ops / 30초 제한`이다. 1M rows / 1M mixed ops는 Docker devcontainer에서 30초를 넘을 수 있으므로 발표용 기본값으로 쓰지 않는다.
+
+무거운 1M/1M 검증을 따로 하고 싶을 때만 아래처럼 변수만 붙인다.
+
+```sh
+make demo-score-prepare DEMO_SCORE_OPS=1000000 DEMO_SCORE_TIMEOUT=300
+```
+
+준비 단계는 devcontainer 안에서 아래 작업을 수행하고 `artifacts/demo-score-fixture/`에 결과를 남긴다.
+
+- `make -B build bench-tools`로 현재 소스를 강제 재빌드한다.
+- score fixture를 생성한다.
+- 초기 행은 SQL INSERT 재생 대신 CSV fixture copy + index warmup으로 준비한다.
+- 실행용 `sqlsprocessor`, `demo_worker_sweep`, `workload_score.sql`, CSV, `.idx` snapshot을 fixture에 고정한다.
+
+### 2. 발표 중 실행
+
+발표 중에는 아래 명령만 실행한다.
+
+```sh
+make demo-presentation-run
+```
+
+짧은 발표 멘트와 해석은 [docs/DEMO_PRESENTATION_RUN_KO.md](docs/DEMO_PRESENTATION_RUN_KO.md)에 정리했다.
+
+이 명령은 준비된 fixture를 임시 실행 디렉터리에 timestamp 보존 복사한 뒤 실행만 한다.
+
+- `demo-score-run`: score workload timed run
+- `demo-worker-sweep-run`: worker count 8/16/32 SELECT 처리량 비교
+- 결과: `artifacts/demo-score/report.svg`, `artifacts/demo-worker-sweep/report.svg`
+
+score만 보여주려면:
+
+```sh
+make demo-score-run
+```
+
+worker 8/16/32만 보여주려면:
+
+```sh
+make demo-worker-sweep-run
+```
+
+기존처럼 pull 직후 `./sqlsprocessor generated_sql/workload_score.sql > /dev/null`를 바로 실행하지 않는다. `sqlsprocessor`, workload, CSV, `.idx` snapshot을 같은 fixture에서 맞춰야 한다.
+
+초기 적재 자체를 INSERT 경로로 검증하고 싶을 때만 아래처럼 느린 모드를 켠다.
+
+```sh
+make demo-score-prepare DEMO_SCORE_PRELOAD_MODE=insert
+```
+
+### 3. DB worker 이전 경계 속도
+
+필요하면 네이티브 Linux에서 worker 경계와 회귀 테스트도 같이 보여준다.
+
+```sh
+make pre-worker-bench
+make test-engine-cmd-processor
+```
+
+- `pre-worker-bench`는 `CmdProcessor acquire/set/submit/release`만 측정한다.
+- hot shard read에서도 여러 worker가 실제로 일하도록 바뀐 상태를 보여준다.
+- same-table read/read 병렬성과 duplicate/read-write correctness 회귀를 함께 확인할 수 있다.
+
+### 4. 외부 TCP는 보조 시연
+
+외부 TCP 시연이 필요하면 아래 문서와 스크립트를 사용한다.
+
+- [docs/K6_TCP_BINARY_BENCH_KO.md](docs/K6_TCP_BINARY_BENCH_KO.md)
+- [scripts/run_k6_tcp_binary_bench.ps1](scripts/run_k6_tcp_binary_bench.ps1)
+
+발표에서는 DB/worker가 주역이면, 외부 TCP는 "별도 벤치 경로 준비됨" 정도로만 짚는 편이 깔끔하다.
+
 ## 2. API
 
 TCP 서버는 SQL을 직접 실행하지 않는다. 외부 요청을 수신해 DB 처리 계층으로 넘기는 경계 역할을 한다.
@@ -62,6 +145,8 @@ API가 요청을 동시에 받아들이면, DB 계층은 공유 데이터에 대
 
 API 동시성과 공존한다. queue, worker, lock plan, engine_mutex를 거쳐 SQL이 실행되는 흐름이다.
 
+![Worker count별 DB 처리량](docs/sijun-yang/diagrams/bench_worker_scale_results.svg)
+
 - API에서 넘어온 SQL은 바로 실행되지 않고, EngineCmdProcessor에서 실행 계획을 먼저 수립한다.
 - 실행 계획은 두 가지를 결정한다. SELECT는 READ, INSERT/UPDATE/DELETE는 WRITE로 분류하고, table 기준으로 어느 worker queue에 넣을지 고른다.
 - 동시에 table 단위 lock plan을 만든다. 읽기끼리는 병렬로 허용하고, 쓰기는 충돌 가능한 요청을 직렬화한다.
@@ -70,13 +155,30 @@ API 동시성과 공존한다. queue, worker, lock plan, engine_mutex를 거쳐 
 
 **API는 병렬로 요청을 접수하고, DB는 lock plan과 engine_mutex를 통해 안전한 요청만 내부 엔진으로 들여보낸다.**
 
-
-![Worker count별 DB 처리량](docs/sijun-yang/diagrams/bench_worker_scale_results.svg)
-
 ### 벤치마크
 
 - worker 수를 1개에서 16개로 늘렸을 때 PK SELECT 처리량이 약 21.3k rps에서 369.9k rps로 증가했다.
 - worker 24개 이후에는 처리량이 떨어지므로, 최적점 이후에는 worker 수보다 lock 경합과 engine_mutex 진입 비용이 더 큰 병목이 된다.
+
+## 시연 안내
+
+아래 명령을 실행한다.
+
+```sh
+make demo-presentation-run
+```
+
+이 명령은 두 가지를 한 번에 보여준다.
+
+- Score workload: 100만 행 테이블 위에서 20만 개의 혼합 SQL을 실행한다.
+- Worker 비교: 같은 100만 행 테이블에서 worker 수를 8, 16, 32로 바꿔 PK SELECT 처리량을 비교한다.
+
+CLI에서 확인할 핵심 숫자는 아래다.
+
+- Score 쪽: 실행 SQL 수, 실행 시간, 처리량, 30초 시간 예산
+- Worker 쪽: 8/16/32 workers별 K req/sec, 최고 처리량 worker 수
+
+상세 설명과 발표용 해석은 [docs/DEMO_PRESENTATION_RUN_KO.md](docs/DEMO_PRESENTATION_RUN_KO.md)에 정리되어 있다.
 
 ## 파일 구조
 
@@ -93,4 +195,5 @@ API 동시성과 공존한다. queue, worker, lock plan, engine_mutex를 거쳐 
 | `bench_workload_generator.c` | 벤치 SQL workload 생성 |
 | `tests/api_story_test.c` | 발표용 TCP API story test runner |
 | `docs/sijun-yang/004_cmd_processor_architecture_flow.md` | CmdProcessor/TCP 상세 발표 문서 |
+
 
