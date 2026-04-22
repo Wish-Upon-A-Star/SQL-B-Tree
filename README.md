@@ -63,7 +63,6 @@ API가 요청을 동시에 받아들이면, DB 계층은 공유 데이터에 대
 
 API 동시성과 공존한다. queue, worker, lock plan, engine_mutex를 거쳐 SQL이 실행되는 흐름이다.
 
-![Worker count별 DB 처리량](docs/sijun-yang/diagrams/bench_worker_scale_results.svg)
 
 - API에서 넘어온 SQL은 바로 실행되지 않고, EngineCmdProcessor에서 실행 계획을 먼저 수립한다.
 - 실행 계획은 두 가지를 결정한다. SELECT는 READ, INSERT/UPDATE/DELETE는 WRITE로 분류하고, table 기준으로 어느 worker queue에 넣을지 고른다.
@@ -72,6 +71,8 @@ API 동시성과 공존한다. queue, worker, lock plan, engine_mutex를 거쳐 
 - 현재 구현은 parser/executor/TableCache의 전역 상태를 고려해 실행 구간을 engine_mutex로 한 번 더 감싼다.
 
 **API는 병렬로 요청을 접수하고, DB는 lock plan과 engine_mutex를 통해 안전한 요청만 내부 엔진으로 들여보낸다.**
+
+![Worker count별 DB 처리량](docs/sijun-yang/diagrams/bench_worker_scale_results.svg)
 
 ### 벤치마크
 
@@ -96,7 +97,6 @@ CLI에서 확인할 핵심 숫자는 아래다.
 - Score 쪽: 실행 SQL 수, 실행 시간, 처리량, 30초 시간 예산
 - Worker 쪽: 8/16/32 workers별 K req/sec, 최고 처리량 worker 수
 
-상세 설명과 발표용 해석은 [docs/DEMO_PRESENTATION_RUN_KO.md](docs/DEMO_PRESENTATION_RUN_KO.md)에 정리되어 있다.
 
 ## 파일 구조
 
