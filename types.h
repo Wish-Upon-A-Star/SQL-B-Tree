@@ -3,6 +3,8 @@
 
 #include <stdio.h>
 
+#include "platform_threads.h"
+
 #define MAX_RECORDS 2000000
 #define INITIAL_RECORD_CAPACITY 1024
 #define ROW_CACHE_LIMIT 65536
@@ -10,7 +12,7 @@
 #define PAGE_CACHE_LIMIT 64
 #define RECORD_SIZE 1024
 #define MAX_COLS 15
-#define MAX_TABLES 1
+#define MAX_TABLES 8
 #define MAX_UKS 5
 #define MAX_WHERE_CONDITIONS 8
 #define MAX_SQL_LEN 4096
@@ -98,6 +100,8 @@ typedef struct {
     char table_name[256];         /* users 형태 이름 */
     FILE *file;                   /* 현재 열려 있는 CSV 파일 포인터 */
     FILE *delta_file;             /* append-only delta log writer */
+    db_mutex_t io_mutex;          /* shared FILE/page-cache access guard */
+    int io_mutex_ready;           /* io_mutex initialized 여부 */
     int delta_batch_open;          /* 현재 delta batch가 B만 쓰고 E 대기 중인지 */
     int delta_ops_since_compact_check; /* delta compaction 크기 확인 주기 */
     long delta_bytes_since_compact; /* 마지막 compaction 이후 delta append 추정 byte 수 */
@@ -107,6 +111,9 @@ typedef struct {
     int uk_indices[MAX_UKS];      /* UK 컬럼 인덱스 목록 */
     int uk_count;                 /* UK 컬럼 개수 */
     UniqueIndex *uk_indexes[MAX_UKS]; /* UK 컬럼별 B+ Tree 인덱스 */
+    int github_idx;               /* github exact-match 보조 인덱스 대상 컬럼, 없으면 -1 */
+    UniqueIndex *github_index;    /* github exact-match 보조 인덱스 */
+    int github_index_state;       /* 0=미구축, 1=사용 가능, -1=중복 등으로 비활성 */
     BPlusTree *id_index;           /* ID/PK 기반 B+ Tree 인덱스 */
     char **records;                /* slot_id별 lazy row cache */
     long *row_ids;                  /* PK가 없는 테이블에서도 쓰는 내부 row id */

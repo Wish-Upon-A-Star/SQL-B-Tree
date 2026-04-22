@@ -32,7 +32,8 @@ typedef enum {
 typedef enum {
     CMD_BODY_NONE,
     CMD_BODY_TEXT,
-    CMD_BODY_JSON
+    CMD_BODY_JSON,
+    CMD_BODY_BINARY
 } CmdBodyFormat;
 
 typedef struct {

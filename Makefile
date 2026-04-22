@@ -1,20 +1,30 @@
 CC ?= gcc
 CFLAGS ?= -O2 -fdiagnostics-color=always -g
 TARGET ?= sqlsprocessor
+TCP_SERVER_TARGET ?= tcp_sql_server
+STRESS_TARGET ?= stress_runner
 BENCH_GEN ?= bench_workload_generator
 BENCH_RUNNER ?= benchmark_runner
 BENCH_TEST ?= bench_formula_test
 CMD_PROCESSOR_TEST ?= cmd_processor_test
+ENGINE_CMD_PROCESSOR_TEST ?= engine_cmd_processor_test
 TCP_CMD_PROCESSOR_TEST ?= tcp_cmd_processor_test
 REPL_CMD_PROCESSOR_TEST ?= repl_cmd_processor_test
 CMD_PROCESSOR_SCALE_SCORE_TEST ?= cmd_processor_engine_scale_score_test
 CMD_PROCESSOR_DIR = cmd_processor
 CJSON_DIR = thirdparty/cjson
 SRC = main.c
+TCP_SERVER_SRC = tcp_server_main.c
+STRESS_SRC = stress_main.c
 SRC_DEPS = main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c bench_memtrack.h jungle_benchmark.h lexer.h parser.h bptree.h executor.h types.h sqlsprocessor_bundle.h platform_threads.h $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/cmd_processor_sync_bridge.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_internal.h $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/cmd_processor_sync_bridge.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_support.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_planner.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_runtime.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor.c
+TCP_SERVER_DEPS = tcp_server_main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c bench_memtrack.h jungle_benchmark.h lexer.h parser.h bptree.h executor.h types.h platform_threads.h $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/cmd_processor_sync_bridge.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_internal.h $(CMD_PROCESSOR_DIR)/tcp_cmd_processor.h $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/cmd_processor_sync_bridge.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_support.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_planner.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_runtime.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor.c $(CMD_PROCESSOR_DIR)/tcp_cmd_processor.c $(CJSON_DIR)/cJSON.c $(CJSON_DIR)/cJSON.h
+STRESS_DEPS = stress_main.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c bench_memtrack.h jungle_benchmark.h lexer.h parser.h bptree.h executor.h types.h platform_threads.h
 CMD_PROCESSOR_TEST_SRC = $(CMD_PROCESSOR_DIR)/cmd_processor_test.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/mock_cmd_processor.c
 CMD_PROCESSOR_TEST_DEPS = $(CMD_PROCESSOR_TEST_SRC) $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/mock_cmd_processor.h
 CMD_PROCESSOR_TEST_RUN = $(if $(filter /%,$(CMD_PROCESSOR_TEST)),$(CMD_PROCESSOR_TEST),./$(CMD_PROCESSOR_TEST))
+ENGINE_CMD_PROCESSOR_TEST_SRC = $(CMD_PROCESSOR_DIR)/engine_cmd_processor_test.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_bundle.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c
+ENGINE_CMD_PROCESSOR_TEST_DEPS = $(ENGINE_CMD_PROCESSOR_TEST_SRC) $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_internal.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_support.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_planner.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_runtime.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_test_support.h executor.h parser.h types.h platform_threads.h
+ENGINE_CMD_PROCESSOR_TEST_RUN = $(if $(filter /%,$(ENGINE_CMD_PROCESSOR_TEST)),$(ENGINE_CMD_PROCESSOR_TEST),./$(ENGINE_CMD_PROCESSOR_TEST))
 TCP_CMD_PROCESSOR_TEST_SRC = $(CMD_PROCESSOR_DIR)/tcp_cmd_processor_test.c $(CMD_PROCESSOR_DIR)/tcp_cmd_processor.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/mock_cmd_processor.c $(CJSON_DIR)/cJSON.c
 TCP_CMD_PROCESSOR_TEST_DEPS = $(TCP_CMD_PROCESSOR_TEST_SRC) $(CMD_PROCESSOR_DIR)/tcp_cmd_processor.h $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/mock_cmd_processor.h $(CJSON_DIR)/cJSON.h
 TCP_CMD_PROCESSOR_TEST_CFLAGS = -DTCP_MAX_CONNECTIONS_TOTAL=4 -DTCP_MAX_CONNECTIONS_PER_CLIENT=2 -DTCP_MAX_INFLIGHT_PER_CONNECTION=2 -DTCP_MAX_INFLIGHT_PER_CLIENT=3
@@ -34,7 +44,7 @@ BENCH_SCORE_DELETE_ROWS ?= 1000000
 BENCH_SCORE_IN_TMP ?= 1
 BENCH_EXEC_SPEC ?= bench_score_exec.conf
 
-.PHONY: all build bench-tools bench-test test-cmd-processor test-tcp-cmd-processor test-repl-cmd-processor test-cmd-processor-scale-score run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
+.PHONY: all build tcp-server stress-tools bench-tools bench-test test-cmd-processor test-engine-cmd-processor test-tcp-cmd-processor test-repl-cmd-processor test-cmd-processor-scale-score docker-build docker-test docker-test-scale run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 
 all: build
 
@@ -43,7 +53,17 @@ build: $(TARGET)
 $(TARGET): $(SRC_DEPS)
 	$(CC) $(CFLAGS) $(SRC) -o $(TARGET)
 
-bench-tools: $(BENCH_GEN) $(BENCH_RUNNER)
+tcp-server: $(TCP_SERVER_TARGET)
+
+$(TCP_SERVER_TARGET): $(TCP_SERVER_DEPS)
+	$(CC) $(CFLAGS) -I$(CMD_PROCESSOR_DIR) -I$(CJSON_DIR) $(TCP_SERVER_SRC) lexer.c parser.c bptree.c jungle_benchmark.c executor.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/cmd_processor_sync_bridge.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_bundle.c $(CMD_PROCESSOR_DIR)/tcp_cmd_processor.c $(CJSON_DIR)/cJSON.c -o $(TCP_SERVER_TARGET) -pthread
+
+stress-tools: $(STRESS_TARGET)
+
+$(STRESS_TARGET): $(STRESS_DEPS)
+	$(CC) $(CFLAGS) $(STRESS_SRC) lexer.c parser.c bptree.c jungle_benchmark.c executor.c -o $(STRESS_TARGET)
+
+bench-tools: $(BENCH_GEN) $(BENCH_RUNNER) $(STRESS_TARGET)
 
 $(BENCH_GEN): bench_workload_generator.c
 	$(CC) $(CFLAGS) bench_workload_generator.c -o $(BENCH_GEN)
@@ -63,6 +83,12 @@ $(CMD_PROCESSOR_TEST): $(CMD_PROCESSOR_TEST_DEPS)
 test-cmd-processor: $(CMD_PROCESSOR_TEST)
 	$(CMD_PROCESSOR_TEST_RUN)
 
+$(ENGINE_CMD_PROCESSOR_TEST): $(ENGINE_CMD_PROCESSOR_TEST_DEPS)
+	$(CC) $(CFLAGS) -I$(CMD_PROCESSOR_DIR) $(ENGINE_CMD_PROCESSOR_TEST_SRC) -o $(ENGINE_CMD_PROCESSOR_TEST) -pthread
+
+test-engine-cmd-processor: $(ENGINE_CMD_PROCESSOR_TEST)
+	$(ENGINE_CMD_PROCESSOR_TEST_RUN)
+
 $(TCP_CMD_PROCESSOR_TEST): $(TCP_CMD_PROCESSOR_TEST_DEPS)
 	$(CC) $(CFLAGS) $(TCP_CMD_PROCESSOR_TEST_CFLAGS) -I$(CMD_PROCESSOR_DIR) -I$(CJSON_DIR) $(TCP_CMD_PROCESSOR_TEST_SRC) -o $(TCP_CMD_PROCESSOR_TEST) -pthread
 
@@ -80,6 +106,15 @@ $(CMD_PROCESSOR_SCALE_SCORE_TEST): $(CMD_PROCESSOR_SCALE_SCORE_TEST_DEPS)
 
 test-cmd-processor-scale-score: $(CMD_PROCESSOR_SCALE_SCORE_TEST)
 	$(CMD_PROCESSOR_SCALE_SCORE_TEST_RUN)
+
+docker-build:
+	docker compose build sqlprocessor
+
+docker-test:
+	docker compose run --rm test
+
+docker-test-scale:
+	docker compose run --rm test-scale
 
 $(JUNGLE_DATASET): $(TARGET)
 	./$(TARGET) --generate-jungle $(JUNGLE_RECORDS) $(JUNGLE_DATASET)
@@ -107,11 +142,11 @@ generate-jungle: $(JUNGLE_DATASET)
 generate-jungle-sql: $(JUNGLE_DATASET)
 	$(PYTHON) scripts/generate_jungle_sql_workloads.py
 
-benchmark: $(TARGET)
-	./$(TARGET) --benchmark 1000000
+benchmark: $(STRESS_TARGET)
+	./$(STRESS_TARGET) --benchmark 1000000
 
-benchmark-jungle: $(TARGET)
-	./$(TARGET) --benchmark-jungle 1000000
+benchmark-jungle: $(STRESS_TARGET)
+	./$(STRESS_TARGET) --benchmark-jungle 1000000
 
 bench-smoke: build bench-tools
 	./$(BENCH_RUNNER) --exec-spec $(BENCH_EXEC_SPEC) --profile smoke --seed 20260415 --repeat 3 --memtrack
@@ -139,4 +174,4 @@ bench-clean:
 	rm -f generated_sql/oracle_smoke.json generated_sql/oracle_regression.json generated_sql/oracle_score.json
 
 clean:
-	rm -f $(TARGET) $(BENCH_GEN) $(BENCH_RUNNER) $(BENCH_TEST) $(CMD_PROCESSOR_TEST) $(TCP_CMD_PROCESSOR_TEST) $(REPL_CMD_PROCESSOR_TEST) $(CMD_PROCESSOR_SCALE_SCORE_TEST)
+	rm -f $(TARGET) $(TCP_SERVER_TARGET) $(STRESS_TARGET) $(BENCH_GEN) $(BENCH_RUNNER) $(BENCH_TEST) $(CMD_PROCESSOR_TEST) $(ENGINE_CMD_PROCESSOR_TEST) $(TCP_CMD_PROCESSOR_TEST) $(REPL_CMD_PROCESSOR_TEST) $(CMD_PROCESSOR_SCALE_SCORE_TEST)

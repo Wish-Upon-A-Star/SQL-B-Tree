@@ -134,6 +134,7 @@ static int build_sql_plan(const char *sql, int shard_count, RoutePlan *route_pla
     const char *cursor;
     char table[256];
     const char *trimmed = skip_spaces(sql);
+    unsigned long shard_hash;
     memset(route_plan, 0, sizeof(*route_plan));
     memset(lock_plan, 0, sizeof(*lock_plan));
 
@@ -173,7 +174,8 @@ static int build_sql_plan(const char *sql, int shard_count, RoutePlan *route_pla
     route_plan->target_table_count = 1;
     copy_fixed(route_plan->target_tables[0], sizeof(route_plan->target_tables[0]), table);
     route_plan->route_key = (uint32_t)hash_text(table);
-    route_plan->target_shard = shard_count > 0 ? (int)(route_plan->route_key % (unsigned long)shard_count) : 0;
+    shard_hash = route_plan->request_class == ENGINE_REQUEST_CLASS_READ ? hash_text(sql) : hash_text(table);
+    route_plan->target_shard = shard_count > 0 ? (int)(shard_hash % (unsigned long)shard_count) : 0;
     lock_plan->lock_count = 1;
     copy_fixed(lock_plan->targets[0].name, sizeof(lock_plan->targets[0].name), table);
     return 1;
@@ -190,7 +192,12 @@ int build_request_plan(EngineCmdProcessorState *state, CmdRequest *request, Rout
         return 1;
     }
     if (request->type != CMD_REQUEST_SQL || !request->sql) return 0;
-    if (planner_cache_lookup(&state->planner_cache, request->sql, route_plan, lock_plan)) return 1;
+    if (planner_cache_lookup(&state->planner_cache, request->sql, route_plan, lock_plan)) {
+        if (route_plan->request_class == ENGINE_REQUEST_CLASS_READ && state->options.shard_count > 0) {
+            route_plan->target_shard = (int)(hash_text(request->sql) % (unsigned long)state->options.shard_count);
+        }
+        return 1;
+    }
     if (!build_sql_plan(request->sql, state->options.shard_count, route_plan, lock_plan)) return 0;
     planner_cache_store(&state->planner_cache, request->sql, route_plan, lock_plan);
     return 1;
