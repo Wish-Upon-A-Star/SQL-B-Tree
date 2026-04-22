@@ -57,6 +57,12 @@ DOT 원본: [`004_cmd_processor_benefit_entrypoint_selection.dot`](./diagrams/00
 
 빌드 또는 실행 설정에서 하나의 진입점을 선택하더라도 요청 처리 코어는 `CmdProcessor` 계약을 바라본다. 그래서 선택된 버전이 파일 실행인지, REPL인지, TCP 입력인지에 따라 바뀌는 부분은 입력을 읽고 `CmdRequest`로 바꾸는 adapter 쪽에 모인다.
 
+![CmdProcessor와 DB 실행 경계](./diagrams/004_cmd_processor_benefit_db_boundary.svg)
+
+DOT 원본: [`004_cmd_processor_benefit_db_boundary.dot`](./diagrams/004_cmd_processor_benefit_db_boundary.dot)
+
+앞쪽 진입점이 `CmdRequest`로 수렴하는 것처럼, 뒤쪽 실행 흐름은 DB 실행 호출 경계로 수렴한다. `CmdProcessor` 구현체는 queue/worker/lock/engine guard를 조정하고, DB 실행 계층은 SQL 의미와 저장 구조를 책임진다.
+
 ![CmdProcessor로 유지되는 main/request core](./diagrams/004_cmd_processor_benefit_stable_main.svg)
 
 DOT 원본: [`004_cmd_processor_benefit_stable_main.dot`](./diagrams/004_cmd_processor_benefit_stable_main.dot)

@@ -1,0 +1,99 @@
+digraph CmdProcessorBenefitDbBoundary {
+    graph [
+        rankdir=LR,
+        compound=true,
+        nodesep=0.52,
+        ranksep=0.78,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_processor {
+        label="CmdProcessor 구현체: DB 실행을 준비";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        request [label="CmdRequest\nid / op / sql"];
+        plan [label="request plan\nREAD / WRITE / table"];
+        queue [label="queue / worker\n순서 + backpressure"];
+        lockplan [label="lock plan\nrwlock acquire"];
+        guard [label="engine_mutex\n전역 실행 보호"];
+    }
+
+    boundary [
+        label="DB 실행 호출 경계\nlocked SQL -> parse/execute",
+        fillcolor="#dbeafe",
+        color="#60a5fa"
+    ];
+
+    subgraph cluster_db {
+        label="DB 실행 계층: SQL 의미와 저장 구조";
+        style="rounded,filled";
+        color="#bbf7d0";
+        fillcolor="#f0fdf4";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        parser [label="lexer / parser\nSQL -> Statement"];
+        executor [label="executor.c\nCRUD + index path"];
+        tablecache [label="TableCache\nrow slots / tail overlay"];
+        bptree [label="B+ Tree\nkey -> slot id"];
+        storage [label="CSV / delta / idx\npersistent state"];
+    }
+
+    subgraph cluster_response {
+        label="CmdProcessor로 반환";
+        style="rounded,filled";
+        color="#d9f99d";
+        fillcolor="#f7fee7";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        result [label="DB result\nrows / affected / error"];
+        response [label="CmdResponse\nstatus / body / counts"];
+        callback [label="callback\nAPI / REPL로 반환"];
+    }
+
+    request -> plan;
+    plan -> queue;
+    queue -> lockplan;
+    lockplan -> guard;
+    guard -> boundary [label="보호된 실행"];
+
+    boundary -> parser;
+    parser -> executor;
+    executor -> tablecache;
+    tablecache -> bptree [label="lookup / range"];
+    tablecache -> storage [label="read / append / replay"];
+    bptree -> tablecache [style=dashed, label="slot id", constraint=false];
+    storage -> tablecache [style=dashed, label="row / delta", constraint=false];
+
+    executor -> result [label="실행 결과"];
+    result -> response;
+    response -> callback;
+}
