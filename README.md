@@ -1,62 +1,122 @@
-# SQL-B-Tree
+# 수요 코딩회 미니 DBMS API 서버
 
-C로 구현한 미니 SQL 처리기다. CSV 파일을 테이블처럼 사용하고, `INSERT`, `SELECT`, `UPDATE`, `DELETE`를 실행한다.
+이번 주 과제인 **미니 DBMS - API 서버** 구현 결과물이다. C로 TCP API 서버를 만들고, 외부 클라이언트가 JSONL 요청으로 SQL을 보내면 내부 SQL 처리기와 B+ Tree 인덱스를 통해 DBMS 기능을 사용할 수 있게 했다.
 
-이 프로젝트의 핵심은 단순 CSV 스캔 처리기를 `B+ Tree 인덱스`, `append-only delta log`, `CmdProcessor 기반 요청 처리`, `TCP JSONL API`, `벤치/시연 도구`까지 갖춘 작은 DBMS 흐름으로 확장한 것이다.
-
-이 README는 발표 흐름대로 읽히도록 구성했다. 하지만 빌드, 실행, 테스트 방법도 바로 찾을 수 있게 README 형식은 유지한다.
-
-## 1. 프로젝트가 푸는 문제
-
-처음 문제는 단순하다.
+핵심은 세 가지다.
 
 ```text
-대용량 CSV에서 특정 row를 찾을 때 매번 처음부터 끝까지 스캔하면 느리다.
+외부 API 서버
+    -> 스레드풀 기반 요청 처리
+    -> 기존 SQL 처리기 + B+ Tree 인덱스 재사용
 ```
 
-그래서 현재 코드는 아래 방향으로 발전했다.
+README는 목요일 발표에서 위에서 아래로 읽을 수 있도록 구성했다. 발표자료는 따로 만들지 않고, 이 문서를 기준으로 데모와 검증 과정을 설명한다.
 
-| 단계 | 해결한 문제 | 현재 구현 |
+## 1. 요구사항 대응
+
+이번 과제 요구사항을 코드 기준으로 매핑하면 다음과 같다.
+
+| 과제 요구사항 | 구현 위치 | 발표에서 보여줄 포인트 |
 | --- | --- | --- |
-| SQL subset | 입력을 SQL 문장으로 받는다 | `lexer.c`, `parser.c`, `Statement` |
-| 실행 엔진 | SQL을 실제 CSV 테이블 작업으로 바꾼다 | `executor.c`, `TableCache` |
-| 인덱스 | PK/UK exact lookup과 range lookup을 빠르게 한다 | `bptree.c` 숫자/문자열 B+ Tree |
-| 저장 복구 | 변경분과 재시작 비용을 관리한다 | `*.csv`, `*.delta`, `*.idx` |
-| 요청 처리 | CLI, REPL, TCP, 테스트가 같은 계약을 쓴다 | `CmdProcessor` |
-| API 서버 | 외부 클라이언트가 JSONL로 SQL을 보낸다 | `TCPCmdProcessor` |
-| 검증 | 기능, 동시성, 점수 측정을 반복한다 | `test.sh`, `benchmark_runner.c` |
+| C 언어로 미니 DBMS API 서버 구현 | `cmd_processor/tcp_cmd_processor.c`, `tests/api_story_test.c` | 실제 TCP 서버를 띄우고 외부 클라이언트가 socket으로 JSONL 요청을 보낸다 |
+| 외부 클라이언트에서 DBMS 기능 사용 | `TCPCmdProcessor`, `cJSON`, API story test client | `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `ping`, `close`를 JSON 요청으로 실행한다 |
+| 스레드풀로 SQL 요청 병렬 처리 | `EngineCmdProcessor`, `WorkQueue`, worker thread | 요청을 queue에 넣고 worker가 꺼내 처리하며, in-flight 요청을 id로 추적한다 |
+| 이전 SQL 처리기 재사용 | `lexer.c`, `parser.c`, `executor.c` | API 서버는 SQL을 직접 실행하지 않고 기존 SQL 엔진에 위임한다 |
+| B+ Tree 인덱스 재사용 | `bptree.c`, `executor.c` | `id(PK)`, `email(UK)`, `phone(UK)` 조회와 range scan에 B+ Tree를 쓴다 |
+| 단위 테스트와 기능 테스트 | `make test-*`, `./test.sh` | CmdProcessor 계약, REPL, TCP, scale score, API story를 분리 검증한다 |
+| 엣지 케이스 고려 | TCP bad request, SQL too long, duplicate id, in-flight limit | 잘못된 JSON, 누락 필드, 중복 request id, UK 중복을 실패 응답으로 확인한다 |
 
-한 줄로 말하면:
+발표의 중심은 DB 자료구조 자체가 아니라, **외부 API 서버와 내부 DB 엔진을 어떻게 연결했고, 그 사이의 동시성 문제를 어떻게 통제했는가**다.
 
-```text
-SQL 요청 -> 공통 요청 처리기 -> parser/executor -> TableCache -> B+ Tree/CSV/delta -> 응답
-```
-
-## 2. 전체 프로젝트 한 장 요약
+## 2. 발표 흐름 한 장 요약
 
 ```mermaid
 flowchart LR
-    A["CLI SQL file<br/>main.c"] --> D["CmdProcessor<br/>request / response"]
-    B["TCP JSONL API<br/>TCPCmdProcessor"] --> D
-    C["tests / benchmark<br/>test.sh / Makefile"] --> D
-    D --> E["EngineCmdProcessor<br/>queue + worker"]
-    D --> F["REPLCmdProcessor<br/>sync eval"]
-    E --> G["lexer.c / parser.c<br/>SQL -> Statement"]
-    F --> G
-    G --> H["executor.c<br/>CRUD execution"]
-    H --> I["TableCache<br/>slot / row cache / tail"]
-    I --> J["bptree.c<br/>PK / UK index"]
-    I --> K["CSV / delta / idx<br/>storage + recovery"]
-    H --> L["CLI text / JSON response"]
+    A["외부 클라이언트<br/>TCP socket"] --> B["TCPCmdProcessor<br/>JSONL API server"]
+    B --> C["CmdRequest<br/>공통 요청 객체"]
+    C --> D["EngineCmdProcessor<br/>queue + worker thread pool"]
+    D --> E["SQL 엔진<br/>lexer / parser / executor"]
+    E --> F["TableCache<br/>CSV + delta + idx"]
+    F --> G["B+ Tree<br/>PK / UK index"]
+    E --> H["CmdResponse<br/>row_count / affected_count"]
+    H --> B
+    B --> A
 ```
 
-이 그림에서 발표의 큰 줄기는 세 개다.
+이 흐름대로 발표한다.
 
-1. 사용자는 SQL 파일, TCP API, 테스트/벤치 도구 중 하나로 들어온다.
-2. 요청은 `CmdProcessor` 계약을 통과해 SQL 실행 계층으로 내려간다.
-3. 실행 계층은 `TableCache`를 중심으로 B+ Tree 인덱스와 CSV 저장소를 함께 유지한다.
+1. 외부 클라이언트가 TCP API 서버에 JSONL 요청을 보낸다.
+2. TCP 계층은 JSON을 검증하고 `CmdRequest`로 변환한다.
+3. `EngineCmdProcessor`가 요청을 queue에 넣고 worker thread가 SQL을 처리한다.
+4. SQL 엔진은 기존 `lexer/parser/executor`와 B+ Tree 인덱스를 그대로 사용한다.
+5. 응답은 같은 request id를 가진 JSON response로 돌아간다.
+6. `./test.sh`와 `./test.sh --stress`로 기능과 동시성을 데모한다.
 
-## 3. 요청 처리 계층: 왜 CmdProcessor가 있는가
+## 3. 중점 포인트 1: API 서버 아키텍처
+
+TCP 계층은 DB가 아니다. socket을 받고, newline으로 구분된 JSON 요청을 `CmdRequest`로 바꿔 뒤쪽 processor에 맡기는 API 어댑터다.
+
+![TCP 기반 전체 요청 흐름](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.svg)
+
+DOT 원본: [004_tcp_cmd_processor_architecture_flow.dot](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.dot)
+
+API 서버가 담당하는 일은 네 가지다.
+
+| 책임 | 설명 |
+| --- | --- |
+| connection 관리 | listen socket, client socket, connection list, client별 제한 |
+| request parsing | JSONL 한 줄을 읽고 `id`, `op`, `sql` 필드를 검증 |
+| in-flight 추적 | 아직 응답이 오지 않은 request id를 connection별로 관리 |
+| response 직렬화 | `CmdResponse`를 JSON 한 줄로 바꿔 같은 connection에 write |
+
+프로토콜은 JSONL이다.
+
+```json
+{"id":"s1","op":"sql","sql":"SELECT * FROM users WHERE id = 1;"}
+{"id":"p1","op":"ping"}
+{"id":"c1","op":"close"}
+```
+
+응답은 항상 request id를 포함한다.
+
+```json
+{"id":"p1","ok":true,"status":"OK","body":"pong"}
+{"id":"s1","ok":true,"status":"OK","row_count":1,"body":"SELECT matched_rows=1"}
+{"id":"bad","ok":false,"status":"BAD_REQUEST","error":"missing sql"}
+```
+
+## 4. 중점 포인트 2: 스레드풀과 동시성
+
+과제의 핵심 요구사항은 “요청이 들어올 때마다 스레드를 할당하여 SQL 요청을 병렬로 처리”하는 것이다. 이 프로젝트에서는 connection thread가 SQL을 직접 처리하지 않고, `EngineCmdProcessor`의 queue/worker 모델로 넘긴다.
+
+```text
+TCP connection thread
+    -> request 검증
+    -> in-flight 등록
+    -> Engine queue에 submit
+    -> worker thread가 SQL 실행
+    -> callback으로 TCP response write
+```
+
+같은 connection 안에서도 여러 요청이 in-flight 상태가 될 수 있다.
+
+![TCP 여러 in-flight 요청 흐름](docs/sijun-yang/diagrams/004_tcp_multi_request_inflight_flow.svg)
+
+DOT 원본: [004_tcp_multi_request_inflight_flow.dot](docs/sijun-yang/diagrams/004_tcp_multi_request_inflight_flow.dot)
+
+동시성에서 중요한 규칙은 아래와 같다.
+
+| 이슈 | 처리 방식 |
+| --- | --- |
+| 응답 순서 역전 | response의 `id`로 요청과 응답을 매칭한다 |
+| 중복 request id | 같은 connection의 in-flight 목록에 이미 있으면 `BAD_REQUEST` |
+| connection 과다 | 전체 connection 수와 client별 connection 수를 제한한다 |
+| in-flight 과다 | connection별/client별 in-flight 수를 제한하고 `BUSY` 응답 |
+| SQL 실행 충돌 | Engine layer에서 request plan과 lock plan으로 처리 순서를 제어한다 |
+
+따라서 발표에서는 “스레드를 만들었다”가 아니라, **요청 추적, 큐잉, worker 처리, callback 응답, 과부하 방어까지 포함한 동시성 구조**로 설명한다.
+
+## 5. 중점 포인트 3: API 서버와 내부 DB 엔진 연결
 
 `CmdProcessor`는 TCP, CLI, REPL, 테스트 코드가 SQL 실행 계층을 직접 붙잡지 않게 하는 공통 요청 처리 계약이다.
 
@@ -77,7 +137,7 @@ DOT 원본: [004_cmd_processor_overall_architecture.dot](docs/sijun-yang/diagram
 
 `submit`이 성공했다는 말은 SQL 성공이 아니라 “요청 제출 성공”이다. 실제 SQL 결과는 callback으로 돌아오는 `CmdResponse`에 담긴다. 이 구조 덕분에 같은 SQL 엔진을 CLI, TCP API, 테스트 러너가 같은 방식으로 사용할 수 있다.
 
-## 4. SQL 실행 흐름
+## 6. 내부 DB 엔진: 기존 SQL 처리기 재사용
 
 SQL 한 문장은 아래 순서로 처리된다.
 
@@ -102,7 +162,7 @@ SQL text
 
 `WHERE`는 `=`와 `BETWEEN`을 지원하고, `AND`로 여러 조건을 묶을 수 있다. 이때 executor는 여러 조건 중 인덱스로 쓸 수 있는 조건을 먼저 고른 뒤, 나머지 조건은 row 필터로 확인한다.
 
-## 5. 인덱스 전략
+## 7. B+ Tree 인덱스 전략
 
 현재 인덱스의 기준은 CSV 헤더에 들어 있는 제약 표기다.
 
@@ -126,7 +186,7 @@ name / status / 기타 일반 컬럼 -> 스캔 경로
 
 B+ Tree는 `key -> slot id`를 찾는다. 실제 row 문자열은 `TableCache`의 slot, CSV offset, 또는 tail overlay에서 읽는다. 즉 B+ Tree는 데이터를 통째로 들고 있는 저장소가 아니라 “row 위치를 빠르게 찾는 지도”다.
 
-## 6. 저장 구조: CSV를 DB처럼 다루기
+## 8. 저장 구조: CSV를 DB처럼 다루기
 
 저장소는 세 파일로 나뉜다.
 
@@ -159,7 +219,7 @@ TableCache
 
 그래서 전체 CSV를 무조건 row 문자열로 들고 있지 않는다. 대용량에서는 필요한 row만 materialize하고, tail은 CSV offset과 delta overlay로 보완한다.
 
-## 7. 쓰기 경로: append, delta, fallback
+## 9. 쓰기 경로: append, delta, fallback
 
 쓰기 계층의 목표는 “인덱스와 저장소가 서로 어긋나지 않게 하는 것”이다.
 
@@ -172,69 +232,27 @@ TableCache
 
 삭제 후에도 인덱스가 stale row를 가리키지 않도록 slot 활성 상태와 free slot 목록을 따로 관리한다. tail row의 `UPDATE` / `DELETE`는 CSV 원본을 바로 덮어쓰지 않고 delta overlay로 반영한다.
 
-## 8. TCP API 흐름
-
-TCP 계층은 DB가 아니다. socket을 받고, newline으로 구분된 JSON 요청을 `CmdRequest`로 바꿔 뒤쪽 processor에 맡기는 어댑터다.
-
-![TCP 기반 전체 요청 흐름](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.svg)
-
-DOT 원본: [004_tcp_cmd_processor_architecture_flow.dot](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.dot)
-
-프로토콜은 JSONL이다.
-
-요청 예:
-
-```json
-{"id":"s1","op":"sql","sql":"SELECT * FROM users WHERE id = 1;"}
-{"id":"p1","op":"ping"}
-{"id":"c1","op":"close"}
-```
-
-응답 예:
-
-```json
-{"id":"p1","ok":true,"status":"OK","body":"pong"}
-{"id":"s1","ok":true,"status":"OK","row_count":1,"body":"SELECT matched_rows=1"}
-{"id":"bad","ok":false,"status":"BAD_REQUEST","error":"missing sql"}
-```
-
-TCP 계층이 관리하는 것은 세 가지다.
-
-| 상태 | 의미 |
-| --- | --- |
-| `connections` | 현재 열린 TCP connection 목록 |
-| `client_counters` | client별 connection 수와 in-flight 수 |
-| `inflight_ids` | 아직 callback이 돌아오지 않은 request id 목록 |
-
-## 9. 여러 요청이 동시에 들어오면
-
-같은 connection 안에서도 여러 요청이 in-flight 상태가 될 수 있다.
-
-![TCP 여러 in-flight 요청 흐름](docs/sijun-yang/diagrams/004_tcp_multi_request_inflight_flow.svg)
-
-DOT 원본: [004_tcp_multi_request_inflight_flow.dot](docs/sijun-yang/diagrams/004_tcp_multi_request_inflight_flow.dot)
-
-중요한 점은 응답 순서다.
-
-```text
-r1을 먼저 보냈어도 r2가 먼저 끝나면 r2 응답이 먼저 올 수 있다.
-클라이언트는 반드시 response.id로 요청과 응답을 매칭해야 한다.
-```
-
-중복 in-flight id, connection별 in-flight 초과, client별 in-flight 초과는 TCP 계층에서 거절한다. 실제 SQL 실행 병렬성은 뒤쪽의 `EngineCmdProcessor` queue/worker 모델이 담당한다.
-
-## 10. 발표용 시연 포인트
+## 10. 데모와 검증 흐름
 
 발표에서 가장 자연스러운 흐름은 아래 순서다.
 
-1. CSV만 스캔하면 대용량에서 느리다는 문제를 제시한다.
-2. `id(PK)`, `email(UK)`, `phone(UK)`를 B+ Tree 인덱스로 바꾼다.
-3. `SELECT WHERE id = ?`와 `SELECT WHERE name = ?`를 비교해 index path와 scan path를 보여준다.
-4. `BETWEEN`으로 B+ Tree leaf range scan의 장점을 설명한다.
-5. `UPDATE` / `DELETE`가 delta log와 slot 상태를 통해 저장소와 인덱스를 같이 유지한다는 점을 설명한다.
-6. 같은 엔진이 TCP JSONL API 뒤에서도 동작한다는 것을 `CmdProcessor`로 연결한다.
-7. `test.sh`로 API 서버, 외부 클라이언트, 동시 요청, B+ Tree 제약 검증을 한 번에 보여준다.
-8. `make bench-score`로 성능/정확성 리포트까지 재현 가능하다는 점으로 마무리한다.
+1. `./test.sh`가 C 테스트 러너를 빌드하고 내부에서 TCP API 서버를 실제로 띄운다.
+2. 테스트 러너가 외부 클라이언트처럼 socket을 열고 JSONL 요청을 보낸다.
+3. `ping`으로 서버 생존을 확인한 뒤 `INSERT -> SELECT -> UPDATE -> DELETE`를 API 요청으로 검증한다.
+4. UK 중복, malformed JSON, SQL 누락 같은 실패 케이스가 `BAD_REQUEST` 또는 실패 응답으로 정리되는지 확인한다.
+5. 여러 클라이언트 thread가 동시에 요청을 보내고, request id별 응답 매칭과 in-flight 처리를 검증한다.
+6. `./test.sh --stress`로 키오스크 4대가 window=16 병렬 요청을 밀어 넣는 부하 장면을 보여준다.
+7. 마지막에 `make test-*`와 `make bench-score`로 단위 테스트, TCP 테스트, 성능/정확성 리포트를 재현할 수 있음을 보여준다.
+
+데모 메시지는 이렇게 잡는다.
+
+```text
+이 프로젝트는 SQL 처리기만 만든 것이 아니라,
+외부 클라이언트가 접속할 수 있는 C 기반 TCP API 서버,
+스레드풀 요청 처리,
+기존 SQL 엔진/B+ Tree 재사용,
+그리고 기능/동시성/엣지 케이스 테스트까지 묶어서 구현했다.
+```
 
 ## 11. 빌드와 실행
 
@@ -286,6 +304,18 @@ SQL 파일 실행:
 기본 정글 데이터셋 파일은 `jungle_benchmark_users.csv`다. 발표에서 쓰기 좋은 비교 컬럼은 `id(PK)`, `email(UK)`, `phone(UK)`, `name`이다. 앞의 세 컬럼은 인덱스 경로, `name`은 scan 경로를 보여준다.
 
 ## 12. 테스트와 벤치마크
+
+품질 요구사항은 아래처럼 검증한다.
+
+| 검증 대상 | 실행 | 확인하는 것 |
+| --- | --- | --- |
+| 공통 요청 계약 | `make test-cmd-processor` | request/response 소유권, status, callback, 동시 submit |
+| REPL 처리기 | `make test-repl-cmd-processor` | 동기 SQL 실행, parse error, processing error |
+| TCP API 서버 | `make test-tcp-cmd-processor` | JSONL request/response, connection 제한, in-flight 제한 |
+| 스레드풀 처리량 | `make test-cmd-processor-scale-score` | queue wait, worker 처리, request slot 사용량 |
+| 발표용 E2E | `./test.sh` | 외부 클라이언트 관점의 CRUD, UK 중복, bad request, 동시 요청 |
+| 병렬 부하 | `./test.sh --stress` | 여러 클라이언트가 outstanding 요청을 유지할 때의 안정성 |
+| 점수형 벤치 | `make bench-score` | correctness, benchmark, memory tracking, report 생성 |
 
 핵심 테스트:
 
@@ -379,11 +409,14 @@ make bench-clean
 
 | 질문 | 답 |
 | --- | --- |
+| API 서버는 실제로 외부 접속을 받나? | `TCPCmdProcessor`가 TCP listen socket을 열고, 테스트 러너가 별도 client socket으로 JSONL 요청을 보낸다. |
+| 스레드풀은 어디에 있나? | `EngineCmdProcessor`가 queue와 worker thread를 만들고, TCP connection thread는 SQL을 직접 실행하지 않고 submit만 한다. |
+| 동시 요청의 응답 순서가 바뀌면? | response의 `id`가 요청 id와 같기 때문에 클라이언트가 id로 매칭한다. |
+| 잘못된 API 요청은 어떻게 되나? | malformed JSON, 필수 필드 누락, SQL 길이 초과, 중복 in-flight id는 DB 실행 전에 실패 응답으로 정리한다. |
 | 왜 B+ Tree인가? | exact lookup뿐 아니라 `BETWEEN` range scan을 같은 인덱스로 설명할 수 있기 때문이다. |
 | 왜 모든 컬럼을 인덱싱하지 않았나? | 인덱스 경로와 scan 경로의 차이를 보여주고, 메모리/갱신 비용을 통제하기 위해 PK/UK 중심으로 제한했다. |
 | CSV인데 DBMS라고 할 수 있나? | 저장 포맷은 CSV지만 SQL parser, executor, index, mutation log, request processor를 갖춘 작은 DBMS 구조다. |
 | DELETE 후 인덱스가 깨지지 않나? | slot active 상태, free slot, index 삭제/재구성, delta replay로 stale row를 방지한다. |
-| TCP 응답 순서가 달라져도 괜찮나? | response의 `id`가 요청 id와 같기 때문에 클라이언트가 id로 매칭한다. |
 | 재실행하면 인덱스를 다시 다 만드나? | 가능한 경우 `*.idx` snapshot을 읽고, 변경분은 `*.delta`를 replay한다. |
 
 추가로 그리면 좋은 시각화 후보:
