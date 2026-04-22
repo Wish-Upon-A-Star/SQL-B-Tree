@@ -1,0 +1,79 @@
+digraph CmdProcessorDITcpBuild {
+    graph [
+        rankdir=TB,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.65,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_entrypoint {
+        label="주입된 진입점 구현체: TCP";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        clients [label="외부 clients"];
+        tcp_adapter [label="TCP adapter\nconnection + JSONL"];
+    }
+
+    subgraph cluster_core {
+        label="코어 구현체: 변경 없음";
+        style="rounded,filled";
+        color="#93c5fd";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        main_core [
+            label="main / request core\n공통 요청 처리 흐름"
+        ];
+
+        contract [
+            label="CmdProcessor 계약\n요청 제출 + 응답 수신",
+            fillcolor="#dbeafe",
+            color="#60a5fa"
+        ];
+
+        db [
+            label="DB BlackBox\nSQL 실행",
+            fillcolor="#ffffff",
+            color="#cbd5e1"
+        ];
+    }
+
+    response [label="TCP response\nsame connection"];
+
+    { rank=same; clients; tcp_adapter; }
+    { rank=same; main_core; contract; }
+    { rank=same; db; response; }
+
+    clients -> tcp_adapter;
+    tcp_adapter -> main_core [label="CmdRequest"];
+    main_core -> contract -> db;
+    contract -> response [style=dashed, label="CmdResponse"];
+}

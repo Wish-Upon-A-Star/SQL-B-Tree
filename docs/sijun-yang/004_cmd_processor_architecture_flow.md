@@ -49,25 +49,31 @@ DOT 원본: [`004_cmd_processor_overall_architecture.dot`](./diagrams/004_cmd_pr
 
 ## 3. CmdProcessor를 둔 장점
 
-`CmdProcessor`를 중간 계약으로 두면 외부 입력 방식과 실제 요청 처리 방식을 분리할 수 있다. 파일 실행, REPL, TCP 같은 진입점은 서로 다르지만, 한 번 `CmdRequest`로 바뀐 뒤에는 같은 제출/응답 흐름을 사용할 수 있다.
+`CmdProcessor`를 중간 계약으로 두면 코어 요청 처리 흐름과 외부 진입점 구현체를 분리할 수 있다. DI처럼 코어는 `CmdProcessor` 계약만 바라보고, 빌드 또는 실행 구성에서 TCP나 REPL 같은 진입점 구현체를 끼워 넣는 방식으로 이해할 수 있다.
 
-![CmdProcessor 진입점 선택 장점](./diagrams/004_cmd_processor_benefit_entrypoint_selection.svg)
+### 코어 구현체만 있는 상태
 
-DOT 원본: [`004_cmd_processor_benefit_entrypoint_selection.dot`](./diagrams/004_cmd_processor_benefit_entrypoint_selection.dot)
+![CmdProcessor DI 코어만 있는 상태](./diagrams/004_cmd_processor_di_core_only.svg)
 
-빌드 또는 실행 설정에서 하나의 진입점을 선택하더라도 요청 처리 코어는 `CmdProcessor` 계약을 바라본다. 그래서 선택된 버전이 파일 실행인지, REPL인지, TCP 입력인지에 따라 바뀌는 부분은 입력을 읽고 `CmdRequest`로 바꾸는 adapter 쪽에 모인다.
+DOT 원본: [`004_cmd_processor_di_core_only.dot`](./diagrams/004_cmd_processor_di_core_only.dot)
 
-![CmdProcessor로 유지되는 main/request core](./diagrams/004_cmd_processor_benefit_stable_main.svg)
+코어 구현체만 있으면 `main/request core`, `CmdProcessor` 계약, DB 실행 계층은 존재하지만 사용자와 만나는 진입점은 아직 비어 있다. 이 상태의 코어는 TCP인지 REPL인지 알지 못하고, 요청을 제출하고 응답을 받는 공통 흐름만 가진다.
 
-DOT 원본: [`004_cmd_processor_benefit_stable_main.dot`](./diagrams/004_cmd_processor_benefit_stable_main.dot)
+### TCP 구현체로 빌드된 상태
 
-이 구조의 장점은 `main` 또는 request 처리 코어가 모든 입력 방식을 직접 알 필요가 없다는 점이다. 진입점 선택과 wiring은 바뀔 수 있지만, 요청 생성, 제출, 응답 처리의 중심 흐름은 유지된다.
+![CmdProcessor DI TCP 구현체 주입](./diagrams/004_cmd_processor_di_tcp_build.svg)
 
-![CmdProcessor 새 요청 추가 장점](./diagrams/004_cmd_processor_benefit_add_requests.svg)
+DOT 원본: [`004_cmd_processor_di_tcp_build.dot`](./diagrams/004_cmd_processor_di_tcp_build.dot)
 
-DOT 원본: [`004_cmd_processor_benefit_add_requests.dot`](./diagrams/004_cmd_processor_benefit_add_requests.dot)
+TCP 구현체를 주입한 빌드는 외부 client connection과 JSONL 입출력을 담당한다. 하지만 TCP에서 읽은 요청이 `CmdRequest`로 바뀐 뒤에는 코어의 요청 제출/응답 처리 흐름이 그대로 사용된다.
 
-새 요청을 추가할 때도 같은 원리가 적용된다. 새 `op`나 명령을 받아 `CmdRequest`로 매핑하고, 필요한 처리만 구현체 쪽에 추가하면 공통 제출/응답 흐름은 그대로 재사용할 수 있다. “main 코드가 절대 바뀌지 않는다”기보다는, 변경이 진입점 adapter나 요청 매핑, 구현체 내부로 제한된다는 것이 핵심이다.
+### REPL 구현체로 빌드된 상태
+
+![CmdProcessor DI REPL 구현체 주입](./diagrams/004_cmd_processor_di_repl_build.svg)
+
+DOT 원본: [`004_cmd_processor_di_repl_build.dot`](./diagrams/004_cmd_processor_di_repl_build.dot)
+
+REPL 구현체를 주입한 빌드는 console prompt와 한 줄 SQL 입력을 담당한다. TCP 빌드와 마찬가지로 입력 방식만 다르고, 코어의 요청 생성, 제출, 응답 처리 흐름은 유지된다.
 
 ## 4. 공통 요청 처리 계약
 
