@@ -533,7 +533,7 @@ static int test_sql_and_multiple_requests(void) {
     CHECK(json_string_equals(first, "status", "OK"));
     body = cJSON_GetObjectItemCaseSensitive(first, "body");
     CHECK(cJSON_IsObject(body));
-    CHECK(json_string_equals(body, "sql", "SELECT 1;"));
+    CHECK(json_string_equals(body, "sql", "SELECT 1"));
     CHECK(json_string_equals(second, "id", "p2"));
     CHECK(json_string_equals(second, "status", "OK"));
 

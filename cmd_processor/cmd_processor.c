@@ -1,5 +1,6 @@
 #include "cmd_processor.h"
 
+#include <ctype.h>
 #include <string.h>
 
 static int processor_is_usable(CmdProcessor *processor) {
@@ -14,6 +15,30 @@ static void copy_request_id(char request_id[64], const char *source) {
     if (len >= 64) len = 63;
     if (len > 0) memcpy(request_id, source, len);
     request_id[len] = '\0';
+}
+
+static size_t normalize_sql_text(char *dst,
+                                 size_t dst_size,
+                                 const char *sql) {
+    const char *start = sql;
+    const char *end;
+    size_t len;
+
+    if (!dst || dst_size == 0 || !sql) return 0;
+
+    while (*start && isspace((unsigned char)*start)) start++;
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    if (end > start && *(end - 1) == ';') {
+        end--;
+        while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    }
+
+    len = (size_t)(end - start);
+    if (len >= dst_size) len = dst_size - 1;
+    if (len > 0) memcpy(dst, start, len);
+    dst[len] = '\0';
+    return len;
 }
 
 const char *cmd_status_to_string(CmdStatusCode status) {
@@ -66,7 +91,7 @@ CmdStatusCode cmd_processor_set_sql_request(CmdProcessor *processor,
 
     copy_request_id(request->request_id, request_id);
     request->type = CMD_REQUEST_SQL;
-    memcpy(request->sql, sql, sql_len + 1);
+    normalize_sql_text(request->sql, processor->context->max_sql_len + 1, sql);
     return CMD_STATUS_OK;
 }
 

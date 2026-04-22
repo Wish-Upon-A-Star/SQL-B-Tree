@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -81,6 +82,7 @@ static void copy_cstr(char *dst, size_t dst_size, const char *src) {
 static int set_socket_timeouts(int fd) {
     struct timeval read_timeout;
     struct timeval write_timeout;
+    int tcp_nodelay = 1;
 #ifdef SO_NOSIGPIPE
     int no_sigpipe = 1;
 #endif
@@ -96,6 +98,7 @@ static int set_socket_timeouts(int fd) {
     if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &write_timeout, sizeof(write_timeout)) != 0) {
         return -1;
     }
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &tcp_nodelay, sizeof(tcp_nodelay));
 #ifdef SO_NOSIGPIPE
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
 #endif
@@ -390,18 +393,25 @@ static int send_all(int fd, const char *data, size_t len) {
 static int write_json_line(TCPConnection *connection, const char *json) {
     int fd = -1;
     int rc = -1;
+    size_t json_len;
+    char *line = NULL;
 
     if (!connection || !json) return -1;
+    json_len = strlen(json);
 
     pthread_mutex_lock(&connection->write_mutex);
     pthread_mutex_lock(&connection->state_mutex);
     if (!connection->closing && connection->client_fd >= 0) fd = connection->client_fd;
     pthread_mutex_unlock(&connection->state_mutex);
 
-    if (fd >= 0 &&
-        send_all(fd, json, strlen(json)) == 0 &&
-        send_all(fd, "\n", 1) == 0) {
-        rc = 0;
+    if (fd >= 0) {
+        line = (char *)malloc(json_len + 2);
+        if (line) {
+            memcpy(line, json, json_len);
+            line[json_len] = '\n';
+            line[json_len + 1] = '\0';
+            if (send_all(fd, line, json_len + 1) == 0) rc = 0;
+        }
     }
 
     if (rc != 0) {
@@ -419,6 +429,7 @@ static int write_json_line(TCPConnection *connection, const char *json) {
         }
     }
 
+    free(line);
     pthread_mutex_unlock(&connection->write_mutex);
     return rc;
 }
