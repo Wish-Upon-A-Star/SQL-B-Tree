@@ -2,25 +2,20 @@
 
 이 프로젝트는 **C로 구현한 미니 DBMS - API 서버**다. 외부 클라이언트가 TCP socket으로 JSONL 요청을 보내면, 서버는 그 요청을 내부 DB 엔진으로 전달하고 기존 SQL 처리기와 B+ Tree 인덱스로 결과를 만든다.
 
-### 핵심 흐름
-
-```text
-외부 요청
-    -> API 계층이 받고 추적한다
-    -> DB 처리 계층이 실행 순서와 상태를 보호한다
-    -> 기존 SQL 처리기와 B+ Tree가 실제 DB 기능을 수행한다
-    -> 테스트로 기능과 동시성을 검증한다
-```
-
 ## 1. 개요
 
 이 프로젝트는 C 기반 미니 DBMS에 TCP API 서버를 붙인 결과물이다.
 
 ### 전체 구조
 
-![프로젝트 전체 흐름](docs/sijun-yang/diagrams/readme_project_overall_flow.svg)
-
-DOT 원본: [readme_project_overall_flow.dot](docs/sijun-yang/diagrams/readme_project_overall_flow.dot)
+```mermaid
+flowchart LR
+    A["외부 클라이언트"] --> B["TCP API 서버"]
+    B --> C["요청 추적 / Thread Pool"]
+    C --> D["DB 실행 보호"]
+    D --> E["SQL 처리기 + B+ Tree"]
+    E --> F["JSON 응답"]
+```
 
 - C 언어로 미니 DBMS API 서버를 구현했다.
 - 외부 클라이언트는 TCP connection으로 JSONL 요청을 보내 DBMS 기능을 사용할 수 있다.
@@ -32,7 +27,7 @@ DOT 원본: [readme_project_overall_flow.dot](docs/sijun-yang/diagrams/readme_pr
 
 ## 2. API
 
-API 장에서 말할 것은 하나다. TCP 서버는 DB가 아니라, 외부 요청을 안전하게 받아 DB 처리 계층으로 넘기는 입구다.
+API 장에서 말할 것은 하나다. TCP 서버는 DB가 아니라, 외부 요청을 안전하게 받아 DB 처리 계층으로 넘기는 입구에 가깝다.
 
 ### API 서버 아키텍처
 
@@ -41,33 +36,14 @@ API 장에서 말할 것은 하나다. TCP 서버는 DB가 아니라, 외부 요
 DOT 원본: [004_tcp_cmd_processor_architecture_flow.dot](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.dot)
 
 - 외부 클라이언트는 TCP connection을 열고 JSONL 한 줄로 SQL 요청을 보낸다.
-- API 계층은 요청 형식과 필수 필드를 먼저 확인한다.
 - 요청 id는 응답이 돌아오기 전까지 in-flight 상태로 추적한다.
 - SQL은 API 계층에서 직접 실행하지 않고 DB 처리 계층으로 넘긴다.
 - 결과가 돌아오면 같은 request id를 붙여 같은 connection에 응답한다.
 - 그래서 응답 순서가 바뀌어도 클라이언트는 id로 자기 요청의 결과를 찾을 수 있다.
 
-### JSONL 프로토콜
-
-요청은 newline으로 구분되는 JSON object 한 줄이다. 아래 예시로 외부 클라이언트가 DBMS 기능을 어떻게 호출하는지 확인할 수 있다.
-
-```json
-{"id":"s1","op":"sql","sql":"SELECT * FROM users WHERE id = 1;"}
-{"id":"p1","op":"ping"}
-{"id":"c1","op":"close"}
-```
-
-응답은 항상 request id를 포함한다.
-
-```json
-{"id":"p1","ok":true,"status":"OK","body":"pong"}
-{"id":"s1","ok":true,"status":"OK","row_count":1,"body":"SELECT matched_rows=1"}
-{"id":"bad","ok":false,"status":"BAD_REQUEST","error":"missing sql"}
-```
-
 ### API 계층의 동시성
 
-API 계층의 동시성은 **요청을 동시에 받고, 잃어버리지 않고, 올바른 클라이언트에 응답하는 문제**다.
+API 계층의 동시성은 **요청을 동시에 받고, 유실시키지 않고, 올바른 클라이언트에 응답하게 하도록 하는 문제**다.
 
 ![TCP 여러 in-flight 요청 흐름](docs/sijun-yang/diagrams/004_tcp_multi_request_inflight_flow.svg)
 
