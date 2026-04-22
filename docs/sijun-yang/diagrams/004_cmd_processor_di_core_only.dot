@@ -1,4 +1,4 @@
-digraph CmdProcessorOverallArchitecture {
+digraph CmdProcessorDICoreOnly {
     graph [
         rankdir=LR,
         compound=true,
@@ -27,7 +27,7 @@ digraph CmdProcessorOverallArchitecture {
         arrowsize=0.7
     ];
 
-    subgraph cluster_io {
+    subgraph cluster_impl {
         label="입출력 구현체";
         style="rounded,filled";
         color="#cbd5e1";
@@ -36,9 +36,11 @@ digraph CmdProcessorOverallArchitecture {
         fontsize=13;
         margin=14;
 
-        io_impl [
-            label="TCP / REPL / tests\n입력 수신\n출력 형식 관리",
-            fillcolor="#ffffff"
+        impl_slot [
+            label="아직 선택되지 않음\n입출력 관리 없음",
+            style="rounded,dashed,filled",
+            fillcolor="#ffffff",
+            color="#cbd5e1"
         ];
     }
 
@@ -52,11 +54,11 @@ digraph CmdProcessorOverallArchitecture {
         margin=14;
 
         cmd_processor [
-            label="CmdProcessor\n요청 처리 정책\nrequest/response 소유",
+            label="CmdProcessor\n요청 처리 정책",
             fillcolor="#ffffff"
         ];
 
-        db_black_box [
+        db [
             label="DB 실행\nBlackBox",
             fillcolor="#ffffff",
             color="#cbd5e1"
@@ -70,16 +72,18 @@ digraph CmdProcessorOverallArchitecture {
         margin="0.08,0.04"
     ];
 
-    io_impl -> cmd_contract [
-        ltail=cluster_io,
+    impl_slot -> cmd_contract [
+        style=dashed,
+        ltail=cluster_impl,
         arrowhead=none,
         minlen=2,
         weight=10
     ];
     cmd_contract -> cmd_processor [
+        style=dashed,
         lhead=cluster_core,
         minlen=2,
         weight=10
     ];
-    cmd_processor -> db_black_box [label="DB 의존", fontsize=9, minlen=1];
+    cmd_processor -> db [label="DB 의존", fontsize=9, minlen=1];
 }
