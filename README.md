@@ -1,34 +1,12 @@
-# 수요 코딩회 미니 DBMS API 서버
+# 미니 DBMS - API 서버
 
-이번 주 과제인 **미니 DBMS - API 서버** 구현 결과물이다. C로 TCP API 서버를 만들고, 외부 클라이언트가 JSONL 요청으로 SQL을 보내면 내부 SQL 처리기와 B+ Tree 인덱스를 통해 DBMS 기능을 사용할 수 있게 했다.
+이 프로젝트는 **미니 DBMS - API 서버** 구현 결과물이다. C로 TCP API 서버를 만들고, 외부 클라이언트가 JSONL 요청으로 SQL을 보내면 내부 SQL 처리기와 B+ Tree 인덱스를 통해 DBMS 기능을 사용할 수 있게 했다.
 
-핵심은 세 가지다.
+이 구현의 핵심은 두가지다.
+- 외부 API 서버에서 들어오는 요청을 스레드풀 기반으로 처리하도록 했다.
+- 기존 SQL 처리기와 B+ Tree 인덱스 구조는 변경하지 않고 재사용했다.
 
-```text
-외부 API 서버
-    -> 스레드풀 기반 요청 처리
-    -> 기존 SQL 처리기 + B+ Tree 인덱스 재사용
-```
-
-README는 목요일 발표에서 위에서 아래로 읽을 수 있도록 구성했다. 발표자료는 따로 만들지 않고, 이 문서를 기준으로 데모와 검증 과정을 설명한다.
-
-## 1. 요구사항 대응
-
-이번 과제 요구사항을 코드 기준으로 매핑하면 다음과 같다.
-
-| 과제 요구사항 | 구현 위치 | 발표에서 보여줄 포인트 |
-| --- | --- | --- |
-| C 언어로 미니 DBMS API 서버 구현 | `cmd_processor/tcp_cmd_processor.c`, `tests/api_story_test.c` | 실제 TCP 서버를 띄우고 외부 클라이언트가 socket으로 JSONL 요청을 보낸다 |
-| 외부 클라이언트에서 DBMS 기능 사용 | `TCPCmdProcessor`, `cJSON`, API story test client | `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `ping`, `close`를 JSON 요청으로 실행한다 |
-| 스레드풀로 SQL 요청 병렬 처리 | `EngineCmdProcessor`, `WorkQueue`, worker thread | 요청을 queue에 넣고 worker가 꺼내 처리하며, in-flight 요청을 id로 추적한다 |
-| 이전 SQL 처리기 재사용 | `lexer.c`, `parser.c`, `executor.c` | API 서버는 SQL을 직접 실행하지 않고 기존 SQL 엔진에 위임한다 |
-| B+ Tree 인덱스 재사용 | `bptree.c`, `executor.c` | `id(PK)`, `email(UK)`, `phone(UK)` 조회와 range scan에 B+ Tree를 쓴다 |
-| 단위 테스트와 기능 테스트 | `make test-*`, `./test.sh` | CmdProcessor 계약, REPL, TCP, scale score, API story를 분리 검증한다 |
-| 엣지 케이스 고려 | TCP bad request, SQL too long, duplicate id, in-flight limit | 잘못된 JSON, 누락 필드, 중복 request id, UK 중복을 실패 응답으로 확인한다 |
-
-발표의 중심은 DB 자료구조 자체가 아니라, **외부 API 서버와 내부 DB 엔진을 어떻게 연결했고, 그 사이의 동시성 문제를 어떻게 통제했는가**다.
-
-## 2. 발표 흐름 한 장 요약
+## 1. 발표 흐름 한 장 요약
 
 ```mermaid
 flowchart LR
@@ -43,8 +21,6 @@ flowchart LR
     B --> A
 ```
 
-이 흐름대로 발표한다.
-
 1. 외부 클라이언트가 TCP API 서버에 JSONL 요청을 보낸다.
 2. TCP 계층은 JSON을 검증하고 `CmdRequest`로 변환한다.
 3. `EngineCmdProcessor`가 요청을 queue에 넣고 worker thread가 SQL을 처리한다.
@@ -52,9 +28,9 @@ flowchart LR
 5. 응답은 같은 request id를 가진 JSON response로 돌아간다.
 6. `./test.sh`와 `./test.sh --stress`로 기능과 동시성을 데모한다.
 
-## 3. 중점 포인트 1: API 서버 아키텍처
+## 2. API 서버 아키텍처
 
-TCP 계층은 DB가 아니다. socket을 받고, newline으로 구분된 JSON 요청을 `CmdRequest`로 바꿔 뒤쪽 processor에 맡기는 API 어댑터다.
+API 서버는 새로운 DB 엔진이 아닌, 기존 DB-Cmd Processor를 위한 네트워크 어댑터다. TCP 소켓으로 수신한 JSONL 요청을 CmdRequest로 변환하고, SQL 처리와 B+ Tree 인덱스 접근은 기존 Processor에 위임한다.
 
 ![TCP 기반 전체 요청 흐름](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.svg)
 
@@ -85,17 +61,14 @@ API 서버가 담당하는 일은 네 가지다.
 {"id":"bad","ok":false,"status":"BAD_REQUEST","error":"missing sql"}
 ```
 
-## 4. 중점 포인트 2: 스레드풀과 동시성
+## 3. 스레드풀과 동시성
 
-과제의 핵심 요구사항은 “요청이 들어올 때마다 스레드를 할당하여 SQL 요청을 병렬로 처리”하는 것이다. 이 프로젝트에서는 connection thread가 SQL을 직접 처리하지 않고, `EngineCmdProcessor`의 queue/worker 모델로 넘긴다.
+핵심 요구사항은 요청마다 스레드를 할당해 SQL을 병렬 처리하는 것이다. 다만 이 구현에서는 connection thread가 SQL을 직접 처리하지 않고, EngineCmdProcessor의 queue/worker 모델에 위임한다.
 
 ```text
-TCP connection thread
-    -> request 검증
-    -> in-flight 등록
-    -> Engine queue에 submit
-    -> worker thread가 SQL 실행
-    -> callback으로 TCP response write
+> 1. TCP connection thread가 요청을 수신하고 검증한다.
+> 2. 요청을 in-flight로 등록한 뒤 Engine queue에 제출한다.
+> 3. worker thread가 SQL을 실행하고, callback을 통해 TCP response를 반환한다.
 ```
 
 같은 connection 안에서도 여러 요청이 in-flight 상태가 될 수 있다.
@@ -114,11 +87,11 @@ DOT 원본: [004_tcp_multi_request_inflight_flow.dot](docs/sijun-yang/diagrams/0
 | in-flight 과다 | connection별/client별 in-flight 수를 제한하고 `BUSY` 응답 |
 | SQL 실행 충돌 | Engine layer에서 request plan과 lock plan으로 처리 순서를 제어한다 |
 
-따라서 발표에서는 “스레드를 만들었다”가 아니라, **요청 추적, 큐잉, worker 처리, callback 응답, 과부하 방어까지 포함한 동시성 구조**로 설명한다.
+즉 이 구현은 "스레드를 만들었다"에 그치지 않고, **요청 추적, 큐잉, worker 처리, callback 응답, 과부하 방어**까지 포함한 동시성 구조다.
 
-## 5. 중점 포인트 3: API 서버와 내부 DB 엔진 연결
+## 4. API 서버와 내부 DB 엔진 연결
 
-`CmdProcessor`는 TCP, CLI, REPL, 테스트 코드가 SQL 실행 계층을 직접 붙잡지 않게 하는 공통 요청 처리 계약이다.
+`CmdProcessor`는 TCP, CLI, REPL, 테스트 코드 등 모든 클라이언트가 SQL 처리 로직에 직접 의존하지 않도록 하는 공통 인터페이스다.
 
 ![CmdProcessor 전체 아키텍처](docs/sijun-yang/diagrams/004_cmd_processor_overall_architecture.svg)
 
@@ -135,9 +108,11 @@ DOT 원본: [004_cmd_processor_overall_architecture.dot](docs/sijun-yang/diagram
 | `REPLCmdProcessor` | 동기 실행 흐름 |
 | `MockCmdProcessor` | 계약 자체를 검증하는 테스트 구현체 |
 
-`submit`이 성공했다는 말은 SQL 성공이 아니라 “요청 제출 성공”이다. 실제 SQL 결과는 callback으로 돌아오는 `CmdResponse`에 담긴다. 이 구조 덕분에 같은 SQL 엔진을 CLI, TCP API, 테스트 러너가 같은 방식으로 사용할 수 있다.
+- submit의 반환값은 SQL 실행 성공이 아닌 요청 제출 성공을 의미한다. 실제 SQL 결과는 비동기로 돌아오는 CmdResponse callback에 담긴다.
+- 즉 호출자는 결과를 기다리지 않고 제출만 하면 되고, 결과 처리는 callback에 맡긴다. 
+- 이 비동기 구조 덕분에 CLI, TCP API, 테스트 러너가 동일한 인터페이스로 같은 SQL 엔진을 사용할 수 있다.
 
-## 6. 내부 DB 엔진: 기존 SQL 처리기 재사용
+## 5. 내부 DB 엔진: 기존 SQL 처리기 재사용
 
 SQL 한 문장은 아래 순서로 처리된다.
 
@@ -149,8 +124,6 @@ SQL text
     -> TableCache: row/cache/index/storage 접근
     -> 결과 row_count / affected_count / body
 ```
-
-현재 지원하는 SQL 범위는 작지만 발표하기 좋게 경계가 분명하다.
 
 | SQL | 예시 | 처리 방식 |
 | --- | --- | --- |
