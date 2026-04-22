@@ -1,12 +1,13 @@
 import json
 import os
-import socket
 import time
 from ctypes import c_ulong, sizeof
 from itertools import count
+from math import gcd
 from pathlib import Path
 
 import gevent
+from gevent import socket as gsocket
 from locust import User, events, task
 
 
@@ -45,11 +46,37 @@ def _hash_text_like_c_ulong(text):
     return value
 
 
-def _inc_counter(mapping, key):
+def _add_counter(mapping, key, count_value):
     if key is None:
         return
+    if count_value <= 0:
+        return
     text_key = str(key)
-    mapping[text_key] = mapping.get(text_key, 0) + 1
+    mapping[text_key] = mapping.get(text_key, 0) + int(count_value)
+
+
+def _add_raw_counter(mapping, key, count_value=1):
+    if count_value <= 0:
+        return
+    mapping[key] = mapping.get(key, 0) + int(count_value)
+
+
+def _count_values(values):
+    counts = {}
+    for value in values:
+        _add_raw_counter(counts, value)
+    return counts
+
+
+def _subtract_counts(total_counts, subtract_counts):
+    remaining = dict(total_counts)
+    for key, value in subtract_counts.items():
+        new_value = remaining.get(key, 0) - int(value)
+        if new_value > 0:
+            remaining[key] = new_value
+        else:
+            remaining.pop(key, None)
+    return remaining
 
 
 class ThroughputRecorder:
@@ -86,35 +113,49 @@ class ThroughputRecorder:
         self.wall_started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     def record(self, exception, context=None):
-        elapsed = time.monotonic() - self.started_at
-        is_success = exception is None
         expected_shard = None
         if context:
             expected_shard = context.get("expected_shard")
+        if exception is None:
+            self.record_counts(success_counts={expected_shard: 1})
+        else:
+            self.record_counts(failure_counts={expected_shard: 1})
+
+    def record_counts(self, success_counts=None, failure_counts=None):
+        elapsed = time.monotonic() - self.started_at
+        self._record_counts_at(elapsed, True, success_counts or {})
+        self._record_counts_at(elapsed, False, failure_counts or {})
+
+    def _record_counts_at(self, elapsed, is_success, counts_by_shard):
+        total_count = sum(int(value) for value in counts_by_shard.values())
+        if total_count <= 0:
+            return
 
         if elapsed < self.warmup_seconds:
             if is_success:
-                self.warmup_success += 1
+                self.warmup_success += total_count
             else:
-                self.warmup_failures += 1
+                self.warmup_failures += total_count
             return
 
         second_index = int(elapsed - self.warmup_seconds)
         if 0 <= second_index < self.measure_seconds:
             if is_success:
-                self.success_by_second[second_index] += 1
-                self.measure_success += 1
-                _inc_counter(self.measure_success_by_expected_shard, expected_shard)
+                self.success_by_second[second_index] += total_count
+                self.measure_success += total_count
+                for expected_shard, count_value in counts_by_shard.items():
+                    _add_counter(self.measure_success_by_expected_shard, expected_shard, count_value)
             else:
-                self.failure_by_second[second_index] += 1
-                self.measure_failures += 1
-                _inc_counter(self.measure_failures_by_expected_shard, expected_shard)
+                self.failure_by_second[second_index] += total_count
+                self.measure_failures += total_count
+                for expected_shard, count_value in counts_by_shard.items():
+                    _add_counter(self.measure_failures_by_expected_shard, expected_shard, count_value)
             return
 
         if is_success:
-            self.after_measure_success += 1
+            self.after_measure_success += total_count
         else:
-            self.after_measure_failures += 1
+            self.after_measure_failures += total_count
 
     def result(self):
         percentiles = {
@@ -184,43 +225,80 @@ class SQLTCPClient:
         self.port = port
         self.timeout = timeout
         self.sock = None
-        self.reader = None
+        self.read_buffer = bytearray()
 
     def connect(self):
         if self.sock is not None:
             return
-        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock = gsocket.create_connection((self.host, self.port), timeout=self.timeout)
         self.sock.settimeout(self.timeout)
-        self.reader = self.sock.makefile("rb", buffering=0)
+        self.read_buffer.clear()
 
     def close(self):
-        if self.reader is not None:
-            try:
-                self.reader.close()
-            except OSError:
-                pass
         if self.sock is not None:
             try:
                 self.sock.close()
             except OSError:
                 pass
-        self.reader = None
         self.sock = None
+        self.read_buffer.clear()
 
-    def send_batch(self, payloads):
+    def send_bytes(self, encoded):
         self.connect()
-        encoded = b"".join(
-            (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-            for payload in payloads
-        )
         self.sock.sendall(encoded)
 
     def read_response(self):
         self.connect()
-        line = self.reader.readline()
-        if not line:
-            raise RuntimeError("server closed connection")
-        return json.loads(line.decode("utf-8"))
+        while True:
+            newline_index = self.read_buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(self.read_buffer[: newline_index + 1])
+                del self.read_buffer[: newline_index + 1]
+                break
+            chunk = self.sock.recv(8192)
+            if not chunk:
+                raise RuntimeError("server closed connection")
+            self.read_buffer.extend(chunk)
+        request_id = _extract_compact_json_string(line, b"id")
+        if not request_id:
+            raise RuntimeError(f"response id missing: {line[:256]!r}")
+        return {
+            "id": request_id,
+            "ok": b'"ok":true' in line,
+            "line": line,
+        }
+
+
+def _extract_compact_json_string(line, key):
+    marker = b'"' + key + b'":"'
+    start = line.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = line.find(b'"', start)
+    if end < 0:
+        return None
+    return line[start:end]
+
+
+class RequestPlan:
+    __slots__ = ("request_id", "expected_shard", "wire")
+
+    def __init__(self, request_id, expected_shard, wire):
+        self.request_id = request_id
+        self.expected_shard = expected_shard
+        self.wire = wire
+
+
+class BatchPlan:
+    __slots__ = ("encoded", "pending_by_id", "expected_shards", "expected_shard_counts", "count")
+
+    def __init__(self, encoded, pending_by_id, expected_shards):
+        self.encoded = encoded
+        self.pending_by_id = pending_by_id
+        self.expected_shards = expected_shards
+        self.expected_shard_counts = _count_values(expected_shards)
+        self.count = len(expected_shards)
 
 
 class TCPMaxRPSUser(User):
@@ -245,11 +323,16 @@ class TCPMaxRPSUser(User):
         self.sql_id_min = _env_int("LOCUST_TCP_SQL_ID_MIN", 1)
         self.sql_id_max = _env_int("LOCUST_TCP_SQL_ID_MAX", self.sql_id_min)
         self.sql_variant_count = _env_int("LOCUST_TCP_SQL_VARIANT_COUNT", 0)
+        self.sql_pool_size = _env_int("LOCUST_TCP_SQL_POOL_SIZE", 4096)
         if self.sql_id_max < self.sql_id_min:
             self.sql_id_max = self.sql_id_min
+        if self.sql_pool_size <= 0:
+            self.sql_pool_size = 1
+        self.request_pool_size = max(self.sql_pool_size, self.pipeline_depth, 1)
         self.socket_index = (self.process_index - 1) + next(USER_INDEX_COUNTER) * max(1, self.process_count)
-        self.user_id = f"{id(self):x}"
-        self.sequence = 0
+        self.user_id = f"{self.process_index:x}-{self.socket_index:x}-{id(self):x}"
+        self.batch_sequence = 0
+        self.batch_plans = self._prebuild_batch_plans()
         self.client = SQLTCPClient(self.host_name, self.port, self.timeout)
         self.client.connect()
         self.batch_interval = 0.0
@@ -286,70 +369,62 @@ class TCPMaxRPSUser(User):
             return None
         return _hash_text_like_c_ulong(sql) % self.server_shards
 
-    def _build_payload(self):
-        request_id = f"{self.user_id}-{self.sequence}"
-        request_sequence = self.sequence
-        self.sequence += 1
-        if self.request_op == "ping":
-            return {"id": request_id, "op": "ping", "expected_shard": None}
-        sql = self._build_sql(request_sequence)
-        return {
-            "id": request_id,
-            "op": "sql",
-            "sql": sql,
-            "expected_shard": self._expected_shard(sql),
-        }
+    def _prebuild_request_pool(self):
+        plans = []
+        for request_sequence in range(self.request_pool_size):
+            request_id = f"{self.user_id}-{request_sequence}".encode("ascii")
+            if self.request_op == "ping":
+                wire = b'{"id":"' + request_id + b'","op":"ping"}\n'
+                plans.append(RequestPlan(request_id, None, wire))
+                continue
+            sql = self._build_sql(request_sequence)
+            sql_json = json.dumps(sql, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            wire = b'{"id":"' + request_id + b'","op":"sql","sql":' + sql_json + b"}\n"
+            plans.append(RequestPlan(request_id, self._expected_shard(sql), wire))
+        return plans
+
+    def _prebuild_batch_plans(self):
+        request_pool = self._prebuild_request_pool()
+        step = max(1, self.pipeline_depth)
+        batch_count = len(request_pool) // gcd(len(request_pool), step)
+        batches = []
+        for batch_index in range(batch_count):
+            offset = (batch_index * step) % len(request_pool)
+            batch_requests = [request_pool[(offset + index) % len(request_pool)] for index in range(step)]
+            pending_by_id = {plan.request_id: plan.expected_shard for plan in batch_requests}
+            if len(pending_by_id) != len(batch_requests):
+                raise RuntimeError("--sql-pool-size must provide unique request ids within a pipeline batch")
+            batches.append(
+                BatchPlan(
+                    b"".join(plan.wire for plan in batch_requests),
+                    pending_by_id,
+                    tuple(plan.expected_shard for plan in batch_requests),
+                )
+            )
+        return batches
 
     @task
     def send_pipelined_requests(self):
         batch_start = time.perf_counter()
-        payloads = [self._build_payload() for _ in range(self.pipeline_depth)]
-        sent_at = batch_start
-        pending = {
-            payload["id"]: {
-                "started_at": sent_at,
-                "expected_shard": payload.get("expected_shard"),
-            }
-            for payload in payloads
-        }
-        wire_payloads = [
-            {key: value for key, value in payload.items() if key != "expected_shard"}
-            for payload in payloads
-        ]
+        batch = self.batch_plans[self.batch_sequence % len(self.batch_plans)]
+        self.batch_sequence += 1
+        success_counts = {}
 
         try:
-            self.client.send_batch(wire_payloads)
-            for _ in payloads:
+            self.client.send_bytes(batch.encoded)
+            for _ in range(batch.count):
                 response = self.client.read_response()
                 request_id = response.get("id")
-                if request_id not in pending:
+                if request_id not in batch.pending_by_id:
                     raise RuntimeError(f"unexpected response id: {response!r}")
-                pending_item = pending[request_id]
-                start = pending_item["started_at"]
-                response_time_ms = (time.perf_counter() - start) * 1000.0
+                expected_shard = batch.pending_by_id[request_id]
                 if not response.get("ok"):
-                    raise RuntimeError(f"request failed: {response!r}")
-                pending.pop(request_id)
-                events.request.fire(
-                    request_type="TCP",
-                    name=self.request_op,
-                    response_time=response_time_ms,
-                    response_length=0,
-                    exception=None,
-                    context={"expected_shard": pending_item.get("expected_shard")},
-                )
-        except Exception as exc:
-            response_time_ms = (time.perf_counter() - sent_at) * 1000.0
-            pending_items = list(pending.values()) or [{"expected_shard": None}]
-            for item in pending_items:
-                events.request.fire(
-                    request_type="TCP",
-                    name=self.request_op,
-                    response_time=response_time_ms,
-                    response_length=0,
-                    exception=exc,
-                    context={"expected_shard": item.get("expected_shard")},
-            )
+                    raise RuntimeError(f"request failed: {response.get('line', b'')[:256]!r}")
+                _add_raw_counter(success_counts, expected_shard)
+            RECORDER.record_counts(success_counts=success_counts)
+        except Exception:
+            failure_counts = _subtract_counts(batch.expected_shard_counts, success_counts)
+            RECORDER.record_counts(success_counts=success_counts, failure_counts=failure_counts)
             self.client.close()
         finally:
             if self.batch_interval > 0.0:

@@ -173,6 +173,7 @@ def build_locust_env(args,
             "LOCUST_TCP_SQL_ID_MIN": str(args.sql_id_min),
             "LOCUST_TCP_SQL_ID_MAX": str(args.sql_id_max),
             "LOCUST_TCP_SQL_VARIANT_COUNT": str(args.sql_variant_count),
+            "LOCUST_TCP_SQL_POOL_SIZE": str(args.sql_pool_size),
             "LOCUST_TCP_RESULT_PATH": str(result_path),
             "LOCUST_SERVER_WORKERS": str(server_workers),
             "LOCUST_SERVER_SHARDS": str(shards),
@@ -567,6 +568,7 @@ def run_one_worker_count(args, repo_root, server_workers):
                 "sql_id_min": args.sql_id_min if args.op == "sql" and args.sql_template else None,
                 "sql_id_max": args.sql_id_max if args.op == "sql" and args.sql_template else None,
                 "sql_variant_count": args.sql_variant_count if args.op == "sql" and args.sql_template else None,
+                "sql_pool_size": args.sql_pool_size if args.op == "sql" else None,
                 "expected_shard_count": shards if args.op == "sql" else 0,
                 "cooldown_seconds": args.cooldown_seconds,
                 "wall_elapsed_seconds": time.time() - started,
@@ -699,6 +701,12 @@ def parse_args():
         default=0,
         help="if >0, cycles {variant} and {pad} to vary raw SQL text without changing {id}",
     )
+    parser.add_argument(
+        "--sql-pool-size",
+        type=int,
+        default=4096,
+        help="prebuilt request frame pool size per TCP socket; raised to pipeline depth if smaller",
+    )
     parser.add_argument("--warmup-seconds", type=int, default=30)
     parser.add_argument("--measure-seconds", type=int, default=60)
     parser.add_argument("--cooldown-seconds", type=int, default=30)
@@ -719,6 +727,8 @@ def main():
         raise RuntimeError("--sql-id-max must be >= --sql-id-min")
     if args.sql_variant_count < 0:
         raise RuntimeError("--sql-variant-count must be >= 0")
+    if args.sql_pool_size <= 0:
+        raise RuntimeError("--sql-pool-size must be > 0")
     if args.sql_template:
         try:
             args.sql_template.format(id=args.sql_id_min, seq=0, variant=0, pad="")
@@ -749,6 +759,7 @@ def main():
             "sql_id_min": args.sql_id_min if args.op == "sql" and args.sql_template else None,
             "sql_id_max": args.sql_id_max if args.op == "sql" and args.sql_template else None,
             "sql_variant_count": args.sql_variant_count if args.op == "sql" and args.sql_template else None,
+            "sql_pool_size": args.sql_pool_size if args.op == "sql" else None,
             "warmup_seconds": args.warmup_seconds,
             "measure_seconds": args.measure_seconds,
             "cooldown_seconds": args.cooldown_seconds,
