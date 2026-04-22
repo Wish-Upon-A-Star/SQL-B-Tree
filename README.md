@@ -34,10 +34,9 @@ TCP 서버는 SQL을 직접 실행하지 않는다. 외부 요청을 수신해 D
 DOT 원본: [004_tcp_cmd_processor_architecture_flow.dot](docs/sijun-yang/diagrams/004_tcp_cmd_processor_architecture_flow.dot)
 
 - 외부 클라이언트는 TCP connection을 열고 JSONL 한 줄로 SQL 요청을 보낸다.
-- API 서버는 요청을 받으면 request id를 기록하고, 응답이 끝날 때까지 추적한다.
+- API 서버는 요청을 수신하면 request id를 기록하고 결과가 돌아올 때까지 추적한다.
 - SQL은 API 서버에서 직접 실행하지 않고 DB 처리 계층으로 전달한다.
-- DB 처리 결과가 돌아오면 같은 request id를 붙여 원래 connection에 응답한다.
-- 그래서 응답 순서가 바뀌어도 클라이언트는 자기 요청의 결과를 찾을 수 있다.
+- 결과가 돌아오면 동일한 request id로 원래 connection에 응답한다. 응답 순서가 바뀌어도 클라이언트는 request id로 자신의 응답을 찾을 수 있다.
 - 잘못된 JSON, 필수 필드 누락, 중복 id 등 DB까지 전달할 필요가 없는 요청은 API 계층에서 먼저 차단한다.
 
 ### API 계층의 동시성
