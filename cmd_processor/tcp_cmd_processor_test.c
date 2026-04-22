@@ -1,4 +1,5 @@
 #include "tcp_cmd_processor.h"
+#include "tcp_protocol_binary.h"
 
 #include "mock_cmd_processor.h"
 #include "../thirdparty/cjson/cJSON.h"
@@ -376,90 +377,253 @@ static int send_all_client(int fd, const char *data, size_t len) {
     return 0;
 }
 
-static int send_line(int fd, const char *line) {
-    if (send_all_client(fd, line, strlen(line)) != 0) return -1;
-    return send_all_client(fd, "\n", 1);
-}
+static int recv_all_client(int fd, unsigned char *data, size_t len) {
+    size_t received = 0;
 
-static int read_line(int fd, char *buffer, size_t buffer_size) {
-    size_t len = 0;
-
-    if (!buffer || buffer_size == 0) return -1;
-    while (len + 1 < buffer_size) {
-        char ch;
-        ssize_t n = recv(fd, &ch, 1, 0);
-        if (n == 0) return -1;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+    while (received < len) {
+        ssize_t n = recv(fd, data + received, len - received, 0);
+        if (n > 0) {
+            received += (size_t)n;
+            continue;
         }
-        if (ch == '\n') {
-            if (len > 0 && buffer[len - 1] == '\r') len--;
-            buffer[len] = '\0';
-            return (int)len;
-        }
-        buffer[len++] = ch;
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
     }
-    return -1;
+    return 0;
 }
 
-static cJSON *read_json_response(int fd) {
-    char line[8192];
+static int send_request_frame(int fd,
+                              TCPBinaryOp op,
+                              const char *request_id,
+                              const char *payload,
+                              size_t payload_len) {
+    TCPBinaryRequestHeader header;
+    size_t header_size;
+    size_t request_id_len;
+    size_t frame_len;
+    unsigned char *frame;
+    unsigned char *cursor;
+    int rc;
 
-    if (read_line(fd, line, sizeof(line)) < 0) return NULL;
-    return cJSON_Parse(line);
+    request_id_len = request_id ? strlen(request_id) : 0;
+    tcp_binary_init_request_header(&header, op, request_id_len, payload_len);
+    frame_len = tcp_binary_request_frame_size(&header);
+    header_size = tcp_binary_request_header_size();
+    frame = (unsigned char *)calloc(frame_len, 1);
+    if (!frame) return -1;
+
+    tcp_binary_encode_request_header(frame, &header);
+    cursor = frame + header_size;
+    if (request_id_len > 0) {
+        memcpy(cursor, request_id, request_id_len);
+        cursor += request_id_len;
+    }
+    if (payload_len > 0) memcpy(cursor, payload, payload_len);
+    rc = send_all_client(fd, (const char *)frame, frame_len);
+    free(frame);
+    return rc;
 }
 
-static int json_string_equals(cJSON *root, const char *name, const char *expected) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
-    return cJSON_IsString(item) && strcmp(item->valuestring, expected) == 0;
+static int send_ping_request(int fd, const char *request_id) {
+    return send_request_frame(fd, TCP_BINARY_OP_PING, request_id, NULL, 0);
 }
 
-static int json_bool_equals(cJSON *root, const char *name, int expected) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
-    if (expected) return cJSON_IsTrue(item);
-    return cJSON_IsFalse(item);
+static int send_close_request(int fd, const char *request_id) {
+    return send_request_frame(fd, TCP_BINARY_OP_CLOSE, request_id, NULL, 0);
+}
+
+static int send_sql_request(int fd, const char *request_id, const char *sql) {
+    return send_request_frame(fd,
+                              TCP_BINARY_OP_SQL,
+                              request_id,
+                              sql,
+                              sql ? strlen(sql) : 0);
+}
+
+static int test_binary_request_header_roundtrip(void) {
+    TCPBinaryRequestHeader header;
+    TCPBinaryRequestHeader decoded;
+    unsigned char bytes[32];
+
+    tcp_binary_init_request_header(&header, TCP_BINARY_OP_SQL, 7, 128);
+    memset(bytes, 0, sizeof(bytes));
+    tcp_binary_encode_request_header(bytes, &header);
+    CHECK(tcp_binary_decode_request_header(bytes, tcp_binary_request_header_size(), &decoded) == 1);
+    CHECK(decoded.magic == TCP_PROTOCOL_REQUEST_MAGIC);
+    CHECK(decoded.version == TCP_PROTOCOL_VERSION);
+    CHECK(decoded.op == TCP_BINARY_OP_SQL);
+    CHECK(decoded.request_id_len == 7);
+    CHECK(decoded.payload_len == 128);
+    CHECK(tcp_binary_validate_request_header(&decoded) == 1);
+    return 0;
+}
+
+static int test_binary_response_header_roundtrip(void) {
+    TCPBinaryResponseHeader header;
+    TCPBinaryResponseHeader decoded;
+    unsigned char bytes[64];
+
+    tcp_binary_init_response_header(&header,
+                                    CMD_STATUS_OK,
+                                    1,
+                                    CMD_BODY_BINARY,
+                                    6,
+                                    48,
+                                    0,
+                                    3,
+                                    2);
+    memset(bytes, 0, sizeof(bytes));
+    tcp_binary_encode_response_header(bytes, &header);
+    CHECK(tcp_binary_decode_response_header(bytes, tcp_binary_response_header_size(), &decoded) == 1);
+    CHECK(decoded.magic == TCP_PROTOCOL_RESPONSE_MAGIC);
+    CHECK(decoded.version == TCP_PROTOCOL_VERSION);
+    CHECK(decoded.status == CMD_STATUS_OK);
+    CHECK(decoded.flags == 1u);
+    CHECK(decoded.request_id_len == 6);
+    CHECK(decoded.body_format == CMD_BODY_BINARY);
+    CHECK(decoded.body_len == 48);
+    CHECK(decoded.error_len == 0);
+    CHECK(decoded.row_count == 3);
+    CHECK(decoded.affected_count == 2);
+    CHECK(tcp_binary_validate_response_header(&decoded) == 1);
+    return 0;
+}
+
+static int test_binary_request_frame_decode(void) {
+    TCPBinaryRequestHeader header;
+    TCPBinaryDecodedRequest decoded;
+    unsigned char frame[128];
+    const char *request_id = "req-42";
+    const char *payload = "SELECT 1";
+    size_t header_size = tcp_binary_request_header_size();
+    size_t request_id_len = strlen(request_id);
+    size_t payload_len = strlen(payload);
+
+    tcp_binary_init_request_header(&header, TCP_BINARY_OP_SQL, request_id_len, payload_len);
+    memset(frame, 0, sizeof(frame));
+    tcp_binary_encode_request_header(frame, &header);
+    memcpy(frame + header_size, request_id, request_id_len);
+    memcpy(frame + header_size + request_id_len, payload, payload_len);
+
+    CHECK(tcp_binary_decode_request_frame(frame,
+                                          header_size + request_id_len + payload_len,
+                                          &decoded) == 1);
+    CHECK(decoded.header.op == TCP_BINARY_OP_SQL);
+    CHECK(memcmp(decoded.request_id, request_id, request_id_len) == 0);
+    CHECK(memcmp(decoded.payload, payload, payload_len) == 0);
+    return 0;
+}
+
+static int test_binary_header_rejects_invalid_values(void) {
+    TCPBinaryRequestHeader request_header;
+    TCPBinaryResponseHeader response_header;
+
+    tcp_binary_init_request_header(&request_header, TCP_BINARY_OP_SQL, 4, 16);
+    request_header.magic = 0;
+    CHECK(tcp_binary_validate_request_header(&request_header) == 0);
+
+    tcp_binary_init_response_header(&response_header,
+                                    CMD_STATUS_OK,
+                                    1,
+                                    CMD_BODY_TEXT,
+                                    4,
+                                    8,
+                                    0,
+                                    0,
+                                    0);
+    response_header.version = 99;
+    CHECK(tcp_binary_validate_response_header(&response_header) == 0);
+    return 0;
+}
+
+static int decoded_request_id_equals(const TCPBinaryDecodedResponse *decoded,
+                                     const char *expected) {
+    size_t len;
+
+    if (!decoded || !expected) return 0;
+    len = strlen(expected);
+    return decoded->header.request_id_len == len &&
+           memcmp(decoded->request_id, expected, len) == 0;
+}
+
+static int read_response_frame(int fd,
+                               unsigned char **out_frame,
+                               size_t *out_frame_len,
+                               TCPBinaryDecodedResponse *out_decoded) {
+    TCPBinaryResponseHeader header;
+    size_t header_size;
+    size_t frame_len;
+    unsigned char *frame;
+
+    if (out_frame) *out_frame = NULL;
+    if (out_frame_len) *out_frame_len = 0;
+    if (!out_frame || !out_frame_len || !out_decoded) return -1;
+
+    header_size = tcp_binary_response_header_size();
+    frame = (unsigned char *)calloc(header_size, 1);
+    if (!frame) return -1;
+    if (recv_all_client(fd, frame, header_size) != 0) {
+        free(frame);
+        return -1;
+    }
+    CHECK(tcp_binary_decode_response_header(frame, header_size, &header) == 1);
+    CHECK(tcp_binary_validate_response_header(&header) == 1);
+
+    frame_len = tcp_binary_response_frame_size(&header);
+    if (frame_len > header_size) {
+        unsigned char *grown = (unsigned char *)realloc(frame, frame_len);
+        CHECK(grown != NULL);
+        frame = grown;
+        CHECK(recv_all_client(fd, frame + header_size, frame_len - header_size) == 0);
+    }
+    CHECK(tcp_binary_decode_response_frame(frame, frame_len, out_decoded) == 1);
+    *out_frame = frame;
+    *out_frame_len = frame_len;
+    return 0;
 }
 
 static int expect_response_status(int fd,
                                   const char *id,
                                   const char *status,
                                   int ok) {
-    cJSON *root;
+    unsigned char *frame = NULL;
+    size_t frame_len = 0;
+    TCPBinaryDecodedResponse decoded;
 
-    root = read_json_response(fd);
-    CHECK(root != NULL);
-    CHECK(json_string_equals(root, "id", id));
-    CHECK(json_string_equals(root, "status", status));
-    CHECK(json_bool_equals(root, "ok", ok));
-    cJSON_Delete(root);
+    CHECK(read_response_frame(fd, &frame, &frame_len, &decoded) == 0);
+    CHECK(decoded_request_id_equals(&decoded, id));
+    CHECK(strcmp(cmd_status_to_string((CmdStatusCode)decoded.header.status), status) == 0);
+    CHECK((decoded.header.flags & 1u) == (ok ? 1u : 0u));
+    free(frame);
     return 0;
 }
 
 static int expect_two_ok_ids(int fd, const char *first_id, const char *second_id) {
-    cJSON *first;
-    cJSON *second;
+    unsigned char *first_frame = NULL;
+    unsigned char *second_frame = NULL;
+    size_t first_len = 0;
+    size_t second_len = 0;
+    TCPBinaryDecodedResponse first;
+    TCPBinaryDecodedResponse second;
     int saw_first;
     int saw_second;
 
-    first = read_json_response(fd);
-    second = read_json_response(fd);
-    CHECK(first != NULL);
-    CHECK(second != NULL);
-    CHECK(json_string_equals(first, "status", "OK"));
-    CHECK(json_string_equals(second, "status", "OK"));
-    CHECK(json_bool_equals(first, "ok", 1));
-    CHECK(json_bool_equals(second, "ok", 1));
+    CHECK(read_response_frame(fd, &first_frame, &first_len, &first) == 0);
+    CHECK(read_response_frame(fd, &second_frame, &second_len, &second) == 0);
+    CHECK(first.header.status == CMD_STATUS_OK);
+    CHECK(second.header.status == CMD_STATUS_OK);
+    CHECK((first.header.flags & 1u) == 1u);
+    CHECK((second.header.flags & 1u) == 1u);
 
-    saw_first = json_string_equals(first, "id", first_id) ||
-                json_string_equals(second, "id", first_id);
-    saw_second = json_string_equals(first, "id", second_id) ||
-                 json_string_equals(second, "id", second_id);
+    saw_first = decoded_request_id_equals(&first, first_id) ||
+                decoded_request_id_equals(&second, first_id);
+    saw_second = decoded_request_id_equals(&first, second_id) ||
+                 decoded_request_id_equals(&second, second_id);
     CHECK(saw_first);
     CHECK(saw_second);
 
-    cJSON_Delete(first);
-    cJSON_Delete(second);
+    free(first_frame);
+    free(second_frame);
     return 0;
 }
 
@@ -488,22 +652,22 @@ static int test_start_port_and_ping(void) {
     TCPCmdProcessor *server = NULL;
     int port;
     int fd;
-    cJSON *root;
-    cJSON *body;
+    unsigned char *frame = NULL;
+    size_t frame_len = 0;
+    TCPBinaryDecodedResponse decoded;
 
     CHECK(start_mock_server(&processor, &server, &port) == 0);
     fd = connect_client(port);
     CHECK(fd >= 0);
-    CHECK(send_line(fd, "{\"id\":\"p1\",\"op\":\"ping\"}") == 0);
-    root = read_json_response(fd);
-    CHECK(root != NULL);
-    CHECK(json_string_equals(root, "id", "p1"));
-    CHECK(json_string_equals(root, "status", "OK"));
-    CHECK(json_bool_equals(root, "ok", 1));
-    body = cJSON_GetObjectItemCaseSensitive(root, "body");
-    CHECK(cJSON_IsString(body));
-    CHECK(strcmp(body->valuestring, "pong") == 0);
-    cJSON_Delete(root);
+    CHECK(send_ping_request(fd, "p1") == 0);
+    CHECK(read_response_frame(fd, &frame, &frame_len, &decoded) == 0);
+    CHECK(decoded_request_id_equals(&decoded, "p1"));
+    CHECK(decoded.header.status == CMD_STATUS_OK);
+    CHECK((decoded.header.flags & 1u) == 1u);
+    CHECK(decoded.header.body_format == CMD_BODY_TEXT);
+    CHECK(decoded.header.body_len == 4);
+    CHECK(memcmp(decoded.body, "pong", 4) == 0);
+    free(frame);
     close(fd);
     tcp_cmd_processor_stop(server);
     cmd_processor_shutdown(processor);
@@ -515,30 +679,39 @@ static int test_sql_and_multiple_requests(void) {
     TCPCmdProcessor *server = NULL;
     int port;
     int fd;
-    cJSON *first;
-    cJSON *second;
+    unsigned char *first_frame = NULL;
+    unsigned char *second_frame = NULL;
+    size_t first_len = 0;
+    size_t second_len = 0;
+    TCPBinaryDecodedResponse first;
+    TCPBinaryDecodedResponse second;
     cJSON *body;
 
     CHECK(start_mock_server(&processor, &server, &port) == 0);
     fd = connect_client(port);
     CHECK(fd >= 0);
-    CHECK(send_line(fd, "{\"id\":\"s1\",\"op\":\"sql\",\"sql\":\"SELECT 1;\"}") == 0);
-    CHECK(send_line(fd, "{\"id\":\"p2\",\"op\":\"ping\"}") == 0);
+    CHECK(send_sql_request(fd, "s1", "SELECT 1;") == 0);
+    CHECK(send_ping_request(fd, "p2") == 0);
 
-    first = read_json_response(fd);
-    second = read_json_response(fd);
-    CHECK(first != NULL);
-    CHECK(second != NULL);
-    CHECK(json_string_equals(first, "id", "s1"));
-    CHECK(json_string_equals(first, "status", "OK"));
-    body = cJSON_GetObjectItemCaseSensitive(first, "body");
+    CHECK(read_response_frame(fd, &first_frame, &first_len, &first) == 0);
+    CHECK(read_response_frame(fd, &second_frame, &second_len, &second) == 0);
+    CHECK(decoded_request_id_equals(&first, "s1"));
+    CHECK(first.header.status == CMD_STATUS_OK);
+    CHECK(first.header.body_format == CMD_BODY_JSON);
+    body = cJSON_ParseWithLength((const char *)first.body, first.header.body_len);
+    CHECK(body != NULL);
     CHECK(cJSON_IsObject(body));
-    CHECK(json_string_equals(body, "sql", "SELECT 1"));
-    CHECK(json_string_equals(second, "id", "p2"));
-    CHECK(json_string_equals(second, "status", "OK"));
+    {
+        cJSON *sql = cJSON_GetObjectItemCaseSensitive(body, "sql");
+        CHECK(cJSON_IsString(sql));
+        CHECK(strcmp(sql->valuestring, "SELECT 1") == 0);
+    }
+    cJSON_Delete(body);
+    CHECK(decoded_request_id_equals(&second, "p2"));
+    CHECK(second.header.status == CMD_STATUS_OK);
 
-    cJSON_Delete(first);
-    cJSON_Delete(second);
+    free(first_frame);
+    free(second_frame);
     close(fd);
     tcp_cmd_processor_stop(server);
     cmd_processor_shutdown(processor);
@@ -550,15 +723,31 @@ static int test_batched_requests_in_one_send(void) {
     TCPCmdProcessor *server = NULL;
     int port;
     int fd;
-    const char *payload =
-        "{\"id\":\"b1\",\"op\":\"ping\"}\n"
-        "{\"id\":\"b2\",\"op\":\"ping\"}\n"
-        "{\"id\":\"b3\",\"op\":\"ping\"}\n";
+    unsigned char *batch = NULL;
+    size_t batch_len = 0;
+    const char *ids[] = { "b1", "b2", "b3" };
+    int i;
 
     CHECK(start_mock_server(&processor, &server, &port) == 0);
     fd = connect_client(port);
     CHECK(fd >= 0);
-    CHECK(send_all_client(fd, payload, strlen(payload)) == 0);
+    for (i = 0; i < 3; i++) {
+        TCPBinaryRequestHeader header;
+        size_t header_size = tcp_binary_request_header_size();
+        size_t id_len = strlen(ids[i]);
+        size_t frame_len;
+        unsigned char *next;
+        tcp_binary_init_request_header(&header, TCP_BINARY_OP_PING, id_len, 0);
+        frame_len = tcp_binary_request_frame_size(&header);
+        next = (unsigned char *)realloc(batch, batch_len + frame_len);
+        CHECK(next != NULL);
+        batch = next;
+        tcp_binary_encode_request_header(batch + batch_len, &header);
+        memcpy(batch + batch_len + header_size, ids[i], id_len);
+        batch_len += frame_len;
+    }
+    CHECK(send_all_client(fd, (const char *)batch, batch_len) == 0);
+    free(batch);
     CHECK(expect_response_status(fd, "b1", "OK", 1) == 0);
     CHECK(expect_response_status(fd, "b2", "OK", 1) == 0);
     CHECK(expect_response_status(fd, "b3", "OK", 1) == 0);
@@ -579,15 +768,21 @@ static int test_invalid_requests(void) {
     fd = connect_client(port);
     CHECK(fd >= 0);
 
-    CHECK(send_line(fd, "{bad json") == 0);
+    {
+        TCPBinaryRequestHeader bad_header;
+        unsigned char bytes[32];
+        tcp_binary_init_request_header(&bad_header, TCP_BINARY_OP_PING, 0, 0);
+        bad_header.magic = 0;
+        memset(bytes, 0, sizeof(bytes));
+        tcp_binary_encode_request_header(bytes, &bad_header);
+        CHECK(send_all_client(fd, (const char *)bytes, tcp_binary_request_header_size()) == 0);
+    }
     CHECK(expect_response_status(fd, "unknown", "BAD_REQUEST", 0) == 0);
-    CHECK(send_line(fd, "{\"op\":\"ping\"}") == 0);
+    CHECK(send_request_frame(fd, TCP_BINARY_OP_PING, "", NULL, 0) == 0);
     CHECK(expect_response_status(fd, "unknown", "BAD_REQUEST", 0) == 0);
-    CHECK(send_line(fd, "{\"id\":\"m1\"}") == 0);
-    CHECK(expect_response_status(fd, "m1", "BAD_REQUEST", 0) == 0);
-    CHECK(send_line(fd, "{\"id\":\"u1\",\"op\":\"unknown\"}") == 0);
-    CHECK(expect_response_status(fd, "u1", "BAD_REQUEST", 0) == 0);
-    CHECK(send_line(fd, "{\"id\":\"s1\",\"op\":\"sql\"}") == 0);
+    CHECK(send_request_frame(fd, (TCPBinaryOp)99, "u1", NULL, 0) == 0);
+    CHECK(expect_response_status(fd, "unknown", "BAD_REQUEST", 0) == 0);
+    CHECK(send_request_frame(fd, TCP_BINARY_OP_SQL, "s1", NULL, 0) == 0);
     CHECK(expect_response_status(fd, "s1", "BAD_REQUEST", 0) == 0);
 
     close(fd);
@@ -602,7 +797,7 @@ static int test_close_only_current_connection(void) {
     int port;
     int first_fd;
     int second_fd;
-    char line[256];
+    unsigned char peek;
 
     CHECK(start_mock_server(&processor, &server, &port) == 0);
     first_fd = connect_client(port);
@@ -610,11 +805,11 @@ static int test_close_only_current_connection(void) {
     CHECK(first_fd >= 0);
     CHECK(second_fd >= 0);
 
-    CHECK(send_line(first_fd, "{\"id\":\"c1\",\"op\":\"close\"}") == 0);
+    CHECK(send_close_request(first_fd, "c1") == 0);
     CHECK(expect_response_status(first_fd, "c1", "OK", 1) == 0);
-    CHECK(read_line(first_fd, line, sizeof(line)) < 0);
+    CHECK(recv(first_fd, &peek, 1, 0) <= 0);
 
-    CHECK(send_line(second_fd, "{\"id\":\"p2\",\"op\":\"ping\"}") == 0);
+    CHECK(send_ping_request(second_fd, "p2") == 0);
     CHECK(expect_response_status(second_fd, "p2", "OK", 1) == 0);
 
     close(first_fd);
@@ -631,22 +826,22 @@ static int test_connection_limit_per_client(void) {
     int first_fd;
     int second_fd;
     int third_fd;
-    char line[256];
+    unsigned char peek;
 
     CHECK(start_mock_server(&processor, &server, &port) == 0);
     first_fd = connect_client(port);
     second_fd = connect_client(port);
     CHECK(first_fd >= 0);
     CHECK(second_fd >= 0);
-    CHECK(send_line(first_fd, "{\"id\":\"p1\",\"op\":\"ping\"}") == 0);
-    CHECK(send_line(second_fd, "{\"id\":\"p2\",\"op\":\"ping\"}") == 0);
+    CHECK(send_ping_request(first_fd, "p1") == 0);
+    CHECK(send_ping_request(second_fd, "p2") == 0);
     CHECK(expect_response_status(first_fd, "p1", "OK", 1) == 0);
     CHECK(expect_response_status(second_fd, "p2", "OK", 1) == 0);
 
     third_fd = connect_client(port);
     CHECK(third_fd >= 0);
-    (void)send_line(third_fd, "{\"id\":\"p3\",\"op\":\"ping\"}");
-    CHECK(read_line(third_fd, line, sizeof(line)) < 0);
+    (void)send_ping_request(third_fd, "p3");
+    CHECK(recv(third_fd, &peek, 1, 0) <= 0);
 
     close(first_fd);
     close(second_fd);
@@ -663,8 +858,12 @@ static int test_inflight_per_connection_limit_and_out_of_order(void) {
     TCPCmdProcessorConfig config;
     int port;
     int fd;
-    cJSON *first;
-    cJSON *second;
+    unsigned char *first_frame = NULL;
+    unsigned char *second_frame = NULL;
+    size_t first_len = 0;
+    size_t second_len = 0;
+    TCPBinaryDecodedResponse first;
+    TCPBinaryDecodedResponse second;
 
     CHECK(delayed_processor_create(&processor, &state) == 0);
     tcp_cmd_processor_config_init(&config, processor);
@@ -674,24 +873,22 @@ static int test_inflight_per_connection_limit_and_out_of_order(void) {
     fd = connect_client(port);
     CHECK(fd >= 0);
 
-    CHECK(send_line(fd, "{\"id\":\"r1\",\"op\":\"sql\",\"sql\":\"delay-first\"}") == 0);
-    CHECK(send_line(fd, "{\"id\":\"r2\",\"op\":\"sql\",\"sql\":\"fast-second\"}") == 0);
+    CHECK(send_sql_request(fd, "r1", "delay-first") == 0);
+    CHECK(send_sql_request(fd, "r2", "fast-second") == 0);
     CHECK(delayed_wait_pending(state, 2));
-    CHECK(send_line(fd, "{\"id\":\"r3\",\"op\":\"sql\",\"sql\":\"third\"}") == 0);
+    CHECK(send_sql_request(fd, "r3", "third") == 0);
     CHECK(expect_response_status(fd, "r3", "BUSY", 0) == 0);
 
     delayed_release_all(state);
-    first = read_json_response(fd);
-    second = read_json_response(fd);
-    CHECK(first != NULL);
-    CHECK(second != NULL);
-    CHECK(json_string_equals(first, "id", "r2"));
-    CHECK(json_string_equals(second, "id", "r1"));
-    CHECK(json_string_equals(first, "status", "OK"));
-    CHECK(json_string_equals(second, "status", "OK"));
+    CHECK(read_response_frame(fd, &first_frame, &first_len, &first) == 0);
+    CHECK(read_response_frame(fd, &second_frame, &second_len, &second) == 0);
+    CHECK(decoded_request_id_equals(&first, "r2"));
+    CHECK(decoded_request_id_equals(&second, "r1"));
+    CHECK(first.header.status == CMD_STATUS_OK);
+    CHECK(second.header.status == CMD_STATUS_OK);
 
-    cJSON_Delete(first);
-    cJSON_Delete(second);
+    free(first_frame);
+    free(second_frame);
     close(fd);
     tcp_cmd_processor_stop(server);
     cmd_processor_shutdown(processor);
@@ -717,12 +914,12 @@ static int test_inflight_per_client_limit(void) {
     CHECK(first_fd >= 0);
     CHECK(second_fd >= 0);
 
-    CHECK(send_line(first_fd, "{\"id\":\"a1\",\"op\":\"sql\",\"sql\":\"one\"}") == 0);
-    CHECK(send_line(first_fd, "{\"id\":\"a2\",\"op\":\"sql\",\"sql\":\"two\"}") == 0);
+    CHECK(send_sql_request(first_fd, "a1", "one") == 0);
+    CHECK(send_sql_request(first_fd, "a2", "two") == 0);
     CHECK(delayed_wait_pending(state, 2));
-    CHECK(send_line(second_fd, "{\"id\":\"b1\",\"op\":\"sql\",\"sql\":\"three\"}") == 0);
+    CHECK(send_sql_request(second_fd, "b1", "three") == 0);
     CHECK(delayed_wait_pending(state, 3));
-    CHECK(send_line(second_fd, "{\"id\":\"b2\",\"op\":\"sql\",\"sql\":\"four\"}") == 0);
+    CHECK(send_sql_request(second_fd, "b2", "four") == 0);
     CHECK(expect_response_status(second_fd, "b2", "BUSY", 0) == 0);
 
     delayed_release_all(state);
@@ -737,6 +934,10 @@ static int test_inflight_per_client_limit(void) {
 }
 
 int main(void) {
+    CHECK(test_binary_request_header_roundtrip() == 0);
+    CHECK(test_binary_response_header_roundtrip() == 0);
+    CHECK(test_binary_request_frame_decode() == 0);
+    CHECK(test_binary_header_rejects_invalid_values() == 0);
     CHECK(test_start_port_and_ping() == 0);
     CHECK(test_sql_and_multiple_requests() == 0);
     CHECK(test_batched_requests_in_one_send() == 0);

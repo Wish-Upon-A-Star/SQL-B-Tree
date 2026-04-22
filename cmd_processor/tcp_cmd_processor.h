@@ -35,6 +35,10 @@
 #define TCP_MAX_LINE_BYTES 8192
 #endif
 
+#ifndef TCP_MAX_FRAME_BYTES
+#define TCP_MAX_FRAME_BYTES 1048576
+#endif
+
 #ifndef TCP_READ_TIMEOUT_MS
 #define TCP_READ_TIMEOUT_MS 30000
 #endif

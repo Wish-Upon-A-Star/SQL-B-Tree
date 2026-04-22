@@ -1,10 +1,12 @@
 #include "tcp_cmd_processor.h"
+#include "tcp_protocol_binary.h"
 
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -25,12 +27,16 @@
 #define TCP_READ_BUFFER_BYTES 65536
 #endif
 
-#ifndef TCP_JSON_INLINE_BYTES
-#define TCP_JSON_INLINE_BYTES 16384
-#endif
-
 #ifndef TCP_SOCKET_BUFFER_BYTES
 #define TCP_SOCKET_BUFFER_BYTES 1048576
+#endif
+
+#ifndef TCP_MAX_OUTBOUND_FRAMES
+#define TCP_MAX_OUTBOUND_FRAMES 256
+#endif
+
+#ifndef TCP_MAX_OUTBOUND_BYTES
+#define TCP_MAX_OUTBOUND_BYTES (4u * 1024u * 1024u)
 #endif
 
 typedef struct TCPInflightId {
@@ -45,10 +51,18 @@ typedef struct TCPClientCounter {
     struct TCPClientCounter *next;
 } TCPClientCounter;
 
+typedef struct TCPOutboundFrame {
+    unsigned char *data;
+    size_t len;
+    struct TCPOutboundFrame *next;
+} TCPOutboundFrame;
+
 typedef struct TCPConnection {
     int client_fd;
+    int wake_fds[2];
     char client_key[TCP_CLIENT_KEY_BYTES];
     int closing;
+    int close_after_flush;
     size_t inflight_count;
     size_t ref_count;
     size_t read_start;
@@ -56,7 +70,12 @@ typedef struct TCPConnection {
     char read_buffer[TCP_READ_BUFFER_BYTES];
     pthread_t thread;
     pthread_mutex_t state_mutex;
+    pthread_mutex_t queue_mutex;
     pthread_mutex_t write_mutex;
+    TCPOutboundFrame *outbound_head;
+    TCPOutboundFrame *outbound_tail;
+    size_t outbound_count;
+    size_t outbound_bytes;
     TCPInflightId *inflight_ids;
     TCPInflightId *free_inflight_ids;
     TCPInflightId inflight_pool[TCP_MAX_INFLIGHT_PER_CONNECTION];
@@ -85,6 +104,7 @@ typedef enum {
 } TCPRequestOp;
 
 static void connection_release(TCPConnection *connection);
+static void notify_connection(TCPConnection *connection);
 
 static void copy_cstr(char *dst, size_t dst_size, const char *src) {
     size_t len;
@@ -235,6 +255,7 @@ static void connection_close_fd(TCPConnection *connection) {
         close(fd);
     }
     pthread_mutex_unlock(&connection->write_mutex);
+    notify_connection(connection);
 }
 
 static int connection_is_closing(TCPConnection *connection) {
@@ -244,6 +265,24 @@ static int connection_is_closing(TCPConnection *connection) {
     closing = connection->closing;
     pthread_mutex_unlock(&connection->state_mutex);
     return closing;
+}
+
+static void connection_request_close_after_flush(TCPConnection *connection) {
+    if (!connection) return;
+    pthread_mutex_lock(&connection->state_mutex);
+    connection->close_after_flush = 1;
+    pthread_mutex_unlock(&connection->state_mutex);
+    notify_connection(connection);
+}
+
+static int connection_should_close_after_flush(TCPConnection *connection) {
+    int should_close;
+
+    if (!connection) return 0;
+    pthread_mutex_lock(&connection->state_mutex);
+    should_close = connection->close_after_flush;
+    pthread_mutex_unlock(&connection->state_mutex);
+    return should_close;
 }
 
 static void remove_connection_from_server(TCPConnection *connection) {
@@ -269,15 +308,37 @@ static void free_inflight_list(TCPConnection *connection) {
     connection->free_inflight_ids = NULL;
 }
 
+static void free_outbound_frames(TCPConnection *connection) {
+    TCPOutboundFrame *frame;
+    TCPOutboundFrame *next;
+
+    if (!connection) return;
+    frame = connection->outbound_head;
+    while (frame) {
+        next = frame->next;
+        free(frame->data);
+        free(frame);
+        frame = next;
+    }
+    connection->outbound_head = NULL;
+    connection->outbound_tail = NULL;
+    connection->outbound_count = 0;
+    connection->outbound_bytes = 0;
+}
+
 static void connection_destroy(TCPConnection *connection) {
     if (!connection) return;
 
     connection_close_fd(connection);
     remove_connection_from_server(connection);
     release_connection_slot(connection->server, connection->client_key);
+    if (connection->wake_fds[0] >= 0) close(connection->wake_fds[0]);
+    if (connection->wake_fds[1] >= 0) close(connection->wake_fds[1]);
 
     free_inflight_list(connection);
+    free_outbound_frames(connection);
     pthread_mutex_destroy(&connection->state_mutex);
+    pthread_mutex_destroy(&connection->queue_mutex);
     pthread_mutex_destroy(&connection->write_mutex);
     free(connection);
 }
@@ -435,276 +496,174 @@ static int send_all(int fd, const char *data, size_t len) {
     return 0;
 }
 
-static int write_response_bytes(TCPConnection *connection, const char *data, size_t len) {
-    int fd = -1;
-    int rc = -1;
+static void notify_connection(TCPConnection *connection) {
+    unsigned char wake = 1;
+    int wake_fd = -1;
 
-    if (!connection || (!data && len != 0)) return -1;
-
-    pthread_mutex_lock(&connection->write_mutex);
+    if (!connection) return;
     pthread_mutex_lock(&connection->state_mutex);
-    if (!connection->closing && connection->client_fd >= 0) fd = connection->client_fd;
+    wake_fd = connection->wake_fds[1];
     pthread_mutex_unlock(&connection->state_mutex);
-
-    if (fd >= 0) {
-        if (send_all(fd, data, len) == 0) rc = 0;
+    if (wake_fd >= 0) {
+        (void)write(wake_fd, &wake, 1);
     }
+}
 
-    if (rc != 0) {
-        int close_fd = -1;
-        pthread_mutex_lock(&connection->state_mutex);
-        connection->closing = 1;
-        if (connection->client_fd >= 0) {
-            close_fd = connection->client_fd;
-            connection->client_fd = -1;
+static int enqueue_response_frame(TCPConnection *connection,
+                                  unsigned char *frame_bytes,
+                                  size_t frame_len) {
+    TCPOutboundFrame *frame;
+    int ok = 0;
+
+    if (!connection || !frame_bytes || frame_len == 0) return 0;
+    frame = (TCPOutboundFrame *)calloc(1, sizeof(*frame));
+    if (!frame) return 0;
+    frame->data = frame_bytes;
+    frame->len = frame_len;
+
+    pthread_mutex_lock(&connection->queue_mutex);
+    if (!connection->closing &&
+        connection->outbound_count < TCP_MAX_OUTBOUND_FRAMES &&
+        connection->outbound_bytes + frame_len <= TCP_MAX_OUTBOUND_BYTES) {
+        if (connection->outbound_tail) {
+            connection->outbound_tail->next = frame;
+        } else {
+            connection->outbound_head = frame;
         }
-        pthread_mutex_unlock(&connection->state_mutex);
-        if (close_fd >= 0) {
-            shutdown(close_fd, SHUT_RDWR);
-            close(close_fd);
-        }
+        connection->outbound_tail = frame;
+        connection->outbound_count++;
+        connection->outbound_bytes += frame_len;
+        ok = 1;
     }
+    pthread_mutex_unlock(&connection->queue_mutex);
 
-    pthread_mutex_unlock(&connection->write_mutex);
-    return rc;
-}
-
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-    char inline_data[TCP_JSON_INLINE_BYTES];
-} JSONBuffer;
-
-static void json_buffer_init(JSONBuffer *buffer) {
-    if (!buffer) return;
-    buffer->data = buffer->inline_data;
-    buffer->len = 0;
-    buffer->cap = sizeof(buffer->inline_data);
-    buffer->inline_data[0] = '\0';
-}
-
-static void json_buffer_destroy(JSONBuffer *buffer) {
-    if (!buffer) return;
-    if (buffer->data && buffer->data != buffer->inline_data) free(buffer->data);
-    buffer->data = buffer->inline_data;
-    buffer->len = 0;
-    buffer->cap = sizeof(buffer->inline_data);
-    buffer->inline_data[0] = '\0';
-}
-
-static int json_buffer_reserve(JSONBuffer *buffer, size_t extra) {
-    char *next;
-    size_t required;
-    size_t cap;
-
-    if (!buffer) return 0;
-    if (!buffer->data) json_buffer_init(buffer);
-    if (extra > ((size_t)-1) - buffer->len - 1) return 0;
-    required = buffer->len + extra + 1;
-    if (required <= buffer->cap) return 1;
-
-    cap = buffer->cap ? buffer->cap : 256;
-    while (cap < required) {
-        if (cap > ((size_t)-1) / 2) {
-            cap = required;
-            break;
-        }
-        cap *= 2;
-    }
-
-    if (buffer->data == buffer->inline_data) {
-        next = (char *)malloc(cap);
-        if (next && buffer->len > 0) memcpy(next, buffer->data, buffer->len);
-        if (next) next[buffer->len] = '\0';
-    } else {
-        next = (char *)realloc(buffer->data, cap);
-    }
-    if (!next) return 0;
-    buffer->data = next;
-    buffer->cap = cap;
-    return 1;
-}
-
-static int json_buffer_append_bytes(JSONBuffer *buffer, const char *data, size_t len) {
-    if (!buffer || (!data && len != 0)) return 0;
-    if (!json_buffer_reserve(buffer, len)) return 0;
-    if (len > 0) memcpy(buffer->data + buffer->len, data, len);
-    buffer->len += len;
-    buffer->data[buffer->len] = '\0';
-    return 1;
-}
-
-static int json_buffer_append_cstr(JSONBuffer *buffer, const char *text) {
-    return json_buffer_append_bytes(buffer, text, text ? strlen(text) : 0);
-}
-
-static int json_buffer_append_char(JSONBuffer *buffer, char ch) {
-    return json_buffer_append_bytes(buffer, &ch, 1);
-}
-
-static int json_buffer_append_int(JSONBuffer *buffer, int value) {
-    char scratch[32];
-    int len;
-
-    len = snprintf(scratch, sizeof(scratch), "%d", value);
-    if (len < 0) return 0;
-    return json_buffer_append_bytes(buffer, scratch, (size_t)len);
-}
-
-static int json_buffer_append_escaped(JSONBuffer *buffer, const char *text, size_t text_len) {
-    size_t i;
-    size_t chunk_start = 0;
-
-    if (!json_buffer_append_char(buffer, '"')) return 0;
-    for (i = 0; i < text_len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        const char *escape = NULL;
-        char unicode_escape[7];
-        int unicode_len = 0;
-
-        switch (ch) {
-            case '\\':
-                escape = "\\\\";
-                break;
-            case '"':
-                escape = "\\\"";
-                break;
-            case '\b':
-                escape = "\\b";
-                break;
-            case '\f':
-                escape = "\\f";
-                break;
-            case '\n':
-                escape = "\\n";
-                break;
-            case '\r':
-                escape = "\\r";
-                break;
-            case '\t':
-                escape = "\\t";
-                break;
-            default:
-                if (ch < 0x20) {
-                    unicode_len = snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04x", ch);
-                    if (unicode_len < 0) return 0;
-                }
-                break;
-        }
-
-        if (!escape && unicode_len == 0) continue;
-
-        if (i > chunk_start &&
-            !json_buffer_append_bytes(buffer, text + chunk_start, i - chunk_start)) {
-            return 0;
-        }
-        if (escape) {
-            if (!json_buffer_append_cstr(buffer, escape)) return 0;
-        } else if (!json_buffer_append_bytes(buffer,
-                                            unicode_escape,
-                                            (size_t)unicode_len)) {
-            return 0;
-        }
-        chunk_start = i + 1;
-    }
-    if (i > chunk_start &&
-        !json_buffer_append_bytes(buffer, text + chunk_start, i - chunk_start)) {
+    if (!ok) {
+        free(frame->data);
+        free(frame);
         return 0;
     }
-    return json_buffer_append_char(buffer, '"');
+    notify_connection(connection);
+    return 1;
 }
 
-static int json_buffer_append_field_prefix(JSONBuffer *buffer,
-                                           int *first_field,
-                                           const char *name) {
-    if (!buffer || !first_field || !name) return 0;
-    if (!*first_field && !json_buffer_append_char(buffer, ',')) return 0;
-    *first_field = 0;
-    if (!json_buffer_append_char(buffer, '"')) return 0;
-    if (!json_buffer_append_cstr(buffer, name)) return 0;
-    return json_buffer_append_cstr(buffer, "\":");
-}
+static TCPOutboundFrame *pop_outbound_frame(TCPConnection *connection) {
+    TCPOutboundFrame *frame;
 
-static int json_buffer_append_string_field(JSONBuffer *buffer,
-                                           int *first_field,
-                                           const char *name,
-                                           const char *value,
-                                           size_t value_len) {
-    if (!json_buffer_append_field_prefix(buffer, first_field, name)) return 0;
-    return json_buffer_append_escaped(buffer, value ? value : "", value ? value_len : 0);
-}
-
-static int json_buffer_append_bool_field(JSONBuffer *buffer,
-                                         int *first_field,
-                                         const char *name,
-                                         int value) {
-    if (!json_buffer_append_field_prefix(buffer, first_field, name)) return 0;
-    return json_buffer_append_cstr(buffer, value ? "true" : "false");
-}
-
-static int json_buffer_append_int_field(JSONBuffer *buffer,
-                                        int *first_field,
-                                        const char *name,
-                                        int value) {
-    if (!json_buffer_append_field_prefix(buffer, first_field, name)) return 0;
-    return json_buffer_append_int(buffer, value);
-}
-
-static int json_buffer_append_hex_string(JSONBuffer *buffer,
-                                         const char *data,
-                                         size_t len) {
-    static const char kHex[] = "0123456789abcdef";
-    size_t i;
-
-    if (!buffer || (!data && len != 0)) return 0;
-    if (len > ((size_t)-1) / 2) return 0;
-    if (!json_buffer_append_char(buffer, '"')) return 0;
-    if (!json_buffer_reserve(buffer, len * 2)) return 0;
-    for (i = 0; i < len; i++) {
-        unsigned char byte = (unsigned char)data[i];
-        buffer->data[buffer->len++] = kHex[(byte >> 4) & 0x0f];
-        buffer->data[buffer->len++] = kHex[byte & 0x0f];
+    if (!connection) return NULL;
+    pthread_mutex_lock(&connection->queue_mutex);
+    frame = connection->outbound_head;
+    if (frame) {
+        connection->outbound_head = frame->next;
+        if (!connection->outbound_head) connection->outbound_tail = NULL;
+        connection->outbound_count--;
+        connection->outbound_bytes -= frame->len;
+        frame->next = NULL;
     }
-    buffer->data[buffer->len] = '\0';
-    return json_buffer_append_char(buffer, '"');
+    pthread_mutex_unlock(&connection->queue_mutex);
+    return frame;
 }
 
-static int build_status_json(JSONBuffer *buffer,
-                             const char *request_id,
-                             CmdStatusCode status,
-                             const char *message) {
-    int first_field = 1;
-    int ok;
-    char error_message[TCP_ERROR_MESSAGE_MAX_BYTES + 1];
-    const char *id_text;
-    const char *status_text;
+static int flush_outbound_queue(TCPConnection *connection) {
+    TCPOutboundFrame *frame;
+    int fd = -1;
 
-    if (!buffer) return 0;
-    ok = status == CMD_STATUS_OK;
-    id_text = request_id ? request_id : "unknown";
-    status_text = cmd_status_to_string(status);
-    if (!json_buffer_append_char(buffer, '{')) return 0;
-    if (!json_buffer_append_string_field(buffer,
-                                         &first_field,
-                                         "id",
-                                         id_text,
-                                         strlen(id_text))) return 0;
-    if (!json_buffer_append_bool_field(buffer, &first_field, "ok", ok)) return 0;
-    if (!json_buffer_append_string_field(buffer,
-                                         &first_field,
-                                         "status",
-                                         status_text,
-                                         strlen(status_text))) return 0;
-    if (!ok) {
-        copy_cstr(error_message, sizeof(error_message), message ? message : "request failed");
-        if (!json_buffer_append_string_field(buffer,
-                                             &first_field,
-                                             "error",
-                                             error_message,
-                                             strlen(error_message))) return 0;
+    if (!connection) return -1;
+    while ((frame = pop_outbound_frame(connection)) != NULL) {
+        pthread_mutex_lock(&connection->write_mutex);
+        pthread_mutex_lock(&connection->state_mutex);
+        if (!connection->closing && connection->client_fd >= 0) fd = connection->client_fd;
+        else fd = -1;
+        pthread_mutex_unlock(&connection->state_mutex);
+
+        if (fd < 0 || send_all(fd, (const char *)frame->data, frame->len) != 0) {
+            pthread_mutex_unlock(&connection->write_mutex);
+            free(frame->data);
+            free(frame);
+            return -1;
+        }
+        pthread_mutex_unlock(&connection->write_mutex);
+        free(frame->data);
+        free(frame);
     }
-    if (!json_buffer_append_cstr(buffer, "}\n")) return 0;
+    return 0;
+}
+
+static void drain_connection_wakeup(TCPConnection *connection) {
+    unsigned char buffer[64];
+    int wake_fd = -1;
+
+    if (!connection) return;
+    pthread_mutex_lock(&connection->state_mutex);
+    if (!connection->closing) wake_fd = connection->wake_fds[0];
+    pthread_mutex_unlock(&connection->state_mutex);
+    if (wake_fd < 0) return;
+
+    while (1) {
+        ssize_t n = read(wake_fd, buffer, sizeof(buffer));
+        if (n > 0) continue;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        break;
+    }
+}
+
+static int build_response_frame(const char *request_id,
+                                CmdStatusCode status,
+                                int ok,
+                                CmdBodyFormat body_format,
+                                const char *body,
+                                size_t body_len,
+                                const char *error_message,
+                                int row_count,
+                                int affected_count,
+                                unsigned char **out_frame,
+                                size_t *out_len) {
+    TCPBinaryResponseHeader header;
+    unsigned char *frame;
+    size_t header_size;
+    size_t request_id_len;
+    size_t error_len = 0;
+    size_t frame_len;
+    unsigned char *cursor;
+
+    if (out_frame) *out_frame = NULL;
+    if (out_len) *out_len = 0;
+    if (!out_frame || !out_len) return 0;
+
+    request_id_len = request_id ? strlen(request_id) : 0;
+    if (request_id_len > TCP_REQUEST_ID_MAX_BYTES) return 0;
+    if (error_message) error_len = strlen(error_message);
+
+    tcp_binary_init_response_header(&header,
+                                    status,
+                                    ok,
+                                    body_format,
+                                    request_id_len,
+                                    body_len,
+                                    error_len,
+                                    row_count,
+                                    affected_count);
+    frame_len = tcp_binary_response_frame_size(&header);
+    header_size = tcp_binary_response_header_size();
+    frame = (unsigned char *)calloc(frame_len, 1);
+    if (!frame) return 0;
+
+    tcp_binary_encode_response_header(frame, &header);
+    cursor = frame + header_size;
+    if (request_id_len > 0) {
+        memcpy(cursor, request_id, request_id_len);
+        cursor += request_id_len;
+    }
+    if (body_len > 0) {
+        memcpy(cursor, body, body_len);
+        cursor += body_len;
+    }
+    if (error_len > 0) {
+        memcpy(cursor, error_message, error_len);
+    }
+
+    *out_frame = frame;
+    *out_len = frame_len;
     return 1;
 }
 
@@ -712,95 +671,60 @@ static int write_status_response(TCPConnection *connection,
                                  const char *request_id,
                                  CmdStatusCode status,
                                  const char *message) {
-    JSONBuffer buffer;
-    int rc = -1;
-
-    json_buffer_init(&buffer);
-    if (build_status_json(&buffer, request_id, status, message)) {
-        rc = write_response_bytes(connection, buffer.data, buffer.len);
+    unsigned char *frame = NULL;
+    size_t frame_len = 0;
+    if (!build_response_frame(request_id ? request_id : "unknown",
+                              status,
+                              status == CMD_STATUS_OK,
+                              CMD_BODY_NONE,
+                              NULL,
+                              0,
+                              status == CMD_STATUS_OK ? NULL : (message ? message : "request failed"),
+                              0,
+                              0,
+                              &frame,
+                              &frame_len)) {
+        return -1;
     }
-    json_buffer_destroy(&buffer);
-    return rc;
+    if (!enqueue_response_frame(connection, frame, frame_len)) {
+        free(frame);
+        return -1;
+    }
+    return 0;
 }
 
-static int build_cmd_response_json(JSONBuffer *buffer, CmdResponse *response) {
-    int first_field = 1;
-    const char *status_text;
-
-    if (!buffer || !response) return 0;
-    status_text = cmd_status_to_string(response->status);
-    if (!json_buffer_append_char(buffer, '{')) return 0;
-    if (!json_buffer_append_string_field(buffer,
-                                         &first_field,
-                                         "id",
-                                         response->request_id,
-                                         strlen(response->request_id))) return 0;
-    if (!json_buffer_append_bool_field(buffer,
-                                       &first_field,
-                                       "ok",
-                                       response->ok ? 1 : 0)) return 0;
-    if (!json_buffer_append_string_field(buffer,
-                                         &first_field,
-                                         "status",
-                                         status_text,
-                                         strlen(status_text))) return 0;
-    if (response->body_format == CMD_BODY_TEXT &&
-        !json_buffer_append_string_field(buffer,
-                                         &first_field,
-                                         "body_format",
-                                         "text",
-                                         4)) return 0;
-    if (response->body_format == CMD_BODY_JSON &&
-        !json_buffer_append_string_field(buffer,
-                                         &first_field,
-                                         "body_format",
-                                         "json",
-                                         4)) return 0;
-    if (response->body_format == CMD_BODY_BINARY &&
-        !json_buffer_append_string_field(buffer,
-                                         &first_field,
-                                         "body_format",
-                                         "binary",
-                                         6)) return 0;
-    if (response->row_count != 0 &&
-        !json_buffer_append_int_field(buffer,
-                                      &first_field,
-                                      "row_count",
-                                      response->row_count)) return 0;
-    if (response->affected_count != 0 &&
-        !json_buffer_append_int_field(buffer,
-                                      &first_field,
-                                      "affected_count",
-                                      response->affected_count)) return 0;
-
-    if (response->body && response->body_len > 0) {
-        if (response->body_format == CMD_BODY_TEXT) {
-            if (!json_buffer_append_string_field(buffer,
-                                                 &first_field,
-                                                 "body",
-                                                 response->body,
-                                                 response->body_len)) return 0;
-        } else if (response->body_format == CMD_BODY_JSON) {
-            if (!json_buffer_append_field_prefix(buffer, &first_field, "body")) return 0;
-            if (!json_buffer_append_bytes(buffer, response->body, response->body_len)) return 0;
-        } else if (response->body_format == CMD_BODY_BINARY) {
-            if (!json_buffer_append_field_prefix(buffer, &first_field, "body_hex")) return 0;
-            if (!json_buffer_append_hex_string(buffer,
-                                               response->body,
-                                               response->body_len)) return 0;
-        }
+static void send_status_or_close(TCPConnection *connection,
+                                 const char *request_id,
+                                 CmdStatusCode status,
+                                 const char *message) {
+    if (write_status_response(connection, request_id, status, message) != 0) {
+        connection_close_fd(connection);
     }
+}
 
-    if (!response->ok && response->error_message) {
-        if (!json_buffer_append_string_field(buffer,
-                                             &first_field,
-                                             "error",
-                                             response->error_message,
-                                             strlen(response->error_message))) return 0;
+static int write_cmd_response(TCPConnection *connection, CmdResponse *response) {
+    unsigned char *frame = NULL;
+    size_t frame_len = 0;
+
+    if (!response) return -1;
+    if (!build_response_frame(response->request_id,
+                              response->status,
+                              response->ok ? 1 : 0,
+                              response->body_format,
+                              response->body,
+                              response->body_len,
+                              response->error_message,
+                              response->row_count,
+                              response->affected_count,
+                              &frame,
+                              &frame_len)) {
+        return -1;
     }
-
-    if (!json_buffer_append_cstr(buffer, "}\n")) return 0;
-    return 1;
+    if (!enqueue_response_frame(connection, frame, frame_len)) {
+        free(frame);
+        return -1;
+    }
+    return 0;
 }
 
 static void tcp_response_callback(CmdProcessor *processor,
@@ -809,27 +733,21 @@ static void tcp_response_callback(CmdProcessor *processor,
                                   void *user_data) {
     TCPConnection *connection;
     const char *request_id;
-    JSONBuffer buffer;
 
     connection = (TCPConnection *)user_data;
     request_id = request ? request->request_id : (response ? response->request_id : "unknown");
 
     if (response) {
-        json_buffer_init(&buffer);
-        if (build_cmd_response_json(&buffer, response)) {
-            (void)write_response_bytes(connection, buffer.data, buffer.len);
-        } else {
-            (void)write_status_response(connection,
-                                        request_id,
-                                        CMD_STATUS_INTERNAL_ERROR,
-                                        "response serialization failed");
+        if (write_cmd_response(connection, response) != 0) {
+            connection_close_fd(connection);
         }
-        json_buffer_destroy(&buffer);
     } else {
-        (void)write_status_response(connection,
-                                    request_id,
-                                    CMD_STATUS_INTERNAL_ERROR,
-                                    "processor returned no response");
+        if (write_status_response(connection,
+                                  request_id,
+                                  CMD_STATUS_INTERNAL_ERROR,
+                                  "processor returned no response") != 0) {
+            connection_close_fd(connection);
+        }
     }
 
     remove_inflight(connection, request_id);
@@ -838,279 +756,166 @@ static void tcp_response_callback(CmdProcessor *processor,
     connection_release(connection);
 }
 
-static int read_json_line(TCPConnection *connection,
-                          char *buffer,
-                          size_t buffer_size,
-                          size_t *out_len,
-                          int *out_too_long) {
-    size_t len = 0;
-    int too_long = 0;
+static int connection_read_more(TCPConnection *connection) {
+    ssize_t n;
+    int fd;
 
-    if (out_len) *out_len = 0;
-    if (out_too_long) *out_too_long = 0;
-    if (!connection || !buffer || buffer_size == 0) return -1;
+    pthread_mutex_lock(&connection->state_mutex);
+    fd = connection->client_fd;
+    pthread_mutex_unlock(&connection->state_mutex);
+    if (fd < 0) return -1;
 
-    while (!connection_is_closing(connection)) {
-        while (connection->read_start < connection->read_end) {
-            char ch = connection->read_buffer[connection->read_start++];
-
-            if (ch == '\n') {
-                if (len > 0 && buffer[len - 1] == '\r') len--;
-                buffer[len] = '\0';
-                if (out_len) *out_len = len;
-                if (out_too_long) *out_too_long = too_long;
-                return too_long ? 1 : 0;
-            }
-
-            if (!too_long) {
-                if (len + 1 < buffer_size) {
-                    buffer[len++] = ch;
-                } else {
-                    too_long = 1;
-                }
-            }
-        }
-
-        {
-            ssize_t n;
-            int fd;
-
-            pthread_mutex_lock(&connection->state_mutex);
-            fd = connection->client_fd;
-            pthread_mutex_unlock(&connection->state_mutex);
-            if (fd < 0) return -1;
-
-            n = recv(fd, connection->read_buffer, sizeof(connection->read_buffer), 0);
-            if (n == 0) return -1;
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                return -1;
-            }
-            connection->read_start = 0;
-            connection->read_end = (size_t)n;
-        }
+    n = recv(fd, connection->read_buffer, sizeof(connection->read_buffer), 0);
+    if (n == 0) return -1;
+    if (n < 0) {
+        if (errno == EINTR) return 1;
+        return -1;
     }
-
-    return -1;
-}
-
-static int parse_op(const char *op_value, TCPRequestOp *out_op) {
-    if (strcmp(op_value, "sql") == 0) {
-        *out_op = TCP_REQUEST_OP_SQL;
-        return 1;
-    }
-    if (strcmp(op_value, "ping") == 0) {
-        *out_op = TCP_REQUEST_OP_PING;
-        return 1;
-    }
-    if (strcmp(op_value, "close") == 0) {
-        *out_op = TCP_REQUEST_OP_CLOSE;
-        return 1;
-    }
+    connection->read_start = 0;
+    connection->read_end = (size_t)n;
     return 0;
 }
 
-static const char *skip_json_ws(const char *cursor) {
-    while (cursor && *cursor && isspace((unsigned char)*cursor)) cursor++;
-    return cursor;
+static int read_exact_bytes(TCPConnection *connection,
+                            unsigned char *dst,
+                            size_t len) {
+    size_t copied = 0;
+
+    if (!connection || (!dst && len != 0)) return -1;
+    while (copied < len && !connection_is_closing(connection)) {
+        size_t available = connection->read_end - connection->read_start;
+        size_t chunk = len - copied;
+
+        if (available == 0) {
+            int rc = connection_read_more(connection);
+            if (rc > 0) continue;
+            if (rc < 0) return -1;
+            available = connection->read_end - connection->read_start;
+            if (available == 0) continue;
+        }
+        if (chunk > available) chunk = available;
+        memcpy(dst + copied, connection->read_buffer + connection->read_start, chunk);
+        connection->read_start += chunk;
+        copied += chunk;
+    }
+    return copied == len ? 0 : -1;
 }
 
-static int parse_hex_digit(char ch, unsigned value[static 1]) {
-    if (ch >= '0' && ch <= '9') {
-        *value = (unsigned)(ch - '0');
-        return 1;
+static int read_request_frame(TCPConnection *connection,
+                              unsigned char **out_frame,
+                              size_t *out_frame_len,
+                              TCPBinaryDecodedRequest *out_decoded) {
+    TCPBinaryRequestHeader header;
+    unsigned char *frame = NULL;
+    size_t header_size;
+    size_t frame_len;
+    int ok = 0;
+
+    if (out_frame) *out_frame = NULL;
+    if (out_frame_len) *out_frame_len = 0;
+    if (!out_frame || !out_frame_len || !out_decoded) return -1;
+
+    header_size = tcp_binary_request_header_size();
+    frame = (unsigned char *)calloc(header_size, 1);
+    if (!frame) return -1;
+    if (read_exact_bytes(connection, frame, header_size) != 0) goto cleanup;
+    if (!tcp_binary_decode_request_header(frame, header_size, &header)) goto cleanup;
+    if (!tcp_binary_validate_request_header(&header)) goto cleanup;
+
+    frame_len = tcp_binary_request_frame_size(&header);
+    if (frame_len > TCP_MAX_FRAME_BYTES || frame_len < header_size) goto cleanup;
+    if (frame_len > header_size) {
+        unsigned char *grown = (unsigned char *)realloc(frame, frame_len);
+        if (!grown) goto cleanup;
+        frame = grown;
+        if (read_exact_bytes(connection, frame + header_size, frame_len - header_size) != 0) goto cleanup;
     }
-    if (ch >= 'a' && ch <= 'f') {
-        *value = (unsigned)(10 + (ch - 'a'));
-        return 1;
-    }
-    if (ch >= 'A' && ch <= 'F') {
-        *value = (unsigned)(10 + (ch - 'A'));
-        return 1;
-    }
-    return 0;
+    if (!tcp_binary_decode_request_frame(frame, frame_len, out_decoded)) goto cleanup;
+    *out_frame = frame;
+    *out_frame_len = frame_len;
+    ok = 1;
+
+cleanup:
+    if (!ok) free(frame);
+    return ok ? 0 : -1;
 }
 
-static int parse_json_string_inplace(const char **cursor_ptr,
-                                     char **out_value,
-                                     size_t *out_len) {
-    const char *cursor;
-    const char *src;
-    char *dst;
-
-    if (out_value) *out_value = NULL;
-    if (out_len) *out_len = 0;
-    if (!cursor_ptr || !*cursor_ptr) return 0;
-
-    cursor = skip_json_ws(*cursor_ptr);
-    if (*cursor != '"') return 0;
-
-    src = cursor + 1;
-    dst = (char *)cursor;
-    while (*src) {
-        if (*src == '"') {
-            *dst = '\0';
-            src++;
-            if (out_value) *out_value = (char *)cursor;
-            if (out_len) *out_len = (size_t)(dst - (char *)cursor);
-            *cursor_ptr = src;
+static int decode_request_op(TCPBinaryOp op, TCPRequestOp *out_op) {
+    if (!out_op) return 0;
+    switch (op) {
+        case TCP_BINARY_OP_SQL:
+            *out_op = TCP_REQUEST_OP_SQL;
             return 1;
-        }
-        if (*src == '\\') {
-            src++;
-            if (*src == '\0') return 0;
-            switch (*src) {
-                case '"':
-                case '\\':
-                case '/':
-                    *dst++ = *src++;
-                    break;
-                case 'b':
-                    *dst++ = '\b';
-                    src++;
-                    break;
-                case 'f':
-                    *dst++ = '\f';
-                    src++;
-                    break;
-                case 'n':
-                    *dst++ = '\n';
-                    src++;
-                    break;
-                case 'r':
-                    *dst++ = '\r';
-                    src++;
-                    break;
-                case 't':
-                    *dst++ = '\t';
-                    src++;
-                    break;
-                case 'u': {
-                    unsigned codepoint = 0;
-                    unsigned digit;
-                    int i;
-                    src++;
-                    for (i = 0; i < 4; i++) {
-                        if (!parse_hex_digit(src[i], &digit)) return 0;
-                        codepoint = (codepoint << 4) | digit;
-                    }
-                    *dst++ = codepoint <= 0x7f ? (char)codepoint : '?';
-                    src += 4;
-                    break;
-                }
-                default:
-                    return 0;
-            }
-            continue;
-        }
-        *dst++ = *src++;
+        case TCP_BINARY_OP_PING:
+            *out_op = TCP_REQUEST_OP_PING;
+            return 1;
+        case TCP_BINARY_OP_CLOSE:
+            *out_op = TCP_REQUEST_OP_CLOSE;
+            return 1;
+        default:
+            return 0;
     }
-    return 0;
-}
-
-static int parse_request_line(char *line,
-                              char *request_id,
-                              size_t request_id_size,
-                              TCPRequestOp *out_op,
-                              char **out_sql) {
-    const char *cursor;
-    char *key;
-    char *value;
-    size_t key_len;
-    size_t value_len;
-    int saw_id = 0;
-    int saw_op = 0;
-
-    if (out_sql) *out_sql = NULL;
-    if (!line || !request_id || request_id_size == 0 || !out_op) return 0;
-
-    cursor = skip_json_ws(line);
-    if (*cursor != '{') return 0;
-    cursor = skip_json_ws(cursor + 1);
-    if (*cursor == '}') return 0;
-
-    while (*cursor) {
-        if (!parse_json_string_inplace(&cursor, &key, &key_len)) return 0;
-        cursor = skip_json_ws(cursor);
-        if (*cursor != ':') return 0;
-        cursor = skip_json_ws(cursor + 1);
-        if (!parse_json_string_inplace(&cursor, &value, &value_len)) return 0;
-
-        if (key_len == 2 && strcmp(key, "id") == 0) {
-            if (value_len == 0) return -2;
-            if (value_len > TCP_REQUEST_ID_MAX_BYTES) return -3;
-            copy_cstr(request_id, request_id_size, value);
-            saw_id = 1;
-        } else if (key_len == 2 && strcmp(key, "op") == 0) {
-            if (value_len > TCP_OP_MAX_BYTES || !parse_op(value, out_op)) return -4;
-            saw_op = 1;
-        } else if (key_len == 3 && strcmp(key, "sql") == 0) {
-            if (out_sql) *out_sql = value;
-        }
-
-        cursor = skip_json_ws(cursor);
-        if (*cursor == ',') {
-            cursor = skip_json_ws(cursor + 1);
-            continue;
-        }
-        if (*cursor == '}') {
-            cursor = skip_json_ws(cursor + 1);
-            if (*cursor != '\0') return 0;
-            break;
-        }
-        return 0;
-    }
-
-    if (!saw_id) return -5;
-    if (!saw_op) return -6;
-    return 1;
 }
 
 static void submit_parsed_request(TCPConnection *connection,
                                   const char *request_id,
                                   TCPRequestOp op,
-                                  const char *sql) {
+                                  const char *sql,
+                                  size_t sql_len) {
     CmdProcessor *processor;
     CmdRequest *cmd_request = NULL;
     CmdStatusCode status;
     const char *message;
     int submit_rc;
+    char *sql_copy = NULL;
 
     processor = connection->server->processor;
     if (!register_inflight(connection, request_id, &status, &message)) {
-        (void)write_status_response(connection, request_id, status, message);
+        send_status_or_close(connection, request_id, status, message);
         return;
     }
 
     if (cmd_processor_acquire_request(processor, &cmd_request) != 0) {
         remove_inflight(connection, request_id);
-        (void)write_status_response(connection,
-                                    request_id,
-                                    CMD_STATUS_INTERNAL_ERROR,
-                                    "request slot unavailable");
+        send_status_or_close(connection,
+                             request_id,
+                             CMD_STATUS_INTERNAL_ERROR,
+                             "request slot unavailable");
         return;
     }
 
     if (op == TCP_REQUEST_OP_SQL) {
-        status = cmd_processor_set_sql_request(processor, cmd_request, request_id, sql);
+        sql_copy = (char *)calloc(sql_len + 1, 1);
+        if (!sql_copy) {
+            cmd_processor_release_request(processor, cmd_request);
+            remove_inflight(connection, request_id);
+            send_status_or_close(connection,
+                                 request_id,
+                                 CMD_STATUS_INTERNAL_ERROR,
+                                 "request allocation failed");
+            return;
+        }
+        if (sql_len > 0) memcpy(sql_copy, sql, sql_len);
+        status = cmd_processor_set_sql_request(processor, cmd_request, request_id, sql_copy);
     } else {
         status = cmd_processor_set_ping_request(processor, cmd_request, request_id);
     }
+    free(sql_copy);
 
     if (status != CMD_STATUS_OK) {
         cmd_processor_release_request(processor, cmd_request);
         remove_inflight(connection, request_id);
-        (void)write_status_response(connection, request_id, status, "invalid request");
+        send_status_or_close(connection, request_id, status, "invalid request");
         return;
     }
 
     if (!connection_add_ref(connection)) {
         cmd_processor_release_request(processor, cmd_request);
         remove_inflight(connection, request_id);
-        (void)write_status_response(connection,
-                                    request_id,
-                                    CMD_STATUS_INTERNAL_ERROR,
-                                    "connection unavailable");
+        send_status_or_close(connection,
+                             request_id,
+                             CMD_STATUS_INTERNAL_ERROR,
+                             "connection unavailable");
         return;
     }
 
@@ -1122,127 +927,143 @@ static void submit_parsed_request(TCPConnection *connection,
         remove_inflight(connection, request_id);
         cmd_processor_release_request(processor, cmd_request);
         connection_release(connection);
-        (void)write_status_response(connection,
-                                    request_id,
-                                    CMD_STATUS_INTERNAL_ERROR,
-                                    "submit failed");
+        send_status_or_close(connection,
+                             request_id,
+                             CMD_STATUS_INTERNAL_ERROR,
+                             "submit failed");
     }
 }
 
-static void process_json_line(TCPConnection *connection,
-                              char *line,
-                              size_t line_len) {
+static void process_request_frame(TCPConnection *connection,
+                                  const TCPBinaryDecodedRequest *decoded) {
     char request_id[TCP_REQUEST_ID_MAX_BYTES + 1];
-    char *sql_value = NULL;
     TCPRequestOp op;
-    int parse_rc;
+    const char *sql_value = NULL;
+    size_t sql_len = 0;
 
-    (void)line_len;
+    if (!connection || !decoded) return;
     request_id[0] = '\0';
 
-    parse_rc = parse_request_line(line, request_id, sizeof(request_id), &op, &sql_value);
-    if (parse_rc == 0) {
-        (void)write_status_response(connection,
-                                    "unknown",
-                                    CMD_STATUS_BAD_REQUEST,
-                                    "invalid JSON object");
+    if (decoded->header.request_id_len == 0) {
+        send_status_or_close(connection,
+                             "unknown",
+                             CMD_STATUS_BAD_REQUEST,
+                             "empty id");
         return;
     }
-    if (parse_rc == -5) {
-        (void)write_status_response(connection,
-                                    "unknown",
-                                    CMD_STATUS_BAD_REQUEST,
-                                    "missing id");
+    if (decoded->header.request_id_len > TCP_REQUEST_ID_MAX_BYTES) {
+        send_status_or_close(connection,
+                             "unknown",
+                             CMD_STATUS_BAD_REQUEST,
+                             "id too long");
         return;
     }
-    if (parse_rc == -2) {
-        (void)write_status_response(connection,
-                                    "",
-                                    CMD_STATUS_BAD_REQUEST,
-                                    "empty id");
+    memcpy(request_id, decoded->request_id, decoded->header.request_id_len);
+    request_id[decoded->header.request_id_len] = '\0';
+
+    if (!decode_request_op((TCPBinaryOp)decoded->header.op, &op)) {
+        send_status_or_close(connection,
+                             request_id,
+                             CMD_STATUS_BAD_REQUEST,
+                             "unknown op");
         return;
     }
-    if (parse_rc == -3) {
-        (void)write_status_response(connection,
-                                    "unknown",
-                                    CMD_STATUS_BAD_REQUEST,
-                                    "id too long");
-        return;
-    }
-    if (parse_rc == -6) {
-        (void)write_status_response(connection,
-                                    request_id,
-                                    CMD_STATUS_BAD_REQUEST,
-                                    "missing op");
-        return;
-    }
-    if (parse_rc == -4) {
-        (void)write_status_response(connection,
-                                    request_id,
-                                    CMD_STATUS_BAD_REQUEST,
-                                    "unknown op");
-        return;
-    }
-    if (parse_rc <= 0) return;
 
     if (op == TCP_REQUEST_OP_CLOSE) {
-        (void)write_status_response(connection, request_id, CMD_STATUS_OK, NULL);
-        connection_close_fd(connection);
+        if (write_status_response(connection, request_id, CMD_STATUS_OK, NULL) != 0) {
+            connection_close_fd(connection);
+            return;
+        }
+        connection_request_close_after_flush(connection);
         return;
     }
 
     if (op == TCP_REQUEST_OP_SQL) {
-        if (!sql_value) {
-            (void)write_status_response(connection,
-                                        request_id,
-                                        CMD_STATUS_BAD_REQUEST,
-                                        "missing sql");
+        sql_len = decoded->header.payload_len;
+        if (sql_len == 0 || !decoded->payload) {
+            send_status_or_close(connection,
+                                 request_id,
+                                 CMD_STATUS_BAD_REQUEST,
+                                 "missing sql");
             return;
         }
-        if (strlen(sql_value) > connection->server->processor->context->max_sql_len) {
-            (void)write_status_response(connection,
-                                        request_id,
-                                        CMD_STATUS_SQL_TOO_LONG,
-                                        "sql too long");
+        if (sql_len > connection->server->processor->context->max_sql_len) {
+            send_status_or_close(connection,
+                                 request_id,
+                                 CMD_STATUS_SQL_TOO_LONG,
+                                 "sql too long");
             return;
         }
+        sql_value = (const char *)decoded->payload;
     }
 
-    submit_parsed_request(connection, request_id, op, sql_value);
+    submit_parsed_request(connection, request_id, op, sql_value, sql_len);
 }
 
 static void *connection_thread_main(void *arg) {
     TCPConnection *connection;
-    char *line;
-    size_t line_len;
-    int too_long;
+    unsigned char *frame = NULL;
+    size_t frame_len = 0;
+    TCPBinaryDecodedRequest decoded;
+    struct pollfd fds[2];
+    int fd_count;
 
     connection = (TCPConnection *)arg;
-    line = (char *)calloc(TCP_MAX_LINE_BYTES + 1, 1);
-    if (!line) {
-        connection_close_fd(connection);
-        connection_release(connection);
-        return NULL;
-    }
 
     while (!connection_is_closing(connection)) {
-        int rc = read_json_line(connection,
-                                line,
-                                TCP_MAX_LINE_BYTES + 1,
-                                &line_len,
-                                &too_long);
-        if (rc < 0) break;
-        if (too_long) {
-            (void)write_status_response(connection,
-                                        "unknown",
-                                        CMD_STATUS_BAD_REQUEST,
-                                        "line too long");
+        int client_fd;
+        int wake_fd;
+
+        if (flush_outbound_queue(connection) != 0) break;
+        if (connection_should_close_after_flush(connection)) break;
+
+        pthread_mutex_lock(&connection->state_mutex);
+        client_fd = connection->client_fd;
+        wake_fd = connection->wake_fds[0];
+        pthread_mutex_unlock(&connection->state_mutex);
+        if (client_fd < 0) break;
+
+        fd_count = 0;
+        fds[fd_count].fd = client_fd;
+        fds[fd_count].events = POLLIN;
+        fds[fd_count].revents = 0;
+        fd_count++;
+        if (wake_fd >= 0) {
+            fds[fd_count].fd = wake_fd;
+            fds[fd_count].events = POLLIN;
+            fds[fd_count].revents = 0;
+            fd_count++;
+        }
+
+        if (poll(fds, (nfds_t)fd_count, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (fd_count > 1 && (fds[1].revents & (POLLIN | POLLHUP))) {
+            drain_connection_wakeup(connection);
             continue;
         }
-        process_json_line(connection, line, line_len);
+        if ((fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) break;
+        if ((fds[0].revents & POLLIN) == 0) continue;
+
+        if (read_request_frame(connection, &frame, &frame_len, &decoded) != 0) {
+            send_status_or_close(connection,
+                                 "unknown",
+                                 CMD_STATUS_BAD_REQUEST,
+                                 "invalid frame");
+            if (flush_outbound_queue(connection) != 0) {
+                break;
+            }
+            continue;
+        }
+        process_request_frame(connection, &decoded);
+        free(frame);
+        frame = NULL;
+        frame_len = 0;
     }
 
-    free(line);
+    (void)flush_outbound_queue(connection);
+    free(frame);
     connection_close_fd(connection);
     connection_release(connection);
     return NULL;
@@ -1269,10 +1090,13 @@ static TCPConnection *create_connection(TCPCmdProcessor *server,
                                         int client_fd,
                                         const char *client_key) {
     TCPConnection *connection;
+    int wake_fds[2] = { -1, -1 };
 
     connection = (TCPConnection *)calloc(1, sizeof(*connection));
     if (!connection) return NULL;
 
+    connection->wake_fds[0] = -1;
+    connection->wake_fds[1] = -1;
     connection->client_fd = client_fd;
     connection->server = server;
     connection->ref_count = 1;
@@ -1282,11 +1106,36 @@ static TCPConnection *create_connection(TCPCmdProcessor *server,
         free(connection);
         return NULL;
     }
-    if (pthread_mutex_init(&connection->write_mutex, NULL) != 0) {
+    if (pthread_mutex_init(&connection->queue_mutex, NULL) != 0) {
         pthread_mutex_destroy(&connection->state_mutex);
         free(connection);
         return NULL;
     }
+    if (pthread_mutex_init(&connection->write_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&connection->queue_mutex);
+        pthread_mutex_destroy(&connection->state_mutex);
+        free(connection);
+        return NULL;
+    }
+    if (pipe(wake_fds) != 0) {
+        pthread_mutex_destroy(&connection->write_mutex);
+        pthread_mutex_destroy(&connection->queue_mutex);
+        pthread_mutex_destroy(&connection->state_mutex);
+        free(connection);
+        return NULL;
+    }
+    if (fcntl(wake_fds[0], F_SETFL, O_NONBLOCK) != 0 ||
+        fcntl(wake_fds[1], F_SETFL, O_NONBLOCK) != 0) {
+        close(wake_fds[0]);
+        close(wake_fds[1]);
+        pthread_mutex_destroy(&connection->write_mutex);
+        pthread_mutex_destroy(&connection->queue_mutex);
+        pthread_mutex_destroy(&connection->state_mutex);
+        free(connection);
+        return NULL;
+    }
+    connection->wake_fds[0] = wake_fds[0];
+    connection->wake_fds[1] = wake_fds[1];
 
     pthread_mutex_lock(&server->mutex);
     connection->next = server->connections;
@@ -1409,16 +1258,17 @@ static int validate_config(const TCPCmdProcessorConfig *config) {
         TCP_MAX_CONNECTIONS_PER_CLIENT <= 0 ||
         TCP_MAX_INFLIGHT_PER_CONNECTION <= 0 ||
         TCP_MAX_INFLIGHT_PER_CLIENT <= 0 ||
-        TCP_MAX_LINE_BYTES <= 0 ||
+        TCP_MAX_FRAME_BYTES <= 0 ||
         TCP_REQUEST_ID_MAX_BYTES <= 0 ||
-        TCP_OP_MAX_BYTES <= 0 ||
-        TCP_ERROR_MESSAGE_MAX_BYTES <= 0) {
+        TCP_MAX_OUTBOUND_FRAMES <= 0 ||
+        TCP_MAX_OUTBOUND_BYTES == 0) {
         return 0;
     }
     if (TCP_REQUEST_ID_MAX_BYTES >= (int)sizeof(((CmdRequest *)0)->request_id)) return 0;
     if (TCP_MAX_CONNECTIONS_PER_CLIENT > TCP_MAX_CONNECTIONS_TOTAL) return 0;
     if (TCP_MAX_INFLIGHT_PER_CONNECTION > TCP_MAX_INFLIGHT_PER_CLIENT) return 0;
-    if (TCP_MAX_LINE_BYTES < config->processor->context->max_sql_len) return 0;
+    if (TCP_MAX_FRAME_BYTES < tcp_binary_request_header_size()) return 0;
+    if (TCP_MAX_FRAME_BYTES < config->processor->context->max_sql_len) return 0;
     return 1;
 }
 
