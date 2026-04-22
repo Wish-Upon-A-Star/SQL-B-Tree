@@ -1,4 +1,4 @@
-# 미니 DBMS - API 서버
+﻿# 미니 DBMS - API 서버
 
 이 프로젝트는 **C로 구현한 미니 DBMS - API 서버**다. 외부 클라이언트가 TCP socket으로 JSONL 요청을 보내면, 서버는 그 요청을 내부 DB 엔진으로 전달하고 기존 SQL 처리기와 B+ Tree 인덱스로 결과를 반환한다.
 
@@ -61,11 +61,9 @@ API가 요청을 동시에 받아들이면, DB 계층은 공유 데이터에 대
 
 ### DB단 동시성 처리
 
-API 동시성과 공존한다. 이 장에서는 queue, worker, lock plan, `engine_mutex`를 거쳐 SQL이 실행되는 흐름을 설명한다.
+API 동시성과 공존한다. queue, worker, lock plan, engine_mutex를 거쳐 SQL이 실행되는 흐름이다.
 
-![DB 동시성 처리 흐름](docs/sijun-yang/diagrams/readme_db_concurrency_flow.svg)
-
-DOT 원본: [readme_db_concurrency_flow.dot](docs/sijun-yang/diagrams/readme_db_concurrency_flow.dot)
+![Worker count별 DB 처리량](docs/sijun-yang/diagrams/bench_worker_scale_results.svg)
 
 - API에서 넘어온 SQL은 바로 실행되지 않고, EngineCmdProcessor에서 실행 계획을 먼저 수립한다.
 - 실행 계획은 두 가지를 결정한다. SELECT는 READ, INSERT/UPDATE/DELETE는 WRITE로 분류하고, table 기준으로 어느 worker queue에 넣을지 고른다.
@@ -75,27 +73,10 @@ DOT 원본: [readme_db_concurrency_flow.dot](docs/sijun-yang/diagrams/readme_db_
 
 **API는 병렬로 요청을 접수하고, DB는 lock plan과 engine_mutex를 통해 안전한 요청만 내부 엔진으로 들여보낸다.**
 
+### 벤치마크
 
-## 4. 성능
-
-이 장의 수치와 그래프는 추후 추가한다. 지금 README에는 발표에서 연결할 지표만 남긴다.
-
-- B+ Tree 조회와 scan 조회를 비교해 인덱스 효과를 보여준다.
-- 동시에 대기 중이던 요청 수로 API 계층의 병렬 요청 상황을 보여준다.
-- queue depth로 요청이 실제로 worker queue에 쌓였다는 근거를 보여준다.
-- queue wait, lock wait, exec time으로 DB 처리 계층에서 시간이 어디에 쓰였는지 설명한다.
-- stress test 처리량으로 여러 클라이언트 요청을 실제로 받아냈다는 점을 보여준다.
-
-발표용 검증 흐름은 아래 순서가 자연스럽다.
-
-```bash
-./test.sh
-./test.sh --stress
-make test-cmd-processor-scale-score
-```
-
-`./test.sh`는 API 기능과 엣지 케이스를 보여주고, `./test.sh --stress`는 여러 클라이언트가 outstanding 요청을 유지하는 장면을 보여준다. `make test-cmd-processor-scale-score`는 queue wait, lock wait, exec time을 숫자로 확인하는 용도다.
-
+- worker 수를 1개에서 16개로 늘렸을 때 PK SELECT 처리량이 약 21.3k rps에서 369.9k rps로 증가했다.
+- worker 24개 이후에는 처리량이 떨어지므로, 최적점 이후에는 worker 수보다 lock 경합과 engine_mutex 진입 비용이 더 큰 병목이 된다.
 
 ## 파일 구조
 
