@@ -1,0 +1,135 @@
+digraph ReadmeDbConcurrencyFlow {
+    graph [
+        rankdir=LR,
+        compound=true,
+        nodesep=0.52,
+        ranksep=0.78,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_api {
+        label="API 계층: 동시에 받고 추적";
+        style="rounded,filled";
+        color="#bfdbfe";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        tcp_req [label="TCP JSONL request\nid / op / sql"];
+        inflight [label="in-flight id 등록\nconnection별 추적"];
+        submit [label="CmdProcessor.submit\n요청 제출"];
+    }
+
+    subgraph cluster_plan {
+        label="EngineCmdProcessor: 실행 전 계획";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        classify [label="request plan\nSELECT=READ\nINSERT/UPDATE/DELETE=WRITE"];
+        route [label="route plan\ntable hash -> shard queue"];
+        lockplan [label="lock plan\ntable 단위 READ/WRITE"];
+        planner_cache [label="planner cache\nSQL template reuse"];
+    }
+
+    subgraph cluster_worker {
+        label="Worker / Lock 계층";
+        style="rounded,filled";
+        color="#c4b5fd";
+        fillcolor="#f5f3ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        queue [label="WorkQueue\nbounded queue"];
+        worker [label="worker thread\njob pop"];
+        rwlock [label="LockManager\nbucket rwlock"];
+        metrics [label="metrics\nqueue / lock / exec wait"];
+    }
+
+    subgraph cluster_db {
+        label="DB 실행 계층: 전역 상태 보호";
+        style="rounded,filled";
+        color="#bbf7d0";
+        fillcolor="#f0fdf4";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        engine_mutex [label="engine_mutex\nparse/execute global guard"];
+        parser [label="lexer / parser\nSQL -> Statement"];
+        executor [label="executor.c\nCRUD + index path"];
+        tablecache [label="TableCache\nopen_tables / slots / cache"];
+        bptree [label="B+ Tree\nPK / UK index"];
+        storage [label="CSV / delta / idx\npersistent state"];
+    }
+
+    subgraph cluster_response {
+        label="응답";
+        style="rounded,filled";
+        color="#d9f99d";
+        fillcolor="#f7fee7";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        response [label="CmdResponse\nok / status / body"];
+        callback [label="callback\nsame request id"];
+        tcp_res [label="TCP JSONL response"];
+    }
+
+    tcp_req -> inflight [label="검증 성공"];
+    inflight -> submit;
+    submit -> classify;
+    classify -> route;
+    classify -> lockplan;
+    planner_cache -> classify [style=dashed, label="hit", constraint=false];
+    classify -> planner_cache [style=dashed, label="store", constraint=false];
+
+    route -> queue [label="target shard"];
+    queue -> worker;
+    lockplan -> rwlock [label="acquire"];
+    worker -> rwlock;
+    rwlock -> engine_mutex [label="locked job"];
+
+    engine_mutex -> parser;
+    parser -> executor;
+    executor -> tablecache;
+    tablecache -> bptree [label="lookup / range"];
+    tablecache -> storage [label="read / append / replay"];
+    storage -> tablecache [style=dashed, label="row / delta / snapshot", constraint=false];
+    bptree -> tablecache [style=dashed, label="slot id", constraint=false];
+
+    executor -> response [label="row_count / affected_count"];
+    response -> callback;
+    callback -> tcp_res;
+    tcp_res -> inflight [style=dashed, label="in-flight 제거", constraint=false];
+
+    worker -> metrics [style=dotted, label="record waits", constraint=false];
+    rwlock -> metrics [style=dotted, constraint=false];
+    executor -> metrics [style=dotted, constraint=false];
+}

@@ -1,0 +1,144 @@
+digraph ClientCliDbmsOverallArchitecture {
+    graph [
+        rankdir=LR,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.85,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_client_cli {
+        label="Client CLI";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        terminal [label="terminal\nSQL 입력 / 결과 출력"];
+        cli [label="client CLI\nprompt + command assembly"];
+        json_client [label="JSONL adapter\nid / op / sql"];
+    }
+
+    subgraph cluster_protocol {
+        label="TCP / JSONL 경계";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        tcp_link [label="TCP connection\nnewline-delimited JSON"];
+    }
+
+    subgraph cluster_dbms {
+        label="DBMS";
+        style="rounded,filled";
+        color="#94a3b8";
+        fillcolor="#f1f5f9";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=20;
+
+        subgraph cluster_tcp {
+            label="TCPCmdProcessor";
+            style="rounded,filled";
+            color="#93c5fd";
+            fillcolor="#eff6ff";
+            fontname="Pretendard";
+            fontsize=13;
+            margin=18;
+
+            tcp_server [label="listener + connection\naccept / read / write"];
+            tcp_adapter [label="req / res adapter\nJSONL <-> CmdRequest"];
+            tcp_state [label="connection state\nclient counters\nin-flight ids"];
+        }
+
+        subgraph cluster_contract {
+            label="CmdProcessor 공통 계약";
+            style="rounded,filled";
+            color="#bfdbfe";
+            fillcolor="#ffffff";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            request [label="CmdRequest"];
+            api [label="CmdProcessor interface\nacquire / submit / release"];
+            response [label="CmdResponse"];
+        }
+
+        subgraph cluster_engine {
+            label="EngineCmdProcessor";
+            style="rounded,filled";
+            color="#bae6fd";
+            fillcolor="#ffffff";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            engine [label="queue + worker model\nplanning / dispatch"];
+        }
+
+        subgraph cluster_sql {
+            label="SQL 실행 계층";
+            style="rounded,filled";
+            color="#cbd5e1";
+            fillcolor="#ffffff";
+            fontname="Pretendard";
+            fontsize=12;
+            margin=14;
+
+            sql_core [label="lexer / parser / executor"];
+            storage [label="B+Tree tables\nrow storage"];
+        }
+    }
+
+    { rank=same; request; api; response; }
+    { rank=same; tcp_server; tcp_adapter; tcp_state; }
+    { rank=same; sql_core; storage; }
+
+    terminal -> cli [label="콘솔 입출력", dir=both, weight=10];
+    cli -> json_client [label="요청 / 응답 변환", dir=both, weight=10];
+    json_client -> tcp_link [label="JSONL request", weight=10];
+
+    tcp_link -> tcp_server [label="connect + request line", weight=10];
+    tcp_server -> tcp_adapter [weight=10];
+    tcp_adapter -> request [label="CmdRequest 채우기", weight=10];
+    request -> api [label="submit", weight=10];
+    api -> engine [weight=10];
+    engine -> sql_core [label="SQL 처리", weight=10];
+    sql_core -> storage [label="read / write", dir=both, weight=10];
+
+    tcp_server -> tcp_state [style=dotted, arrowhead=none, label="connection 추적", constraint=false];
+    tcp_adapter -> tcp_state [style=dotted, arrowhead=none, label="in-flight 등록", constraint=false];
+
+    sql_core -> response [style=dashed, label="실행 결과", constraint=false];
+    response -> api [style=dashed, constraint=false];
+    api -> tcp_adapter [style=dashed, label="callback", constraint=false];
+    tcp_adapter -> tcp_server [style=dashed, constraint=false];
+    tcp_server -> tcp_link [style=dashed, label="response line", constraint=false];
+    tcp_link -> json_client [style=dashed, label="JSONL response", constraint=false];
+}

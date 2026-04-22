@@ -545,6 +545,30 @@ static int test_sql_and_multiple_requests(void) {
     return 0;
 }
 
+static int test_batched_requests_in_one_send(void) {
+    CmdProcessor *processor = NULL;
+    TCPCmdProcessor *server = NULL;
+    int port;
+    int fd;
+    const char *payload =
+        "{\"id\":\"b1\",\"op\":\"ping\"}\n"
+        "{\"id\":\"b2\",\"op\":\"ping\"}\n"
+        "{\"id\":\"b3\",\"op\":\"ping\"}\n";
+
+    CHECK(start_mock_server(&processor, &server, &port) == 0);
+    fd = connect_client(port);
+    CHECK(fd >= 0);
+    CHECK(send_all_client(fd, payload, strlen(payload)) == 0);
+    CHECK(expect_response_status(fd, "b1", "OK", 1) == 0);
+    CHECK(expect_response_status(fd, "b2", "OK", 1) == 0);
+    CHECK(expect_response_status(fd, "b3", "OK", 1) == 0);
+
+    close(fd);
+    tcp_cmd_processor_stop(server);
+    cmd_processor_shutdown(processor);
+    return 0;
+}
+
 static int test_invalid_requests(void) {
     CmdProcessor *processor = NULL;
     TCPCmdProcessor *server = NULL;
@@ -715,6 +739,7 @@ static int test_inflight_per_client_limit(void) {
 int main(void) {
     CHECK(test_start_port_and_ping() == 0);
     CHECK(test_sql_and_multiple_requests() == 0);
+    CHECK(test_batched_requests_in_one_send() == 0);
     CHECK(test_invalid_requests() == 0);
     CHECK(test_close_only_current_connection() == 0);
     CHECK(test_connection_limit_per_client() == 0);
