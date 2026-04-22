@@ -4,8 +4,6 @@
 
 ## 1. 개요
 
-이 프로젝트는 C 기반 미니 DBMS에 TCP API 서버를 붙인 결과물이다.
-
 ### 전체 구조
 
 ```mermaid
@@ -47,11 +45,13 @@ DOT 원본: [004_tcp_cmd_processor_architecture_flow.dot](docs/sijun-yang/diagra
 - 여러 클라이언트 connection과 여러 in-flight 요청이 동시에 존재할 수 있다.
 - 여기서의 동시성은 DB 내부의 lock 문제가 아니라, 동시에 들어온 네트워크 요청을 누락 없이 올바른 응답에 매칭하는 문제다.
 
-**API 계층의 동시성은 DB lock이 아닌 요청 추적과 응답 매칭의 문제다.**
+**즉, API 계층의 동시성은 DB lock이 아닌 요청 추적과 응답 매칭의 문제다.**
 
 ## 3. DB
 
 API가 요청을 동시에 받아들이면, DB 계층은 공유 데이터에 대한 접근 순서를 제어해야 한다.
+
+![DB Storage Model](docs/sijun-yang/diagrams/DB.png)
 
 ### API와 DB 실행 경계
 - API 계층은 SQL을 직접 실행하지 않는다.
@@ -96,13 +96,6 @@ make test-cmd-processor-scale-score
 
 `./test.sh`는 API 기능과 엣지 케이스를 보여주고, `./test.sh --stress`는 여러 클라이언트가 outstanding 요청을 유지하는 장면을 보여준다. `make test-cmd-processor-scale-score`는 queue wait, lock wait, exec time을 숫자로 확인하는 용도다.
 
-## 빌드와 실행
-
-기본 빌드:
-
-```bash
-make
-```
 
 ## 파일 구조
 
