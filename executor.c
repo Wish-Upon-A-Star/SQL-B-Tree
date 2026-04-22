@@ -19,6 +19,7 @@
 
 typedef struct SnapshotMeta SnapshotMeta;
 typedef struct MutationLookupPlan MutationLookupPlan;
+typedef enum MutationLookupMode MutationLookupMode;
 
 TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
@@ -29,12 +30,17 @@ static int g_table_registry_mutex_ready = 0;
 
 #define INFO_PRINTF(...) do { if (!g_executor_quiet) printf(__VA_ARGS__); } while (0)
 
+enum MutationLookupMode {
+    MUTATION_LOOKUP_NONE = 0,
+    MUTATION_LOOKUP_PK,
+    MUTATION_LOOKUP_UK,
+    MUTATION_LOOKUP_AUX
+};
+
 struct MutationLookupPlan {
     int condition_index;
     int where_idx;
-    int uses_pk_lookup;
-    int uses_uk_lookup;
-    int uses_aux_lookup;
+    MutationLookupMode lookup_mode;
 };
 
 void set_executor_quiet(int quiet) {
@@ -61,7 +67,6 @@ static int rebuild_uk_indexes(TableCache *tc);
 static int ensure_github_index(TableCache *tc);
 static int unique_index_insert(TableCache *tc, UniqueIndex *index, const char *key, int row_index);
 static int maybe_rebuild_indexes_for_order(TableCache *tc);
-static int index_record_uks(TableCache *tc, int row_index);
 static int index_record_uks_from_row(TableCache *tc, const char *row, int row_index);
 static int get_uk_slot(TableCache *tc, int col_idx);
 static int is_github_lookup_column(TableCache *tc, int col_idx);
@@ -71,8 +76,6 @@ static void github_index_on_remove(TableCache *tc, const char *row);
 static void github_index_on_update(TableCache *tc, const char *old_row, int row_index, int set_idx);
 static int ensure_uk_indexes(TableCache *tc);
 static void rollback_updated_records(TableCache *tc, char **old_records);
-static int remove_record_indexes(TableCache *tc, const char *row);
-static int restore_record_indexes(TableCache *tc, int slot_id);
 static int append_csv_field(char *row, size_t row_size, size_t *offset, const char *value, int is_last);
 static int parse_long_value(const char *value, long *out);
 static int slot_is_active(TableCache *tc, int slot_id);
@@ -102,18 +105,31 @@ static int load_rows_into_cache(TableCache *tc, const char *name, FILE *f,
 static int finalize_indexes_and_recovery(TableCache *tc, const char *name, FILE *f,
                                          int has_delta_log, long file_next_auto_id);
 static int load_table_contents(TableCache *tc, const char *name, FILE *f);
-static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_idx,
-                                     const WhereCondition *lookup_cond, int set_idx, const char *set_value, int uses_pk_lookup,
-                                     int uses_uk_lookup, int uses_aux_lookup, int rebuild_uk_needed);
+static int execute_update_single_row(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                     MutationLookupMode lookup_mode, int set_idx, const char *set_value,
+                                     int rebuild_uk_needed);
+static int execute_update_truncated(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                    MutationLookupMode lookup_mode, int set_idx, const char *set_value,
+                                    int rebuild_uk_needed, int *affected_rows);
+static int execute_update_exact_or_scan(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                        MutationLookupMode lookup_mode, int set_idx, const char *set_value,
+                                        int rebuild_uk_needed, int *affected_rows);
 static int row_fields_match_statement(TableCache *tc, Statement *stmt, char *fields[MAX_COLS]);
 static int mark_selected_rows(TableCache *tc, Statement *stmt, int *match_flags, int *match_count);
 static int prepare_update_set(TableCache *tc, Statement *stmt, int *set_idx,
                               char *set_value, size_t set_value_size, int *rebuild_uk_needed);
+static int build_updated_row_buffer(TableCache *tc, const char *row, int set_idx, const char *set_value,
+                                    char *new_row, size_t new_row_size, int allow_slice_build);
 static int build_updated_row_copy(TableCache *tc, const char *row, int set_idx, const char *set_value,
                                   char **new_copy, int allow_slice_build);
-static int build_updated_row_text(TableCache *tc, const char *row, int set_idx, const char *set_value,
-                                  char *new_row, size_t new_row_size);
+static int row_column_equals_value(TableCache *tc, const char *row, int col_idx, const char *value);
 static void set_slot_memory_row(TableCache *tc, int slot_id, char *row);
+static void free_saved_rows(char **saved_rows, int row_count);
+static void restore_single_updated_row(TableCache *tc, int target_row, char *old_record, int rebuild_uk_needed);
+static int persist_single_updated_row(TableCache *tc, int target_row, char *old_record,
+                                      int rebuild_uk_needed, int emit_logs);
+static void restore_updated_batch(TableCache *tc, char **old_records, int rebuild_uk_needed);
+static int persist_updated_batch(TableCache *tc, char **old_records, int rebuild_uk_needed);
 static int persist_updated_row(TableCache *tc, int target_row, char *old_record,
                                int set_idx, const char *set_value,
                                int rebuild_uk_needed, int allow_slice_build, int emit_logs);
@@ -130,10 +146,20 @@ static int scan_truncated_update_targets(TableCache *tc, Statement *stmt, int se
                                          const char *set_value, int *target_count, int *uk_conflict);
 static int resolve_tail_pk_row(TableCache *tc, Statement *stmt, long pk_key, long offset,
                                char *base_row, size_t base_row_size, const char **current_row);
+static void mark_single_deleted_row(TableCache *tc, int target_row);
+static void restore_single_deleted_row(TableCache *tc, int target_row);
+static int finalize_single_deleted_row(TableCache *tc, int target_row);
+static int mark_deleted_batch(TableCache *tc, int *delete_flags, int old_count);
+static void restore_deleted_batch(TableCache *tc, int *delete_flags, int old_count, int deleted_count);
+static int finalize_deleted_batch(TableCache *tc, int *delete_flags, int old_count);
+static int persist_deleted_batch(TableCache *tc, char **old_records, int *delete_flags, int old_count, int deleted_count);
 static int persist_deleted_slot(TableCache *tc, int target_row, char *old_record, int emit_logs);
-static int execute_delete_single_row(TableCache *tc, Statement *stmt, int index_col,
-                                     const WhereCondition *lookup_cond, int uses_pk_lookup,
-                                     int uses_aux_lookup);
+static int execute_delete_single_row(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                     MutationLookupMode lookup_mode);
+static int execute_delete_truncated(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                    MutationLookupMode lookup_mode, int *affected_rows);
+static int execute_delete_exact_or_scan(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                        MutationLookupMode lookup_mode, int *affected_rows);
 static int execute_delete_scan(TableCache *tc, Statement *stmt);
 static int scan_select_file_rows(TableCache *tc, long start_offset,
                                  const char *tail_trace, const char *full_trace,
@@ -148,7 +174,6 @@ static int read_snapshot_uk_indexes(TableCache *tc, FILE *f, int active_count,
                                     UniqueIndex *new_indexes[MAX_UKS]);
 static int read_snapshot_github_index(TableCache *tc, FILE *f, int active_count);
 static void reset_deleted_flags(TableCache *tc, int *delete_flags, int old_count);
-static void release_deleted_slots(TableCache *tc, int *delete_flags, int old_count);
 static void clear_slot_storage(TableCache *tc, int slot_id);
 int rewrite_file(TableCache *tc);
 static int execute_insert_internal(Statement *stmt, long *inserted_id);
@@ -1131,56 +1156,6 @@ static int append_record_csv_indexed(TableCache *tc, const char *row, long id_va
     return 1;
 }
 
-static int append_record_memory(TableCache *tc, const char *row, long id_value, int *inserted_slot) {
-    int slot_id;
-    long row_id;
-
-    if (!take_record_slot(tc, 1, &slot_id)) return 0;
-    if (!assign_slot_row(tc, slot_id, row, ROW_STORE_MEMORY, -1, 1)) {
-        push_free_slot(tc, slot_id);
-        return 0;
-    }
-    row_id = tc->next_row_id++;
-    tc->row_ids[slot_id] = row_id;
-    tc->record_active[slot_id] = 1;
-    tc->active_count++;
-
-    {
-        long index_key = tc->pk_idx != -1 ? id_value : row_id;
-        int existing_row;
-        if (bptree_search(tc->id_index, index_key, &existing_row)) {
-            if ((existing_row != slot_id && slot_is_active(tc, existing_row)) ||
-                (!bptree_delete(tc->id_index, index_key) && !rebuild_id_index(tc))) {
-                deactivate_slot(tc, slot_id, 1);
-                return 0;
-            }
-        }
-    }
-    if (bptree_insert(tc->id_index, tc->pk_idx != -1 ? id_value : row_id, slot_id) != 1) {
-        deactivate_slot(tc, slot_id, 1);
-        return 0;
-    }
-    if (tc->pk_idx != -1) {
-        if (id_value >= tc->next_auto_id) tc->next_auto_id = id_value + 1;
-    }
-    if (!index_record_uks(tc, slot_id)) {
-        deactivate_slot(tc, slot_id, 1);
-        if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
-            printf("[error] INSERT rollback failed: indexes may be stale.\n");
-        }
-        return 0;
-    }
-    if (!maybe_rebuild_indexes_for_order(tc)) {
-        deactivate_slot(tc, slot_id, 1);
-        if (!rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
-            printf("[error] INSERT rollback failed: indexes may be stale.\n");
-        }
-        return 0;
-    }
-    if (inserted_slot) *inserted_slot = slot_id;
-    return 1;
-}
-
 static void rollback_updated_records(TableCache *tc, char **old_records) {
     int i;
 
@@ -1815,27 +1790,6 @@ static int append_delta_update_key(TableCache *tc, long id_value, const char *ne
     return ferror(f) ? 0 : 1;
 }
 
-static int append_delta_update_one(TableCache *tc, const char *new_record) {
-    FILE *f;
-    long id_value;
-
-    if (!tc || !new_record) return 0;
-    f = get_delta_writer(tc);
-    if (!f) return 0;
-    if (!begin_delta_batch(tc)) return 0;
-    if (tc->pk_idx != -1) {
-        if (!get_row_pk_value(tc, new_record, &id_value)) return 0;
-    } else {
-        int i;
-        for (i = 0; i < tc->record_count; i++) {
-            if (slot_row(tc, i) == new_record && get_row_index_key(tc, new_record, i, &id_value)) break;
-        }
-        if (i == tc->record_count) return 0;
-    }
-    if (!track_delta_write(tc, fprintf(f, "U\t%ld\t%s\n", id_value, new_record))) return 0;
-    return ferror(f) ? 0 : 1;
-}
-
 static int append_delta_deletes(TableCache *tc, char **old_records, int *delete_flags, int old_count) {
     FILE *f;
     int i;
@@ -1874,28 +1828,6 @@ static int append_delta_delete_key(TableCache *tc, long id_value) {
     FILE *f;
 
     if (!tc) return 0;
-    f = get_delta_writer(tc);
-    if (!f) return 0;
-    if (!begin_delta_batch(tc)) return 0;
-    if (!track_delta_write(tc, fprintf(f, "D\t%ld\n", id_value))) return 0;
-    return ferror(f) ? 0 : 1;
-}
-
-static int append_delta_delete_one(TableCache *tc, const char *old_record) {
-    FILE *f;
-    long id_value;
-
-    int i;
-
-    if (!tc || !old_record) return 0;
-    if (tc->pk_idx != -1) {
-        if (!get_row_pk_value(tc, old_record, &id_value)) return 0;
-    } else {
-        for (i = 0; i < tc->record_count; i++) {
-            if (tc->records[i] == old_record && get_row_index_key(tc, old_record, i, &id_value)) break;
-        }
-        if (i == tc->record_count) return 0;
-    }
     f = get_delta_writer(tc);
     if (!f) return 0;
     if (!begin_delta_batch(tc)) return 0;
@@ -2108,30 +2040,6 @@ static int ensure_uk_indexes(TableCache *tc) {
     return 1;
 }
 
-static int index_record_uks(TableCache *tc, int row_index) {
-    char row_buf[RECORD_SIZE];
-    char *fields[MAX_COLS] = {0};
-    char *row;
-    int i;
-
-    if (tc->uk_count == 0) return 1;
-    if (!ensure_uk_indexes(tc)) return 0;
-    row = slot_row(tc, row_index);
-    if (!row) return 1;
-    parse_csv_row(row, fields, row_buf);
-    for (i = 0; i < tc->uk_count; i++) {
-        char key[RECORD_SIZE];
-        int col_idx = tc->uk_indices[i];
-        int result;
-
-        normalize_value(fields[col_idx], key, sizeof(key));
-        if (strlen(key) == 0) continue;
-        result = unique_index_insert(tc, tc->uk_indexes[i], key, row_index);
-        if (result != 1) return 0;
-    }
-    return 1;
-}
-
 static int index_record_uks_from_row(TableCache *tc, const char *row, int row_index) {
     char row_buf[RECORD_SIZE];
     char *fields[MAX_COLS] = {0};
@@ -2292,56 +2200,6 @@ static int materialize_cached_csv_rows(TableCache *tc) {
     if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
     tc->rows_materialized = 1;
     table_io_unlock(tc);
-    return 1;
-}
-
-static int remove_record_indexes(TableCache *tc, const char *row) {
-    char row_buf[RECORD_SIZE];
-    char *fields[MAX_COLS] = {0};
-    int i;
-
-    if (!tc || !row) return 0;
-    parse_csv_row(row, fields, row_buf);
-    {
-        long id_value;
-        if (tc->pk_idx != -1) {
-            if (!parse_long_value(fields[tc->pk_idx], &id_value)) return 0;
-        } else {
-            int i;
-            for (i = 0; i < tc->record_count; i++) {
-                if (slot_row(tc, i) == row && get_row_index_key(tc, row, i, &id_value)) break;
-            }
-            if (i == tc->record_count) return 0;
-        }
-        if (!bptree_delete(tc->id_index, id_value)) return 0;
-    }
-    if (tc->uk_count > 0) {
-        if (!ensure_uk_indexes(tc)) return 0;
-        for (i = 0; i < tc->uk_count; i++) {
-            char key[RECORD_SIZE];
-            int col_idx = tc->uk_indices[i];
-            int uk_slot = get_uk_slot(tc, col_idx);
-
-            if (uk_slot == -1) return 0;
-            normalize_value(fields[col_idx], key, sizeof(key));
-            if (strlen(key) == 0) continue;
-            if (!bptree_string_delete(tc->uk_indexes[uk_slot]->tree, key)) return 0;
-        }
-    }
-    github_index_on_remove(tc, row);
-    return 1;
-}
-
-static int restore_record_indexes(TableCache *tc, int slot_id) {
-    char *row;
-    long id_value;
-
-    if (!tc || !slot_is_active(tc, slot_id)) return 0;
-    row = slot_row(tc, slot_id);
-    if (!get_row_index_key(tc, row, slot_id, &id_value)) return 0;
-    if (bptree_insert(tc->id_index, id_value, slot_id) != 1) return 0;
-    if (!index_record_uks(tc, slot_id)) return 0;
-    github_index_on_insert(tc, row, slot_id);
     return 1;
 }
 
@@ -3849,15 +3707,6 @@ void execute_insert(Statement *stmt) {
     INFO_PRINTF("[ok] INSERT completed. id=%ld\n", id_value);
 }
 
-int execute_insert_values_fast(const char *table_name, const char *values_csv) {
-    TableCache *tc;
-
-    if (!table_name || !values_csv) return 0;
-    tc = get_table(table_name);
-    if (!tc) return 0;
-    return insert_row_data(tc, values_csv, 0, NULL);
-}
-
 typedef struct {
     int select_idx[MAX_COLS];
     int select_count;
@@ -4104,18 +3953,58 @@ static void build_mutation_lookup_plan(TableCache *tc, Statement *stmt, Mutation
     plan->where_idx = (index_col != -1)
         ? index_col
         : condition_column_index(tc, &stmt->where_conditions[0]);
-    plan->uses_pk_lookup = (index_cond != -1 &&
-                            index_col == tc->pk_idx &&
-                            stmt->where_conditions[index_cond].type == WHERE_EQ);
-    plan->uses_uk_lookup = (index_cond != -1 &&
-                            !plan->uses_pk_lookup &&
-                            get_uk_slot(tc, index_col) != -1 &&
-                            stmt->where_conditions[index_cond].type == WHERE_EQ);
-    plan->uses_aux_lookup = (index_cond != -1 &&
-                             !plan->uses_pk_lookup &&
-                             !plan->uses_uk_lookup &&
-                             is_github_lookup_column(tc, index_col) &&
-                             stmt->where_conditions[index_cond].type == WHERE_EQ);
+    plan->lookup_mode = MUTATION_LOOKUP_NONE;
+    if (index_cond == -1 || stmt->where_conditions[index_cond].type != WHERE_EQ) return;
+    if (index_col == tc->pk_idx) {
+        plan->lookup_mode = MUTATION_LOOKUP_PK;
+        return;
+    }
+    if (get_uk_slot(tc, index_col) != -1) {
+        plan->lookup_mode = MUTATION_LOOKUP_UK;
+        return;
+    }
+    if (is_github_lookup_column(tc, index_col)) {
+        plan->lookup_mode = MUTATION_LOOKUP_AUX;
+    }
+}
+
+static int mutation_lookup_uses_exact(const MutationLookupPlan *plan) {
+    return plan && plan->lookup_mode != MUTATION_LOOKUP_NONE;
+}
+
+static MutationLookupMode prepare_mutation_lookup_mode(TableCache *tc,
+                                                       const MutationLookupPlan *plan) {
+    if (!tc || !plan) return MUTATION_LOOKUP_NONE;
+    if (plan->lookup_mode != MUTATION_LOOKUP_AUX) return plan->lookup_mode;
+    return ensure_github_index(tc) ? MUTATION_LOOKUP_AUX : MUTATION_LOOKUP_NONE;
+}
+
+static int resolve_mutation_lookup_row(TableCache *tc,
+                                       Statement *stmt,
+                                       const MutationLookupPlan *lookup,
+                                       MutationLookupMode lookup_mode,
+                                       int *out_target_row) {
+    const WhereCondition *lookup_cond;
+
+    if (out_target_row) *out_target_row = -1;
+    if (!tc || !stmt || !lookup || lookup->condition_index < 0 || lookup->where_idx < 0 || !out_target_row) {
+        return -1;
+    }
+
+    lookup_cond = &stmt->where_conditions[lookup->condition_index];
+    switch (lookup_mode) {
+        case MUTATION_LOOKUP_PK:
+            INFO_PRINTF("[index] B+ tree id lookup for mutation\n");
+            return find_pk_row(tc, lookup_cond->val, out_target_row);
+        case MUTATION_LOOKUP_UK:
+            INFO_PRINTF("[index] UK B+ tree lookup for mutation on column '%s'\n", lookup_cond->col);
+            return find_uk_row(tc, lookup->where_idx, lookup_cond->val, out_target_row);
+        case MUTATION_LOOKUP_AUX:
+            INFO_PRINTF("[index] auxiliary exact lookup for mutation on column '%s'\n", lookup_cond->col);
+            return find_github_row(tc, lookup_cond->val, out_target_row);
+        default:
+            return -1;
+    }
 }
 
 static int print_range_row_visitor(long key, int row_index, void *ctx) {
@@ -4236,18 +4125,23 @@ static int prepare_update_set(TableCache *tc, Statement *stmt, int *set_idx,
     return 1;
 }
 
+static int build_updated_row_buffer(TableCache *tc, const char *row, int set_idx, const char *set_value,
+                                    char *new_row, size_t new_row_size, int allow_slice_build) {
+    if (!tc || !row || !new_row || new_row_size == 0) return 0;
+
+    if (allow_slice_build &&
+        build_updated_row_slice(tc, row, set_idx, set_value, new_row, new_row_size)) {
+        return 1;
+    }
+    return build_updated_row(tc, row, set_idx, set_value, new_row, new_row_size);
+}
+
 static int build_updated_row_copy(TableCache *tc, const char *row, int set_idx, const char *set_value,
                                   char **new_copy, int allow_slice_build) {
     char new_row[RECORD_SIZE];
 
-    if (!tc || !row || !new_copy) return 0;
-
-    if (allow_slice_build) {
-        if (!build_updated_row_slice(tc, row, set_idx, set_value, new_row, sizeof(new_row)) &&
-            !build_updated_row(tc, row, set_idx, set_value, new_row, sizeof(new_row))) {
-            return 0;
-        }
-    } else if (!build_updated_row(tc, row, set_idx, set_value, new_row, sizeof(new_row))) {
+    if (!new_copy) return 0;
+    if (!build_updated_row_buffer(tc, row, set_idx, set_value, new_row, sizeof(new_row), allow_slice_build)) {
         return 0;
     }
 
@@ -4255,22 +4149,74 @@ static int build_updated_row_copy(TableCache *tc, const char *row, int set_idx, 
     return *new_copy != NULL;
 }
 
-static int build_updated_row_text(TableCache *tc, const char *row, int set_idx, const char *set_value,
-                                  char *new_row, size_t new_row_size) {
+static int row_column_equals_value(TableCache *tc, const char *row, int col_idx, const char *value) {
     char row_buf[RECORD_SIZE];
     char *fields[MAX_COLS] = {0};
-    size_t offset = 0;
+
+    if (!tc || !row || col_idx < 0 || col_idx >= tc->col_count) return 0;
+    parse_csv_row(row, fields, row_buf);
+    return compare_value(fields[col_idx], value);
+}
+
+static void free_saved_rows(char **saved_rows, int row_count) {
     int i;
 
-    if (!tc || !row || !new_row || new_row_size == 0) return 0;
+    if (!saved_rows) return;
+    for (i = 0; i < row_count; i++) free(saved_rows[i]);
+    free(saved_rows);
+}
 
-    new_row[0] = '\0';
-    parse_csv_row(row, fields, row_buf);
-    for (i = 0; i < tc->col_count; i++) {
-        const char *value = (i == set_idx) ? set_value : (fields[i] ? fields[i] : "");
-        if (!append_csv_field(new_row, new_row_size, &offset, value, i == tc->col_count - 1)) {
+static void restore_single_updated_row(TableCache *tc, int target_row, char *old_record, int rebuild_uk_needed) {
+    if (!tc || target_row < 0 || target_row >= tc->record_count || !old_record) return;
+    free(tc->records[target_row]);
+    set_slot_memory_row(tc, target_row, old_record);
+    if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+}
+
+static int persist_single_updated_row(TableCache *tc, int target_row, char *old_record,
+                                      int rebuild_uk_needed, int emit_logs) {
+    if (can_use_delta_log(tc)) {
+        if (!append_delta_update_slot(tc, target_row, tc->records[target_row])) {
+            restore_single_updated_row(tc, target_row, old_record, rebuild_uk_needed);
+            if (emit_logs) printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
             return 0;
         }
+        if (emit_logs) INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
+        if (!maybe_compact_delta_log(tc) && emit_logs) {
+            printf("[warning] UPDATE completed, but delta compaction failed.\n");
+        }
+        return 1;
+    }
+
+    if (!rewrite_file(tc)) {
+        restore_single_updated_row(tc, target_row, old_record, rebuild_uk_needed);
+        if (emit_logs) printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void restore_updated_batch(TableCache *tc, char **old_records, int rebuild_uk_needed) {
+    rollback_updated_records(tc, old_records);
+    if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+}
+
+static int persist_updated_batch(TableCache *tc, char **old_records, int rebuild_uk_needed) {
+    if (can_use_delta_log(tc)) {
+        if (!append_delta_updates(tc, old_records)) {
+            restore_updated_batch(tc, old_records, rebuild_uk_needed);
+            return 0;
+        }
+        INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
+        if (!maybe_compact_delta_log(tc)) {
+            printf("[warning] UPDATE completed, but delta compaction failed.\n");
+        }
+        return 1;
+    }
+
+    if (!rewrite_file(tc)) {
+        restore_updated_batch(tc, old_records, rebuild_uk_needed);
+        return 0;
     }
     return 1;
 }
@@ -4280,6 +4226,10 @@ static int persist_updated_row(TableCache *tc, int target_row, char *old_record,
                                int rebuild_uk_needed, int allow_slice_build, int emit_logs) {
     char *new_copy;
 
+    if (row_column_equals_value(tc, old_record, set_idx, set_value)) {
+        if (emit_logs) INFO_PRINTF("[notice] UPDATE skipped because the target value is unchanged.\n");
+        return 0;
+    }
     if (rebuild_uk_needed &&
         !validate_update_uk(tc, set_idx, set_value, target_row, NULL, 0)) {
         return -1;
@@ -4296,30 +4246,12 @@ static int persist_updated_row(TableCache *tc, int target_row, char *old_record,
 
     set_slot_memory_row(tc, target_row, new_copy);
     if (rebuild_uk_needed && !index_record_single_uk(tc, target_row, set_idx)) {
-        free(tc->records[target_row]);
-        set_slot_memory_row(tc, target_row, old_record);
-        rebuild_uk_indexes(tc);
+        restore_single_updated_row(tc, target_row, old_record, 1);
         if (emit_logs) printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
         return -1;
     }
 
-    if (can_use_delta_log(tc)) {
-        if (!append_delta_update_slot(tc, target_row, tc->records[target_row])) {
-            free(tc->records[target_row]);
-            set_slot_memory_row(tc, target_row, old_record);
-            if (rebuild_uk_needed) rebuild_uk_indexes(tc);
-            if (emit_logs) printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
-            return -1;
-        }
-        if (emit_logs) INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
-        if (!maybe_compact_delta_log(tc) && emit_logs) {
-            printf("[warning] UPDATE completed, but delta compaction failed.\n");
-        }
-    } else if (!rewrite_file(tc)) {
-        free(tc->records[target_row]);
-        set_slot_memory_row(tc, target_row, old_record);
-        if (rebuild_uk_needed) rebuild_uk_indexes(tc);
-        if (emit_logs) printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
+    if (!persist_single_updated_row(tc, target_row, old_record, rebuild_uk_needed, emit_logs)) {
         return -1;
     }
 
@@ -4415,8 +4347,9 @@ static int execute_update_scan(TableCache *tc, Statement *stmt, int set_idx, con
         if (!match_flags[i]) continue;
         row = slot_row(tc, i);
         if (!row) continue;
-        if (!build_updated_row_copy(tc, row, set_idx, set_value, &new_copy, 0)) {
-            rollback_updated_records(tc, old_records);
+        if (row_column_equals_value(tc, row, set_idx, set_value)) continue;
+        if (!build_updated_row_copy(tc, row, set_idx, set_value, &new_copy, 1)) {
+            restore_updated_batch(tc, old_records, 0);
             free(old_records);
             free(match_flags);
             printf("[error] UPDATE failed: rebuilt row is too long.\n");
@@ -4429,13 +4362,16 @@ static int execute_update_scan(TableCache *tc, Statement *stmt, int set_idx, con
     }
 
     free(match_flags);
+    if (count == 0) {
+        free(old_records);
+        return 0;
+    }
     if (rebuild_uk_needed) {
         for (i = 0; i < tc->record_count; i++) {
             if (!old_records[i]) continue;
             if (!remove_record_single_uk(tc, old_records[i], set_idx) ||
                 !index_record_single_uk(tc, i, set_idx)) {
-                rollback_updated_records(tc, old_records);
-                rebuild_uk_indexes(tc);
+                restore_updated_batch(tc, old_records, 1);
                 free(old_records);
                 printf("[error] UPDATE failed: UK index update failed; memory restored.\n");
                 return -1;
@@ -4443,28 +4379,13 @@ static int execute_update_scan(TableCache *tc, Statement *stmt, int set_idx, con
         }
     }
 
-    if (can_use_delta_log(tc)) {
-        if (!append_delta_updates(tc, old_records)) {
-            rollback_updated_records(tc, old_records);
-            if (rebuild_uk_needed) rebuild_uk_indexes(tc);
-            free(old_records);
-            printf("[error] UPDATE failed: delta log append failed; memory restored.\n");
-            return -1;
-        }
-        INFO_PRINTF("[delta] UPDATE persisted through append-only delta log.\n");
-        if (!maybe_compact_delta_log(tc)) {
-            printf("[warning] UPDATE completed, but delta compaction failed.\n");
-        }
-    } else if (!rewrite_file(tc)) {
-        rollback_updated_records(tc, old_records);
-        if (rebuild_uk_needed) rebuild_uk_indexes(tc);
+    if (!persist_updated_batch(tc, old_records, rebuild_uk_needed)) {
         free(old_records);
         printf("[error] UPDATE warning: memory changed but file rewrite failed.\n");
         return -1;
     }
 
-    for (i = 0; i < tc->record_count; i++) free(old_records[i]);
-    free(old_records);
+    free_saved_rows(old_records, tc->record_count);
     tc->snapshot_dirty = 1;
     INFO_PRINTF("[ok] UPDATE completed. rows=%d\n", count);
     return 1;
@@ -4549,22 +4470,11 @@ static int scan_truncated_update_targets(TableCache *tc, Statement *stmt, int se
     return 1;
 }
 
-static int execute_delete_single_row(TableCache *tc, Statement *stmt, int index_col,
-                                     const WhereCondition *lookup_cond, int uses_pk_lookup,
-                                     int uses_aux_lookup) {
+static int execute_delete_single_row(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                     MutationLookupMode lookup_mode) {
     int target_row = -1;
     char *old_record;
-
-    if (uses_pk_lookup) {
-        INFO_PRINTF("[index] B+ tree id lookup for DELETE\n");
-        if (!find_pk_row(tc, lookup_cond->val, &target_row)) return 0;
-    } else if (uses_aux_lookup) {
-        INFO_PRINTF("[index] auxiliary exact lookup for DELETE on column '%s'\n", lookup_cond->col);
-        if (!find_github_row(tc, lookup_cond->val, &target_row)) return 0;
-    } else {
-        INFO_PRINTF("[index] UK B+ tree lookup for DELETE on column '%s'\n", lookup_cond->col);
-        if (!find_uk_row(tc, index_col, lookup_cond->val, &target_row)) return 0;
-    }
+    if (resolve_mutation_lookup_row(tc, stmt, lookup, lookup_mode, &target_row) <= 0) return 0;
 
     old_record = slot_row(tc, target_row);
     if (!old_record) {
@@ -4580,6 +4490,7 @@ static int execute_delete_scan(TableCache *tc, Statement *stmt) {
     char **old_records;
     int *delete_flags;
     int count = 0;
+    int deleted_count;
     int read_idx;
 
     old_count = tc->record_count;
@@ -4604,36 +4515,21 @@ static int execute_delete_scan(TableCache *tc, Statement *stmt) {
         return 0;
     }
 
-    for (read_idx = 0; read_idx < tc->record_count; read_idx++) {
-        if (delete_flags[read_idx] && tc->record_active[read_idx]) {
-            tc->record_active[read_idx] = 0;
-            tc->active_count--;
-        }
-    }
-
-    if (can_use_delta_log(tc)) {
-        if (!append_delta_deletes(tc, old_records, delete_flags, old_count)) {
-            reset_deleted_flags(tc, delete_flags, old_count);
-            tc->active_count += count;
-            free(old_records);
-            free(delete_flags);
-            printf("[error] DELETE failed: delta log append failed; memory restored.\n");
-            return -1;
-        }
-        INFO_PRINTF("[delta] DELETE persisted through append-only delta log.\n");
-        if (!maybe_compact_delta_log(tc)) {
-            printf("[warning] DELETE completed, but delta compaction failed.\n");
-        }
-    } else if (!rewrite_file(tc)) {
-        reset_deleted_flags(tc, delete_flags, old_count);
-        tc->active_count += count;
+    deleted_count = mark_deleted_batch(tc, delete_flags, old_count);
+    if (!persist_deleted_batch(tc, old_records, delete_flags, old_count, deleted_count)) {
         free(old_records);
         free(delete_flags);
         printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
         return -1;
     }
 
-    release_deleted_slots(tc, delete_flags, old_count);
+    if (!finalize_deleted_batch(tc, delete_flags, old_count)) {
+        restore_deleted_batch(tc, delete_flags, old_count, deleted_count);
+        free(old_records);
+        free(delete_flags);
+        printf("[error] DELETE failed: free-slot bookkeeping failed.\n");
+        return -1;
+    }
     free(old_records);
     free(delete_flags);
     tc->snapshot_dirty = 1;
@@ -4662,6 +4558,75 @@ static int resolve_tail_pk_row(TableCache *tc, Statement *stmt, long pk_key, lon
     return 1;
 }
 
+static void mark_single_deleted_row(TableCache *tc, int target_row) {
+    if (!tc || target_row < 0 || target_row >= tc->record_count) return;
+    tc->record_active[target_row] = 0;
+    tc->active_count--;
+}
+
+static void restore_single_deleted_row(TableCache *tc, int target_row) {
+    if (!tc || target_row < 0 || target_row >= tc->record_count) return;
+    tc->record_active[target_row] = 1;
+    tc->active_count++;
+}
+
+static int finalize_single_deleted_row(TableCache *tc, int target_row) {
+    if (!tc || target_row < 0 || target_row >= tc->record_count) return 0;
+    clear_slot_storage(tc, target_row);
+    return push_free_slot(tc, target_row);
+}
+
+static int mark_deleted_batch(TableCache *tc, int *delete_flags, int old_count) {
+    int i;
+    int count = 0;
+
+    if (!tc || !delete_flags) return 0;
+    for (i = 0; i < old_count; i++) {
+        if (!delete_flags[i] || !tc->record_active[i]) continue;
+        tc->record_active[i] = 0;
+        tc->active_count--;
+        count++;
+    }
+    return count;
+}
+
+static void restore_deleted_batch(TableCache *tc, int *delete_flags, int old_count, int deleted_count) {
+    reset_deleted_flags(tc, delete_flags, old_count);
+    if (tc) tc->active_count += deleted_count;
+}
+
+static int finalize_deleted_batch(TableCache *tc, int *delete_flags, int old_count) {
+    int i;
+
+    if (!tc || !delete_flags) return 0;
+    for (i = 0; i < old_count; i++) {
+        if (!delete_flags[i]) continue;
+        clear_slot_storage(tc, i);
+        if (!push_free_slot(tc, i)) return 0;
+    }
+    return 1;
+}
+
+static int persist_deleted_batch(TableCache *tc, char **old_records, int *delete_flags, int old_count, int deleted_count) {
+    if (can_use_delta_log(tc)) {
+        if (!append_delta_deletes(tc, old_records, delete_flags, old_count)) {
+            restore_deleted_batch(tc, delete_flags, old_count, deleted_count);
+            return 0;
+        }
+        INFO_PRINTF("[delta] DELETE persisted through append-only delta log.\n");
+        if (!maybe_compact_delta_log(tc)) {
+            printf("[warning] DELETE completed, but delta compaction failed.\n");
+        }
+        return 1;
+    }
+
+    if (!rewrite_file(tc)) {
+        restore_deleted_batch(tc, delete_flags, old_count, deleted_count);
+        return 0;
+    }
+    return 1;
+}
+
 static int persist_deleted_slot(TableCache *tc, int target_row, char *old_record, int emit_logs) {
     if (!tc || target_row < 0 || target_row >= tc->record_count || !old_record) return -1;
     if (!ensure_free_slot_capacity(tc, tc->free_count + 1)) {
@@ -4669,12 +4634,10 @@ static int persist_deleted_slot(TableCache *tc, int target_row, char *old_record
         return -1;
     }
 
-    tc->record_active[target_row] = 0;
-    tc->active_count--;
+    mark_single_deleted_row(tc, target_row);
     if (can_use_delta_log(tc)) {
         if (!append_delta_delete_slot(tc, target_row, old_record)) {
-            tc->record_active[target_row] = 1;
-            tc->active_count++;
+            restore_single_deleted_row(tc, target_row);
             if (emit_logs) printf("[error] DELETE failed: delta log append failed; memory restored.\n");
             return -1;
         }
@@ -4683,14 +4646,16 @@ static int persist_deleted_slot(TableCache *tc, int target_row, char *old_record
             printf("[warning] DELETE completed, but delta compaction failed.\n");
         }
     } else if (!rewrite_file(tc)) {
-        tc->record_active[target_row] = 1;
-        tc->active_count++;
+        restore_single_deleted_row(tc, target_row);
         if (emit_logs) printf("[error] DELETE warning: memory changed but file rewrite failed.\n");
         return -1;
     }
 
-    clear_slot_storage(tc, target_row);
-    tc->free_slots[tc->free_count++] = target_row;
+    if (!finalize_single_deleted_row(tc, target_row)) {
+        restore_single_deleted_row(tc, target_row);
+        if (emit_logs) printf("[error] DELETE failed: free-slot bookkeeping failed.\n");
+        return -1;
+    }
     tc->snapshot_dirty = 1;
     if (emit_logs) INFO_PRINTF("[ok] DELETE completed. rows=1\n");
     return 1;
@@ -4764,17 +4729,6 @@ static void reset_deleted_flags(TableCache *tc, int *delete_flags, int old_count
     for (i = 0; i < old_count; i++) {
         if (!delete_flags[i]) continue;
         tc->record_active[i] = 1;
-    }
-}
-
-static void release_deleted_slots(TableCache *tc, int *delete_flags, int old_count) {
-    int i;
-
-    if (!tc || !delete_flags) return;
-    for (i = 0; i < old_count; i++) {
-        if (!delete_flags[i]) continue;
-        clear_slot_storage(tc, i);
-        push_free_slot(tc, i);
     }
 }
 
@@ -5298,7 +5252,11 @@ static int rewrite_truncated_update(TableCache *tc, Statement *stmt,
         if (matched) {
             char new_row[RECORD_SIZE];
 
-            if (!build_updated_row_text(tc, line, set_idx, set_value, new_row, sizeof(new_row))) goto fail;
+            if (row_column_equals_value(tc, line, set_idx, set_value)) {
+                if (fprintf(out, "%s\n", line) < 0) goto fail;
+                continue;
+            }
+            if (!build_updated_row_buffer(tc, line, set_idx, set_value, new_row, sizeof(new_row), 1)) goto fail;
             if (fprintf(out, "%s\n", new_row) < 0) goto fail;
             count++;
             continue;
@@ -5393,7 +5351,11 @@ static int execute_update_tail_pk_row(TableCache *tc, Statement *stmt, long pk_k
         return -1;
     }
     if (resolved == 0) return 0;
-    if (!build_updated_row_text(tc, current_row, set_idx, set_value, new_row, sizeof(new_row))) {
+    if (row_column_equals_value(tc, current_row, set_idx, set_value)) {
+        INFO_PRINTF("[notice] UPDATE skipped because the target value is unchanged.\n");
+        return 0;
+    }
+    if (!build_updated_row_buffer(tc, current_row, set_idx, set_value, new_row, sizeof(new_row), 1)) {
         printf("[error] UPDATE failed: rebuilt row is too long.\n");
         return -1;
     }
@@ -5435,24 +5397,12 @@ static int execute_delete_tail_pk_row(TableCache *tc, Statement *stmt, long pk_k
     return 1;
 }
 
-static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_idx,
-                                     const WhereCondition *lookup_cond, int set_idx, const char *set_value, int uses_pk_lookup,
-                                     int uses_uk_lookup, int uses_aux_lookup, int rebuild_uk_needed) {
+static int execute_update_single_row(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                     MutationLookupMode lookup_mode, int set_idx, const char *set_value,
+                                     int rebuild_uk_needed) {
     int target_row = -1;
     char *old_record;
-
-    if (uses_pk_lookup) {
-        INFO_PRINTF("[index] B+ tree id lookup for UPDATE\n");
-        if (!find_pk_row(tc, lookup_cond->val, &target_row)) return 0;
-    } else if (uses_uk_lookup) {
-        INFO_PRINTF("[index] UK B+ tree lookup for UPDATE on column '%s'\n", lookup_cond->col);
-        if (!find_uk_row(tc, where_idx, lookup_cond->val, &target_row)) return 0;
-    } else if (uses_aux_lookup) {
-        INFO_PRINTF("[index] auxiliary exact lookup for UPDATE on column '%s'\n", lookup_cond->col);
-        if (!find_github_row(tc, lookup_cond->val, &target_row)) return 0;
-    } else {
-        return -1;
-    }
+    if (resolve_mutation_lookup_row(tc, stmt, lookup, lookup_mode, &target_row) <= 0) return 0;
 
     old_record = slot_row(tc, target_row);
     if (!old_record) {
@@ -5461,16 +5411,61 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
     }
     if (!row_matches_statement(tc, stmt, old_record)) return 0;
     return persist_updated_row(tc, target_row, old_record, set_idx, set_value,
-                               rebuild_uk_needed, 0, 1);
+                               rebuild_uk_needed, 1, 1);
+}
+
+static int execute_update_truncated(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                    MutationLookupMode lookup_mode, int set_idx, const char *set_value,
+                                    int rebuild_uk_needed, int *affected_rows) {
+    if (lookup_mode == MUTATION_LOOKUP_PK && stmt->where_count == 1 && !rebuild_uk_needed) {
+        long pk_key;
+        long tail_offset;
+        int result;
+
+        if (!parse_long_value(stmt->where_conditions[lookup->condition_index].val, &pk_key)) {
+            return 1;
+        }
+        if (find_tail_pk_offset(tc, pk_key, &tail_offset)) {
+            result = execute_update_tail_pk_row(tc, stmt, pk_key, tail_offset, set_idx, set_value);
+        } else {
+            result = execute_update_single_row(tc, stmt, lookup, lookup_mode, set_idx, set_value, rebuild_uk_needed);
+        }
+        if (result > 0 && affected_rows) *affected_rows = result;
+        return result >= 0;
+    }
+
+    if (lookup_mode == MUTATION_LOOKUP_UK) {
+        INFO_PRINTF("[notice] UPDATE on uncached table uses CSV scan fallback because tail rows have no UK offset index.\n");
+    }
+    if (!rewrite_truncated_update(tc, stmt, set_idx, set_value)) {
+        printf("[error] UPDATE failed while using CSV scan fallback.\n");
+        return 0;
+    }
+    if (affected_rows) *affected_rows = 1;
+    return 1;
+}
+
+static int execute_update_exact_or_scan(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                        MutationLookupMode lookup_mode, int set_idx, const char *set_value,
+                                        int rebuild_uk_needed, int *affected_rows) {
+    int result;
+
+    if (mutation_lookup_uses_exact(lookup) && lookup_mode != MUTATION_LOOKUP_NONE) {
+        result = execute_update_single_row(tc, stmt, lookup, lookup_mode, set_idx, set_value, rebuild_uk_needed);
+    } else {
+        result = execute_update_scan(tc, stmt, set_idx, set_value, rebuild_uk_needed);
+    }
+    if (result > 0 && affected_rows) *affected_rows = result;
+    return result >= 0;
 }
 
 static int execute_update_internal(Statement *stmt, int *affected_rows) {
     TableCache *tc = get_table(stmt->table_name);
     MutationLookupPlan lookup;
+    MutationLookupMode lookup_mode;
     int set_idx;
     char set_value[256];
     int rebuild_uk_needed;
-    int result;
 
     if (affected_rows) *affected_rows = 0;
     if (!tc) return 0;
@@ -5487,89 +5482,70 @@ static int execute_update_internal(Statement *stmt, int *affected_rows) {
     if (!prepare_update_set(tc, stmt, &set_idx, set_value, sizeof(set_value), &rebuild_uk_needed)) {
         return 0;
     }
+    lookup_mode = prepare_mutation_lookup_mode(tc, &lookup);
 
     if (tc->cache_truncated) {
-        if (lookup.uses_pk_lookup && stmt->where_count == 1 && !rebuild_uk_needed) {
-            long pk_key;
-            long tail_offset;
-
-            if (!parse_long_value(stmt->where_conditions[lookup.condition_index].val, &pk_key)) {
-                return 1;
-            }
-            if (find_tail_pk_offset(tc, pk_key, &tail_offset)) {
-                int result = execute_update_tail_pk_row(tc, stmt, pk_key, tail_offset, set_idx, set_value);
-                if (result > 0 && affected_rows) *affected_rows = result;
-                return result >= 0;
-            }
-            {
-                int result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
-                                                       set_idx, set_value,
-                                                       lookup.uses_pk_lookup, lookup.uses_uk_lookup,
-                                                       lookup.uses_aux_lookup && ensure_github_index(tc),
-                                                       rebuild_uk_needed);
-                if (result > 0 && affected_rows) *affected_rows = result;
-                return result >= 0;
-            }
-        }
-        if (lookup.uses_uk_lookup) {
-            INFO_PRINTF("[notice] UPDATE on uncached table uses CSV scan fallback because tail rows have no UK offset index.\n");
-        }
-        if (!rewrite_truncated_update(tc, stmt, set_idx, set_value)) {
-            printf("[error] UPDATE failed while using CSV scan fallback.\n");
-            return 0;
-        }
-        if (affected_rows) *affected_rows = 1;
-        return 1;
+        return execute_update_truncated(tc, stmt, &lookup, lookup_mode, set_idx, set_value,
+                                        rebuild_uk_needed, affected_rows);
     }
-
-    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup ||
-        (lookup.uses_aux_lookup && ensure_github_index(tc))) {
-        result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
-                                           set_idx, set_value,
-                                           lookup.uses_pk_lookup, lookup.uses_uk_lookup,
-                                           lookup.uses_aux_lookup && ensure_github_index(tc),
-                                           rebuild_uk_needed);
-        if (result > 0 && affected_rows) *affected_rows = result;
-        return result >= 0;
-    }
-    result = execute_update_scan(tc, stmt, set_idx, set_value, rebuild_uk_needed);
-    if (result > 0 && affected_rows) *affected_rows = result;
-    return result >= 0;
+    return execute_update_exact_or_scan(tc, stmt, &lookup, lookup_mode, set_idx, set_value,
+                                        rebuild_uk_needed, affected_rows);
 }
 
 void execute_update(Statement *stmt) {
     int affected_rows = 0;
 
     if (!execute_update_internal(stmt, &affected_rows)) return;
-    if (affected_rows == 0) INFO_PRINTF("[notice] no rows matched UPDATE condition.\n");
+    if (affected_rows == 0) INFO_PRINTF("[notice] no rows changed for UPDATE condition.\n");
 }
 
-int execute_update_id_fast(const char *table_name, const char *set_col, const char *set_value, const char *id_value) {
-    TableCache *tc;
-    int set_idx;
-    int rebuild_uk_needed;
-    int target_row = -1;
-    char *old_record;
+static int execute_delete_truncated(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                    MutationLookupMode lookup_mode, int *affected_rows) {
+    if (lookup_mode == MUTATION_LOOKUP_PK && stmt->where_count == 1) {
+        long pk_key;
+        long tail_offset;
+        int result;
 
-    if (!table_name || !set_col || !set_value || !id_value) return 0;
-    tc = get_table(table_name);
-    if (!tc || tc->pk_idx < 0 || tc->cache_truncated) return 0;
-    if (!materialize_cached_csv_rows(tc)) return 0;
-    set_idx = get_col_idx(tc, set_col);
-    if (set_idx < 0) return 0;
+        if (!parse_long_value(stmt->where_conditions[lookup->condition_index].val, &pk_key)) {
+            return 1;
+        }
+        if (find_tail_pk_offset(tc, pk_key, &tail_offset)) {
+            result = execute_delete_tail_pk_row(tc, stmt, pk_key, tail_offset);
+            if (result > 0 && affected_rows) *affected_rows = result;
+            return result >= 0;
+        }
+    }
 
-    if (!find_pk_row(tc, id_value, &target_row)) return 1;
-    old_record = slot_row(tc, target_row);
-    if (!old_record) return 0;
-    rebuild_uk_needed = get_uk_slot(tc, set_idx) != -1;
-    return persist_updated_row(tc, target_row, old_record, set_idx, set_value,
-                               rebuild_uk_needed, 1, 0) > 0;
+    if (lookup_mode == MUTATION_LOOKUP_PK) return execute_delete_exact_or_scan(tc, stmt, lookup, lookup_mode, affected_rows);
+
+    if (lookup_mode == MUTATION_LOOKUP_UK) {
+        INFO_PRINTF("[notice] DELETE on uncached table uses CSV scan fallback because tail rows have no UK offset index.\n");
+    }
+    if (!rewrite_truncated_delete(tc, stmt)) {
+        printf("[error] DELETE failed while using CSV scan fallback.\n");
+        return 0;
+    }
+    if (affected_rows) *affected_rows = 1;
+    return 1;
+}
+
+static int execute_delete_exact_or_scan(TableCache *tc, Statement *stmt, const MutationLookupPlan *lookup,
+                                        MutationLookupMode lookup_mode, int *affected_rows) {
+    int result;
+
+    if (mutation_lookup_uses_exact(lookup) && lookup_mode != MUTATION_LOOKUP_NONE) {
+        result = execute_delete_single_row(tc, stmt, lookup, lookup_mode);
+    } else {
+        result = execute_delete_scan(tc, stmt);
+    }
+    if (result > 0 && affected_rows) *affected_rows = result;
+    return result >= 0;
 }
 
 static int execute_delete_internal(Statement *stmt, int *affected_rows) {
     TableCache *tc = get_table(stmt->table_name);
     MutationLookupPlan lookup;
-    int result;
+    MutationLookupMode lookup_mode;
 
     if (affected_rows) *affected_rows = 0;
     if (!tc) return 0;
@@ -5579,45 +5555,11 @@ static int execute_delete_internal(Statement *stmt, int *affected_rows) {
         return 0;
     }
     build_mutation_lookup_plan(tc, stmt, &lookup);
+    lookup_mode = prepare_mutation_lookup_mode(tc, &lookup);
     if (tc->cache_truncated) {
-        if (lookup.uses_pk_lookup && stmt->where_count == 1) {
-            long pk_key;
-            long tail_offset;
-
-            if (!parse_long_value(stmt->where_conditions[lookup.condition_index].val, &pk_key)) {
-                return 1;
-            }
-            if (find_tail_pk_offset(tc, pk_key, &tail_offset)) {
-                int result = execute_delete_tail_pk_row(tc, stmt, pk_key, tail_offset);
-                if (result > 0 && affected_rows) *affected_rows = result;
-                return result >= 0;
-            }
-        }
-        if (!lookup.uses_pk_lookup) {
-            if (lookup.uses_uk_lookup) {
-                INFO_PRINTF("[notice] DELETE on uncached table uses CSV scan fallback because tail rows have no UK offset index.\n");
-            }
-            if (!rewrite_truncated_delete(tc, stmt)) {
-                printf("[error] DELETE failed while using CSV scan fallback.\n");
-                return 0;
-            }
-            if (affected_rows) *affected_rows = 1;
-            return 1;
-        }
+        return execute_delete_truncated(tc, stmt, &lookup, lookup_mode, affected_rows);
     }
-    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup ||
-        (lookup.uses_aux_lookup && ensure_github_index(tc))) {
-        result = execute_delete_single_row(tc, stmt, lookup.where_idx,
-                                           &stmt->where_conditions[lookup.condition_index],
-                                           lookup.uses_pk_lookup,
-                                           lookup.uses_aux_lookup && ensure_github_index(tc));
-        if (result > 0 && affected_rows) *affected_rows = result;
-        return result >= 0;
-    }
-
-    result = execute_delete_scan(tc, stmt);
-    if (result > 0 && affected_rows) *affected_rows = result;
-    return result >= 0;
+    return execute_delete_exact_or_scan(tc, stmt, &lookup, lookup_mode, affected_rows);
 }
 
 void execute_delete(Statement *stmt) {
@@ -5625,27 +5567,6 @@ void execute_delete(Statement *stmt) {
 
     if (!execute_delete_internal(stmt, &affected_rows)) return;
     if (affected_rows == 0) INFO_PRINTF("[notice] no rows matched DELETE condition.\n");
-}
-
-int execute_delete_id_fast(const char *table_name, const char *id_value) {
-    TableCache *tc;
-    int target_row = -1;
-    char *old_record;
-
-    if (!table_name || !id_value) return 0;
-    tc = get_table(table_name);
-    if (!tc || tc->pk_idx < 0 || tc->cache_truncated) return 0;
-    if (!materialize_cached_csv_rows(tc)) return 0;
-
-    if (!find_pk_row(tc, id_value, &target_row)) return 1;
-    old_record = slot_row(tc, target_row);
-    if (!old_record) return 0;
-    if (!remove_record_indexes(tc, old_record)) return 0;
-    if (persist_deleted_slot(tc, target_row, old_record, 0) <= 0) {
-        restore_record_indexes(tc, target_row);
-        return 0;
-    }
-    return 1;
 }
 
 int executor_execute_statement_with_result(Statement *stmt, ExecutorResult *result) {

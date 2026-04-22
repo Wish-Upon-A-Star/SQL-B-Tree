@@ -221,6 +221,8 @@ void destroy_job_pool(MemoryPool *pool);
 int work_queue_init(WorkQueue *queue, int capacity);
 void work_queue_destroy(WorkQueue *queue);
 int work_queue_push(WorkQueue *queue, void *item, int *depth_out);
+void *work_queue_try_pop(WorkQueue *queue);
+void *work_queue_pop_timed(WorkQueue *queue, uint64_t timeout_ms);
 void *work_queue_pop(WorkQueue *queue);
 void work_queue_shutdown(WorkQueue *queue);
 int planner_cache_init(PlannerCache *cache, int capacity);

@@ -158,7 +158,6 @@ void release_job(EngineCmdProcessorState *state, CmdJob *job) {
 }
 
 void destroy_job_pool(MemoryPool *pool) {
-    MemoryPoolNode *node;
     if (!pool) return;
     memory_pool_destroy(pool);
 }
@@ -204,6 +203,42 @@ int work_queue_push(WorkQueue *queue, void *item, int *depth_out) {
     db_cond_signal(&queue->not_empty);
     db_mutex_unlock(&queue->mutex);
     return 1;
+}
+
+void *work_queue_try_pop(WorkQueue *queue) {
+    void *item = NULL;
+
+    if (!queue) return NULL;
+    db_mutex_lock(&queue->mutex);
+    if (queue->count > 0) {
+        item = queue->items[queue->head];
+        queue->head = (queue->head + 1) % queue->capacity;
+        queue->count--;
+        db_cond_signal(&queue->not_full);
+    }
+    db_mutex_unlock(&queue->mutex);
+    return item;
+}
+
+void *work_queue_pop_timed(WorkQueue *queue, uint64_t timeout_ms) {
+    void *item = NULL;
+
+    if (!queue) return NULL;
+    db_mutex_lock(&queue->mutex);
+    while (!queue->shutdown && queue->count == 0) {
+        if (!db_cond_timedwait(&queue->not_empty, &queue->mutex, timeout_ms)) {
+            db_mutex_unlock(&queue->mutex);
+            return NULL;
+        }
+    }
+    if (queue->count > 0) {
+        item = queue->items[queue->head];
+        queue->head = (queue->head + 1) % queue->capacity;
+        queue->count--;
+        db_cond_signal(&queue->not_full);
+    }
+    db_mutex_unlock(&queue->mutex);
+    return item;
 }
 
 void *work_queue_pop(WorkQueue *queue) {

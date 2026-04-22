@@ -10,7 +10,6 @@
 #endif
 
 #include "types.h"
-#include "parser.h"
 #include "executor.h"
 #include "cmd_processor/cmd_processor.h"
 #include "cmd_processor/cmd_processor_sync_bridge.h"
@@ -18,10 +17,7 @@
 #include "bench_memtrack.h"
 
 static void configure_console_encoding(void);
-static void copy_trimmed(char *dst, size_t dst_size, const char *start, const char *end);
-static int starts_with_keyword(const char *text, const char *keyword);
 static const char *skip_utf8_bom_and_space(const char *sql);
-static void dispatch_statement(const Statement *stmt);
 typedef enum {
     APP_MODE_EXEC_FILE,
     APP_MODE_GENERATE_JUNGLE
@@ -41,10 +37,6 @@ static int parse_count_arg(int argc, char *argv[], int index, int fallback);
 static int read_input_filename(AppConfig *config);
 static int parse_app_config(int argc, char *argv[], AppConfig *config);
 static int run_app(const AppConfig *config);
-static int parse_fast_insert_sql(const char *sql);
-static int parse_fast_update_sql(const char *sql);
-static int parse_fast_delete_sql(const char *sql);
-static int try_execute_fast_sql(const char *sql);
 static void execute_sql_text(const char *sql);
 static int flush_sql_buffer(char *sql_buffer, int *length, int *too_long);
 static int execute_sql_file(const char *filename);
@@ -59,29 +51,6 @@ static void configure_console_encoding(void) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
-}
-
-static void copy_trimmed(char *dst, size_t dst_size, const char *start, const char *end) {
-    size_t len;
-
-    if (!dst || dst_size == 0 || !start || !end || end < start) return;
-    while (start < end && isspace((unsigned char)*start)) start++;
-    while (end > start && isspace((unsigned char)*(end - 1))) end--;
-    if (end > start && *start == '\'' && *(end - 1) == '\'') {
-        start++;
-        end--;
-    }
-    len = (size_t)(end - start);
-    if (len >= dst_size) len = dst_size - 1;
-    memcpy(dst, start, len);
-    dst[len] = '\0';
-}
-
-static int starts_with_keyword(const char *text, const char *keyword) {
-    size_t length = strlen(keyword);
-
-    return strncmp(text, keyword, length) == 0 &&
-           (text[length] == '\0' || isspace((unsigned char)text[length]));
 }
 
 static const char *skip_utf8_bom_and_space(const char *sql) {
@@ -103,25 +72,6 @@ static void next_request_id(char buffer[64]) {
     snprintf(buffer, 64, "req-%llu-%llu",
              (unsigned long long)now,
              (unsigned long long)counter);
-}
-
-static void dispatch_statement(const Statement *stmt) {
-    switch (stmt->type) {
-        case STMT_INSERT:
-            execute_insert((Statement *)stmt);
-            return;
-        case STMT_SELECT:
-            execute_select((Statement *)stmt);
-            return;
-        case STMT_DELETE:
-            execute_delete((Statement *)stmt);
-            return;
-        case STMT_UPDATE:
-            execute_update((Statement *)stmt);
-            return;
-        default:
-            return;
-    }
 }
 
 static void init_app_config(AppConfig *config) {
@@ -185,112 +135,6 @@ static int run_app(const AppConfig *config) {
             shutdown_cmd_processor();
             return 0;
     }
-}
-
-static int parse_fast_insert_sql(const char *sql) {
-    const char *p;
-    const char *values_kw;
-    const char *close_paren;
-    char table[256];
-    char values[MAX_SQL_LEN];
-
-    if (!starts_with_keyword(sql, "INSERT")) return 0;
-
-    p = strstr(sql, "INTO");
-    if (!p) return 0;
-    p += 4;
-
-    while (isspace((unsigned char)*p)) p++;
-    values_kw = strstr(p, "VALUES");
-    if (!values_kw) return 0;
-
-    copy_trimmed(table, sizeof(table), p, values_kw);
-    p = strchr(values_kw, '(');
-    close_paren = strrchr(values_kw, ')');
-    if (!p || !close_paren || close_paren <= p) return 0;
-
-    copy_trimmed(values, sizeof(values), p + 1, close_paren);
-    return execute_insert_values_fast(table, values);
-}
-
-static int parse_fast_update_sql(const char *sql) {
-    const char *cursor;
-    const char *set_kw;
-    const char *where_kw;
-    const char *eq;
-    char table[256];
-    char column[50];
-    char value[256];
-    char id_value[64];
-
-    if (!starts_with_keyword(sql, "UPDATE")) return 0;
-
-    cursor = sql + 6;
-    while (isspace((unsigned char)*cursor)) cursor++;
-
-    set_kw = strstr(cursor, "SET");
-    where_kw = strstr(cursor, "WHERE");
-    if (!set_kw || !where_kw || where_kw <= set_kw) return 0;
-
-    copy_trimmed(table, sizeof(table), cursor, set_kw);
-    cursor = set_kw + 3;
-    eq = strchr(cursor, '=');
-    if (!eq || eq > where_kw) return 0;
-
-    copy_trimmed(column, sizeof(column), cursor, eq);
-    copy_trimmed(value, sizeof(value), eq + 1, where_kw);
-
-    cursor = where_kw + 5;
-    while (isspace((unsigned char)*cursor)) cursor++;
-    if (strncmp(cursor, "id", 2) != 0 ||
-        !(cursor[2] == '\0' || isspace((unsigned char)cursor[2]) || cursor[2] == '=')) {
-        return 0;
-    }
-
-    eq = strchr(cursor, '=');
-    if (!eq) return 0;
-
-    copy_trimmed(id_value, sizeof(id_value), eq + 1, sql + strlen(sql));
-    return execute_update_id_fast(table, column, value, id_value);
-}
-
-static int parse_fast_delete_sql(const char *sql) {
-    const char *from_kw;
-    const char *where_kw;
-    const char *cursor;
-    const char *eq;
-    char table[256];
-    char id_value[64];
-
-    if (!starts_with_keyword(sql, "DELETE")) return 0;
-
-    from_kw = strstr(sql, "FROM");
-    where_kw = strstr(sql, "WHERE");
-    if (!from_kw || !where_kw || where_kw <= from_kw) return 0;
-
-    cursor = from_kw + 4;
-    copy_trimmed(table, sizeof(table), cursor, where_kw);
-
-    cursor = where_kw + 5;
-    while (isspace((unsigned char)*cursor)) cursor++;
-    if (strncmp(cursor, "id", 2) != 0 ||
-        !(cursor[2] == '\0' || isspace((unsigned char)cursor[2]) || cursor[2] == '=')) {
-        return 0;
-    }
-
-    eq = strchr(cursor, '=');
-    if (!eq) return 0;
-
-    copy_trimmed(id_value, sizeof(id_value), eq + 1, sql + strlen(sql));
-    return execute_delete_id_fast(table, id_value);
-}
-
-static int try_execute_fast_sql(const char *sql) {
-    if (parse_fast_insert_sql(sql)) return 1;
-    if (parse_fast_update_sql(sql)) return 1;
-    if (parse_fast_delete_sql(sql)) return 1;
-
-    return 0;
 }
 
 static void execute_sql_text(const char *sql) {

@@ -99,23 +99,6 @@ static int submit_ping_inline(EngineCmdProcessorState *state,
     return 0;
 }
 
-static int submit_sql_inline(EngineCmdProcessorState *state,
-                             CmdProcessor *processor,
-                             CmdRequest *request,
-                             ResponseSlot *response_slot,
-                             CmdProcessorResponseCallback callback,
-                             void *user_data,
-                             const LockPlan *lock_plan,
-                             uint64_t start_us) {
-    ExecutionStats stats;
-
-    memset(&stats, 0, sizeof(stats));
-    execute_planned_request(state, request, response_slot, lock_plan, &stats);
-    stats.total_us = monotonic_us() - start_us;
-    deliver_inline_response(state, processor, request, response_slot, callback, user_data, &stats);
-    return 0;
-}
-
 static int plan_request_or_respond(EngineCmdProcessorState *state,
                                    CmdProcessor *processor,
                                    CmdRequest *request,
@@ -135,26 +118,6 @@ static int plan_request_or_respond(EngineCmdProcessorState *state,
                            "request planning failed",
                            state->response_body_capacity);
     return 0;
-}
-
-static int dispatch_sql_request(EngineCmdProcessorState *state,
-                                CmdProcessor *processor,
-                                CmdRequest *request,
-                                ResponseSlot *response_slot,
-                                CmdProcessorResponseCallback callback,
-                                void *user_data,
-                                const RoutePlan *route_plan,
-                                const LockPlan *lock_plan,
-                                uint64_t start_us) {
-    (void)start_us;
-    return enqueue_planned_job(state,
-                               processor,
-                               request,
-                               response_slot,
-                               callback,
-                               user_data,
-                               route_plan,
-                               lock_plan);
 }
 
 static int enqueue_planned_job(EngineCmdProcessorState *state,
@@ -241,15 +204,14 @@ static int processor_submit(CmdProcessor *processor,
         return 0;
     }
 
-    return dispatch_sql_request(state,
-                                processor,
-                                request,
-                                response_slot,
-                                callback,
-                                user_data,
-                                &route_plan,
-                                &lock_plan,
-                                start_us);
+    return enqueue_planned_job(state,
+                               processor,
+                               request,
+                               response_slot,
+                               callback,
+                               user_data,
+                               &route_plan,
+                               &lock_plan);
 }
 
 static int processor_make_error_response(CmdProcessorContext *context, const char *request_id, CmdStatusCode status, const char *error_message, CmdResponse **out_response) {

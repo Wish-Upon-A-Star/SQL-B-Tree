@@ -54,6 +54,13 @@ static const TestTableSpec g_table_specs[] = {
     {TEST_TABLE_B, TEST_FILE_B}
 };
 
+uint64_t monotonic_us(void);
+
+static int create_processor_with_options(size_t response_body_capacity,
+                                         int worker_count,
+                                         int shard_count,
+                                         CmdProcessor **out_processor);
+
 static void cleanup_tables(void) {
     close_all_tables();
     remove(TEST_FILE_A);
@@ -69,6 +76,20 @@ static int file_exists(const char *path) {
     if (!f) return 0;
     fclose(f);
     return 1;
+}
+
+static long file_size_or_minus_one(const char *path) {
+    FILE *f = fopen(path, "rb");
+    long size;
+
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    size = ftell(f);
+    fclose(f);
+    return size;
 }
 
 typedef struct {
@@ -144,27 +165,13 @@ static const unsigned char *parse_binary_field(const CmdResponse *response,
 }
 
 static int create_processor(CmdProcessor **out_processor) {
-    CmdProcessorContext context;
-    EngineCmdProcessorOptions options;
-
-    if (out_processor) *out_processor = NULL;
-    memset(&context, 0, sizeof(context));
-    context.name = "engine_cmd_processor_test";
-    context.max_sql_len = 256;
-    context.request_buffer_count = 16;
-    context.response_body_capacity = 256;
-
-    memset(&options, 0, sizeof(options));
-    options.worker_count = 2;
-    options.shard_count = 1;
-    options.queue_capacity_per_shard = 16;
-    options.planner_cache_capacity = 32;
-    return engine_cmd_processor_create(&context, &options, out_processor);
+    return create_processor_with_options(256, 2, 1, out_processor);
 }
 
-static int create_processor_with_body_capacity(size_t response_body_capacity,
-                                              int shard_count,
-                                              CmdProcessor **out_processor) {
+static int create_processor_with_options(size_t response_body_capacity,
+                                         int worker_count,
+                                         int shard_count,
+                                         CmdProcessor **out_processor) {
     CmdProcessorContext context;
     EngineCmdProcessorOptions options;
 
@@ -176,11 +183,17 @@ static int create_processor_with_body_capacity(size_t response_body_capacity,
     context.response_body_capacity = response_body_capacity;
 
     memset(&options, 0, sizeof(options));
-    options.worker_count = 2;
+    options.worker_count = worker_count;
     options.shard_count = shard_count;
     options.queue_capacity_per_shard = 16;
     options.planner_cache_capacity = 32;
     return engine_cmd_processor_create(&context, &options, out_processor);
+}
+
+static int create_processor_with_body_capacity(size_t response_body_capacity,
+                                              int shard_count,
+                                              CmdProcessor **out_processor) {
+    return create_processor_with_options(response_body_capacity, 2, shard_count, out_processor);
 }
 
 static int submit_sql(CmdProcessor *processor,
@@ -236,6 +249,92 @@ static db_thread_return_t DB_THREAD_CALL submit_worker(void *arg_ptr) {
 #else
     return NULL;
 #endif
+}
+
+static int build_hot_shard_sqls(char sqls[][256], int sql_count, unsigned long shard_mod) {
+    int found = 0;
+    int suffix = 0;
+
+    while (found < sql_count) {
+        snprintf(sqls[found], 256, "SELECT id FROM " TEST_TABLE_A " WHERE name = '__hot_shard_%d__'", suffix++);
+        if ((test_hash_text(sqls[found]) % 4UL) != shard_mod) continue;
+        found++;
+    }
+    return 0;
+}
+
+static unsigned long long run_hot_shard_read_batch(int worker_count, int shard_count, int request_count) {
+    CmdProcessor *processor = NULL;
+    db_thread_t threads[8];
+    SubmitArg args[8];
+    db_mutex_t start_mutex;
+    db_cond_t start_cond;
+    int start_flag = 0;
+    char sqls[8][256];
+    unsigned long long start_us;
+    unsigned long long elapsed_us;
+    int i;
+
+    if (request_count > 8) return 0;
+    if (create_processor_with_options(256, worker_count, shard_count, &processor) != 0 || !processor) return 0;
+    if (build_hot_shard_sqls(sqls, request_count, 0UL) != 0) {
+        cmd_processor_shutdown(processor);
+        return 0;
+    }
+
+    for (i = 0; i < request_count; i++) {
+        char request_id[32];
+        snprintf(request_id, sizeof(request_id), "warm-hot-%d", i);
+        if (run_sql(processor, request_id, sqls[i]) != 0) {
+            cmd_processor_shutdown(processor);
+            return 0;
+        }
+    }
+
+    if (!db_mutex_init(&start_mutex) || !db_cond_init(&start_cond)) {
+        cmd_processor_shutdown(processor);
+        return 0;
+    }
+    memset(args, 0, sizeof(args));
+    for (i = 0; i < request_count; i++) {
+        static const char *request_ids[] = {
+            "bench-hot-0", "bench-hot-1", "bench-hot-2", "bench-hot-3",
+            "bench-hot-4", "bench-hot-5", "bench-hot-6", "bench-hot-7"
+        };
+        args[i].processor = processor;
+        args[i].request_id = request_ids[i];
+        args[i].sql = sqls[i];
+        args[i].expect_ok = 1;
+        args[i].start_mutex = &start_mutex;
+        args[i].start_cond = &start_cond;
+        args[i].start_flag = &start_flag;
+        if (!db_thread_create(&threads[i], submit_worker, &args[i])) {
+            db_cond_destroy(&start_cond);
+            db_mutex_destroy(&start_mutex);
+            cmd_processor_shutdown(processor);
+            return 0;
+        }
+    }
+
+    db_mutex_lock(&start_mutex);
+    start_us = monotonic_us();
+    start_flag = 1;
+    db_cond_broadcast(&start_cond);
+    db_mutex_unlock(&start_mutex);
+    for (i = 0; i < request_count; i++) {
+        db_thread_join(threads[i]);
+        if (args[i].failed) {
+            db_cond_destroy(&start_cond);
+            db_mutex_destroy(&start_mutex);
+            cmd_processor_shutdown(processor);
+            return 0;
+        }
+    }
+    elapsed_us = monotonic_us() - start_us;
+    db_cond_destroy(&start_cond);
+    db_mutex_destroy(&start_mutex);
+    cmd_processor_shutdown(processor);
+    return elapsed_us;
 }
 
 static int create_test_tables(void) {
@@ -438,6 +537,118 @@ static int test_parallel_execution_same_table_reads(void) {
     CHECK(stats.max_concurrent_executions >= 2);
 
     cmd_processor_shutdown(processor);
+    cleanup_tables();
+    set_executor_quiet(0);
+    return 0;
+}
+
+static int test_hot_shard_reads_use_multiple_workers(void) {
+    CmdProcessor *processor = NULL;
+    EngineCmdProcessorStats stats;
+    db_thread_t threads[4];
+    SubmitArg args[4];
+    db_mutex_t start_mutex;
+    db_cond_t start_cond;
+    int start_flag = 0;
+    char sqls[4][256];
+    int found = 0;
+    int suffix = 0;
+
+    cleanup_tables();
+    generate_jungle_dataset(120000, TEST_FILE_A);
+    CHECK(file_exists(TEST_FILE_A) == 1);
+
+    set_executor_quiet(1);
+    CHECK(create_processor_with_options(256, 4, 4, &processor) == 0);
+    CHECK(processor != NULL);
+
+    while (found < 4) {
+        snprintf(sqls[found], sizeof(sqls[found]), "SELECT id FROM " TEST_TABLE_A " WHERE name = '__hot_shard_%d__'", suffix++);
+        if ((test_hash_text(sqls[found]) % 4UL) != 0UL) continue;
+        found++;
+    }
+
+    CHECK(run_sql(processor, "warm-hot-0", sqls[0]) == 0);
+    CHECK(run_sql(processor, "warm-hot-1", sqls[1]) == 0);
+    CHECK(run_sql(processor, "warm-hot-2", sqls[2]) == 0);
+    CHECK(run_sql(processor, "warm-hot-3", sqls[3]) == 0);
+
+    CHECK(db_mutex_init(&start_mutex) == 1);
+    CHECK(db_cond_init(&start_cond) == 1);
+
+    memset(args, 0, sizeof(args));
+    args[0].processor = processor;
+    args[0].request_id = "hot-shard-0";
+    args[0].sql = sqls[0];
+    args[0].expect_ok = 1;
+    args[1].processor = processor;
+    args[1].request_id = "hot-shard-1";
+    args[1].sql = sqls[1];
+    args[1].expect_ok = 1;
+    args[2].processor = processor;
+    args[2].request_id = "hot-shard-2";
+    args[2].sql = sqls[2];
+    args[2].expect_ok = 1;
+    args[3].processor = processor;
+    args[3].request_id = "hot-shard-3";
+    args[3].sql = sqls[3];
+    args[3].expect_ok = 1;
+
+    args[0].start_mutex = &start_mutex;
+    args[0].start_cond = &start_cond;
+    args[0].start_flag = &start_flag;
+    args[1].start_mutex = &start_mutex;
+    args[1].start_cond = &start_cond;
+    args[1].start_flag = &start_flag;
+    args[2].start_mutex = &start_mutex;
+    args[2].start_cond = &start_cond;
+    args[2].start_flag = &start_flag;
+    args[3].start_mutex = &start_mutex;
+    args[3].start_cond = &start_cond;
+    args[3].start_flag = &start_flag;
+
+    CHECK(db_thread_create(&threads[0], submit_worker, &args[0]) == 1);
+    CHECK(db_thread_create(&threads[1], submit_worker, &args[1]) == 1);
+    CHECK(db_thread_create(&threads[2], submit_worker, &args[2]) == 1);
+    CHECK(db_thread_create(&threads[3], submit_worker, &args[3]) == 1);
+    db_mutex_lock(&start_mutex);
+    start_flag = 1;
+    db_cond_broadcast(&start_cond);
+    db_mutex_unlock(&start_mutex);
+    db_thread_join(threads[0]);
+    db_thread_join(threads[1]);
+    db_thread_join(threads[2]);
+    db_thread_join(threads[3]);
+    db_cond_destroy(&start_cond);
+    db_mutex_destroy(&start_mutex);
+
+    CHECK(args[0].failed == 0);
+    CHECK(args[1].failed == 0);
+    CHECK(args[2].failed == 0);
+    CHECK(args[3].failed == 0);
+    CHECK(engine_cmd_processor_snapshot_stats(processor, &stats) == 0);
+    CHECK(stats.max_concurrent_executions >= 2);
+
+    cmd_processor_shutdown(processor);
+    cleanup_tables();
+    set_executor_quiet(0);
+    return 0;
+}
+
+static int test_hot_shard_reads_scale_beyond_single_worker(void) {
+    unsigned long long single_worker_us;
+    unsigned long long multi_worker_us;
+
+    cleanup_tables();
+    generate_jungle_dataset(180000, TEST_FILE_A);
+    CHECK(file_exists(TEST_FILE_A) == 1);
+    set_executor_quiet(1);
+
+    single_worker_us = run_hot_shard_read_batch(1, 4, 8);
+    multi_worker_us = run_hot_shard_read_batch(4, 4, 8);
+    printf("[bench] hot-shard single-worker=%llu us multi-worker=%llu us\n", single_worker_us, multi_worker_us);
+    CHECK(multi_worker_us < single_worker_us);
+
     cleanup_tables();
     set_executor_quiet(0);
     return 0;
@@ -840,16 +1051,111 @@ static int test_parallel_same_id_read_update_serializes(void) {
     return 0;
 }
 
+static int test_update_same_value_skips_persistence(void) {
+    CmdProcessor *processor = NULL;
+    CmdResponse *response = NULL;
+    BinaryRowsetHeader header;
+    size_t offset = 0;
+    const unsigned char *cursor = NULL;
+    char column_name[32];
+    char row_value[128];
+    char sql[256];
+    long delta_size_before;
+    long delta_size_after;
+
+    cleanup_tables();
+    CHECK(create_test_tables() == 0);
+    set_executor_quiet(1);
+    CHECK(create_processor_with_body_capacity(4096, 2, &processor) == 0);
+    CHECK(processor != NULL);
+
+    CHECK(submit_sql(processor,
+                     "noop-select-before",
+                     "SELECT name FROM " TEST_TABLE_A " WHERE id = 1",
+                     &response) == 0);
+    CHECK(response != NULL);
+    CHECK(response->ok == 1);
+    CHECK(response->row_count == 1);
+    CHECK(parse_binary_rowset_header(response, &header, &offset) == 1);
+    cursor = (const unsigned char *)response->body + offset;
+    cursor = parse_binary_column_name(response, cursor, column_name, sizeof(column_name));
+    CHECK(cursor != NULL);
+    CHECK(strcmp(column_name, "name") == 0);
+    cursor = parse_binary_field(response, cursor, row_value, sizeof(row_value));
+    CHECK(cursor != NULL);
+    cmd_processor_release_response(processor, response);
+    response = NULL;
+
+    delta_size_before = file_size_or_minus_one(TEST_TABLE_A ".delta");
+    snprintf(sql, sizeof(sql), "UPDATE " TEST_TABLE_A " SET name = '%s' WHERE id = 1", row_value);
+    CHECK(run_sql(processor, "noop-update", sql) == 0);
+    delta_size_after = file_size_or_minus_one(TEST_TABLE_A ".delta");
+    CHECK(delta_size_before == delta_size_after);
+
+    CHECK(submit_sql(processor,
+                     "noop-select-after",
+                     "SELECT name FROM " TEST_TABLE_A " WHERE id = 1",
+                     &response) == 0);
+    CHECK(response != NULL);
+    CHECK(response->ok == 1);
+    CHECK(response->row_count == 1);
+    CHECK(parse_binary_rowset_header(response, &header, &offset) == 1);
+    cursor = (const unsigned char *)response->body + offset;
+    cursor = parse_binary_column_name(response, cursor, column_name, sizeof(column_name));
+    CHECK(cursor != NULL);
+    cursor = parse_binary_field(response, cursor, row_value, sizeof(row_value));
+    CHECK(cursor != NULL);
+    CHECK(strlen(row_value) > 0);
+    cmd_processor_release_response(processor, response);
+
+    cmd_processor_shutdown(processor);
+    cleanup_tables();
+    set_executor_quiet(0);
+    return 0;
+}
+
+static int test_scan_update_same_value_skips_persistence(void) {
+    CmdProcessor *processor = NULL;
+    long delta_size_before;
+    long delta_size_after;
+
+    cleanup_tables();
+    CHECK(create_test_tables() == 0);
+    set_executor_quiet(1);
+    CHECK(create_processor_with_body_capacity(4096, 2, &processor) == 0);
+    CHECK(processor != NULL);
+
+    CHECK(run_sql(processor,
+                  "scan-noop-insert",
+                  "INSERT INTO " TEST_TABLE_A " VALUES (999031,'scan-noop@test.com','010-9999-0031','ScanNoopName','trackA','bgA','histA','preA','scan-noop-gh','active','1')") == 0);
+
+    delta_size_before = file_size_or_minus_one(TEST_TABLE_A ".delta");
+    CHECK(run_sql(processor,
+                  "scan-noop-update",
+                  "UPDATE " TEST_TABLE_A " SET name = 'ScanNoopName' WHERE github = 'scan-noop-gh'") == 0);
+    delta_size_after = file_size_or_minus_one(TEST_TABLE_A ".delta");
+    CHECK(delta_size_before == delta_size_after);
+
+    cmd_processor_shutdown(processor);
+    cleanup_tables();
+    set_executor_quiet(0);
+    return 0;
+}
+
 int main(void) {
     CHECK(test_select_response_contains_rows_binary() == 0);
     CHECK(test_select_response_too_large_reports_error() == 0);
     CHECK(test_parallel_execution_across_tables() == 0);
     CHECK(test_parallel_execution_same_table_reads() == 0);
+    CHECK(test_hot_shard_reads_use_multiple_workers() == 0);
+    CHECK(test_hot_shard_reads_scale_beyond_single_worker() == 0);
     CHECK(test_parallel_execution_same_id_reads() == 0);
     CHECK(test_parallel_insert_same_pk_rejects_duplicate() == 0);
     CHECK(test_parallel_insert_same_uk_rejects_duplicate() == 0);
     CHECK(test_parallel_same_table_read_write_serializes() == 0);
     CHECK(test_parallel_same_id_read_update_serializes() == 0);
+    CHECK(test_update_same_value_skips_persistence() == 0);
+    CHECK(test_scan_update_same_value_skips_persistence() == 0);
     printf("[ok] engine cmd processor parallel execution test passed\n");
     return 0;
 }

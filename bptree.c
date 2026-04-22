@@ -22,12 +22,6 @@ struct BPlusTree {
     int order;
 };
 
-typedef struct {
-    BPlusNode **nodes;
-    int count;
-    int used;
-} NodePool;
-
 static BPlusNode *create_node(int is_leaf) {
     BPlusNode *node = (BPlusNode *)calloc(1, sizeof(BPlusNode));
     if (!node) return NULL;
@@ -91,61 +85,9 @@ static int upper_bound_long(const long *keys, int count, long key) {
     return lo;
 }
 
-static int tree_height(BPlusNode *node) {
-    int height = 0;
-    while (node) {
-        height++;
-        if (node->is_leaf) break;
-        node = node->children[0];
-    }
-    return height;
-}
-
 static long first_key(BPlusNode *node) {
     while (node && !node->is_leaf) node = node->children[0];
     return (node && node->key_count > 0) ? node->keys[0] : 0;
-}
-
-static int prepare_node_pool(NodePool *pool, int count) {
-    int i;
-
-    pool->nodes = (BPlusNode **)calloc((size_t)count, sizeof(BPlusNode *));
-    if (!pool->nodes) return 0;
-    pool->count = count;
-    pool->used = 0;
-
-    for (i = 0; i < count; i++) {
-        pool->nodes[i] = create_node(1);
-        if (!pool->nodes[i]) {
-            while (--i >= 0) free(pool->nodes[i]);
-            free(pool->nodes);
-            pool->nodes = NULL;
-            pool->count = 0;
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static BPlusNode *take_reserved_node(NodePool *pool, int is_leaf) {
-    BPlusNode *node;
-
-    if (!pool || pool->used >= pool->count) return NULL;
-    node = pool->nodes[pool->used++];
-    memset(node, 0, sizeof(BPlusNode));
-    node->is_leaf = is_leaf;
-    return node;
-}
-
-static void release_unused_pool_nodes(NodePool *pool) {
-    int i;
-
-    if (!pool || !pool->nodes) return;
-    for (i = pool->used; i < pool->count; i++) free(pool->nodes[i]);
-    free(pool->nodes);
-    pool->nodes = NULL;
-    pool->count = 0;
-    pool->used = 0;
 }
 
 BPlusTree *bptree_create(void) {
@@ -464,12 +406,6 @@ struct BPlusStringTree {
     int order;
 };
 
-typedef struct {
-    BPlusStringNode **nodes;
-    int count;
-    int used;
-} StringNodePool;
-
 static char *dup_key(const char *src) {
     size_t len;
     char *copy;
@@ -525,61 +461,9 @@ static BPlusStringNode *create_string_node(int is_leaf) {
     return node;
 }
 
-static int string_tree_height(BPlusStringNode *node) {
-    int height = 0;
-    while (node) {
-        height++;
-        if (node->is_leaf) break;
-        node = node->children[0];
-    }
-    return height;
-}
-
 static char *first_string_key(BPlusStringNode *node) {
     while (node && !node->is_leaf) node = node->children[0];
     return (node && node->key_count > 0) ? node->keys[0] : NULL;
-}
-
-static int prepare_string_node_pool(StringNodePool *pool, int count) {
-    int i;
-
-    pool->nodes = (BPlusStringNode **)calloc((size_t)count, sizeof(BPlusStringNode *));
-    if (!pool->nodes) return 0;
-    pool->count = count;
-    pool->used = 0;
-
-    for (i = 0; i < count; i++) {
-        pool->nodes[i] = create_string_node(1);
-        if (!pool->nodes[i]) {
-            while (--i >= 0) free(pool->nodes[i]);
-            free(pool->nodes);
-            pool->nodes = NULL;
-            pool->count = 0;
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static BPlusStringNode *take_reserved_string_node(StringNodePool *pool, int is_leaf) {
-    BPlusStringNode *node;
-
-    if (!pool || pool->used >= pool->count) return NULL;
-    node = pool->nodes[pool->used++];
-    memset(node, 0, sizeof(BPlusStringNode));
-    node->is_leaf = is_leaf;
-    return node;
-}
-
-static void release_unused_string_pool_nodes(StringNodePool *pool) {
-    int i;
-
-    if (!pool || !pool->nodes) return;
-    for (i = pool->used; i < pool->count; i++) free(pool->nodes[i]);
-    free(pool->nodes);
-    pool->nodes = NULL;
-    pool->count = 0;
-    pool->used = 0;
 }
 
 BPlusStringTree *bptree_string_create(void) {

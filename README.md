@@ -16,6 +16,15 @@ C 기반 미니 DB 프로젝트다. CSV 파일을 테이블처럼 사용하며 `
 - 엔진 `SELECT` 응답 body는 binary rowset 형식 지원
 - 정글 데이터셋 생성기, 벤치 도구, 점수 계산 도구까지 포함
 
+## DB + Worker 기준 문서
+
+- [docs/DB_WORKER_OPTIMIZATION_GUIDELINES_KO.md](docs/DB_WORKER_OPTIMIZATION_GUIDELINES_KO.md)
+  - 팀 범위, 우선순위, 최적화 판단 기준
+- [docs/DB_WORKER_CURRENT_TARGET_KO.md](docs/DB_WORKER_CURRENT_TARGET_KO.md)
+  - 현재 목표와 다음 직접 대상
+- [docs/DB_WORKER_CURRENT_STATE_KO.md](docs/DB_WORKER_CURRENT_STATE_KO.md)
+  - 지금까지의 구조와 보장 범위
+
 ## 파일 구조
 
 현재 읽기 시작점은 아래 순서가 가장 낫다.
@@ -280,6 +289,8 @@ make generate-jungle-sql
   - DB + worker 최적화와 현재 병목 정리
 - `docs/DB_WORKER_CURRENT_STATE_KO.md`
   - 팀 인수인계 기준 현재 상태 요약
+- `docs/DB_WORKER_OPTIMIZATION_GUIDELINES_KO.md`
+  - TCP를 범위에서 제외하고 DB + worker만 최적화하는 팀 지침
 
 ## 점수/벤치 도구
 

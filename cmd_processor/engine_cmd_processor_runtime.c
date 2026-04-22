@@ -498,15 +498,60 @@ static void job_complete(EngineCmdProcessorState *state, CmdJob *job) {
     release_job(state, job);
 }
 
+static CmdJob *try_pop_job_from_any_shard(EngineCmdProcessorState *state, int start_shard) {
+    int i;
+
+    if (!state || state->options.shard_count <= 0) return NULL;
+    for (i = 0; i < state->options.shard_count; i++) {
+        int shard = (start_shard + i) % state->options.shard_count;
+        CmdJob *job = (CmdJob *)work_queue_try_pop(&state->queues[shard]);
+        if (job) return job;
+    }
+    return NULL;
+}
+
+static int has_pending_jobs(EngineCmdProcessorState *state) {
+    int i;
+
+    if (!state || state->options.shard_count <= 0) return 0;
+    for (i = 0; i < state->options.shard_count; i++) {
+        int has_items;
+
+        db_mutex_lock(&state->queues[i].mutex);
+        has_items = state->queues[i].count > 0;
+        db_mutex_unlock(&state->queues[i].mutex);
+        if (has_items) return 1;
+    }
+    return 0;
+}
+
+static int processor_running(EngineCmdProcessorState *state) {
+    int running;
+
+    db_mutex_lock(&state->state_mutex);
+    running = state->running;
+    db_mutex_unlock(&state->state_mutex);
+    return running;
+}
+
 db_thread_return_t DB_THREAD_CALL worker_main(void *arg_ptr) {
     WorkerArgs *arg = (WorkerArgs *)arg_ptr;
     EngineCmdProcessorState *state = arg->state;
-    WorkQueue *queue = &state->queues[arg->shard_id];
+    int preferred_shard = arg->shard_id;
 
     for (;;) {
-        CmdJob *job = (CmdJob *)work_queue_pop(queue);
+        CmdJob *job = try_pop_job_from_any_shard(state, preferred_shard);
 
-        if (!job) break;
+        if (!job) {
+            job = (CmdJob *)work_queue_pop_timed(&state->queues[preferred_shard], 2);
+        }
+
+        if (!job) {
+            if (!processor_running(state) && !has_pending_jobs(state)) break;
+            continue;
+        }
+
+        preferred_shard = job->route_plan.target_shard;
 
         job->stats.queue_wait_us = monotonic_us() - job->enqueue_us;
         execute_planned_request(state,
