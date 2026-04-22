@@ -2,8 +2,8 @@ digraph CmdProcessorOverallArchitecture {
     graph [
         rankdir=LR,
         compound=true,
-        nodesep=0.55,
-        ranksep=0.85,
+        nodesep=0.35,
+        ranksep=0.7,
         splines=line,
         newrank=true,
         pad=0.2,
@@ -27,74 +27,59 @@ digraph CmdProcessorOverallArchitecture {
         arrowsize=0.7
     ];
 
-    subgraph cluster_frontends {
-        label="외부 진입점";
+    subgraph cluster_io {
+        label="입출력 구현체";
         style="rounded,filled";
         color="#cbd5e1";
         fillcolor="#f8fafc";
         fontname="Pretendard";
         fontsize=13;
-        margin=18;
+        margin=14;
 
-        frontends [label="TCP / console / tests\n외부 요청과 응답"];
+        io_impl [
+            label="TCP / REPL / tests\n입력 수신\n출력 형식 관리",
+            fillcolor="#ffffff"
+        ];
     }
 
-    subgraph cluster_contract {
-        label="CmdProcessor 공통 계약";
-        style="rounded,filled";
-        color="#93c5fd";
-        fillcolor="#eff6ff";
-        fontname="Pretendard";
-        fontsize=13;
-        margin=18;
-
-        request [label="CmdRequest"];
-        api [label="CmdProcessor interface\nacquire / submit / release"];
-        response [label="CmdResponse"];
-    }
-
-    subgraph cluster_impls {
-        label="CmdProcessor 구현체";
+    subgraph cluster_core {
+        label="코어";
         style="rounded,filled";
         color="#bae6fd";
         fillcolor="#f0f9ff";
         fontname="Pretendard";
         fontsize=13;
-        margin=18;
+        margin=14;
 
-        engine [label="EngineCmdProcessor\nqueue + worker model"];
-        repl [label="REPLCmdProcessor\nsync model"];
-        mock [label="MockCmdProcessor\ntest model"];
+        cmd_processor [
+            label="CmdProcessor\n요청 처리 정책\nrequest/response 소유",
+            fillcolor="#ffffff"
+        ];
+
+        db_black_box [
+            label="DB 실행\nBlackBox",
+            fillcolor="#ffffff",
+            color="#cbd5e1"
+        ];
     }
 
-    subgraph cluster_db {
-        label="DB 실행 계층";
-        style="rounded,filled";
-        color="#cbd5e1";
-        fillcolor="#ffffff";
-        fontname="Pretendard";
-        fontsize=13;
-        margin=18;
+    cmd_contract [
+        label="CmdRequest / CmdResponse",
+        fillcolor="#dbeafe",
+        color="#60a5fa",
+        margin="0.08,0.04"
+    ];
 
-        db_black_box [label="DB BlackBox"];
-    }
-
-    { rank=same; request; api; response; }
-    { rank=same; engine; repl; mock; }
-
-    frontends -> request [label="요청", weight=10];
-
-    request -> api [label="요청 제출", weight=10];
-    api -> engine [weight=10];
-    api -> repl [weight=10];
-    api -> mock [weight=10];
-
-    engine -> db_black_box [label="SQL 처리", weight=10];
-    repl -> db_black_box [label="SQL 처리", weight=10];
-
-    engine -> response [style=dashed, constraint=false];
-    repl -> response [style=dashed, constraint=false];
-    mock -> response [style=dashed, constraint=false];
-
-    response -> frontends [style=dashed, label="응답", constraint=false];
+    io_impl -> cmd_contract [
+        ltail=cluster_io,
+        arrowhead=none,
+        minlen=2,
+        weight=10
+    ];
+    cmd_contract -> cmd_processor [
+        lhead=cluster_core,
+        minlen=2,
+        weight=10
+    ];
+    cmd_processor -> db_black_box [label="DB 의존", fontsize=9, minlen=1];
 }

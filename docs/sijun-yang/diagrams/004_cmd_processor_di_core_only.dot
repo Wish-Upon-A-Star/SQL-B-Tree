@@ -1,9 +1,9 @@
 digraph CmdProcessorDICoreOnly {
     graph [
-        rankdir=TB,
+        rankdir=LR,
         compound=true,
-        nodesep=0.55,
-        ranksep=0.65,
+        nodesep=0.35,
+        ranksep=0.7,
         splines=line,
         newrank=true,
         pad=0.2,
@@ -27,49 +27,63 @@ digraph CmdProcessorDICoreOnly {
         arrowsize=0.7
     ];
 
-    placeholder [
-        label="진입점 구현체 자리\n아직 주입되지 않음",
-        style="rounded,dashed,filled",
-        fillcolor="#f8fafc",
-        color="#cbd5e1"
-    ];
-
-    subgraph cluster_core {
-        label="코어 구현체";
+    subgraph cluster_impl {
+        label="입출력 구현체";
         style="rounded,filled";
-        color="#93c5fd";
-        fillcolor="#eff6ff";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
         fontname="Pretendard";
         fontsize=13;
-        margin=18;
+        margin=14;
 
-        main_core [
-            label="main / request core\n공통 요청 처리 흐름"
-        ];
-
-        contract [
-            label="CmdProcessor 계약\n요청 제출 + 응답 수신",
-            fillcolor="#dbeafe",
-            color="#60a5fa"
-        ];
-
-        db [
-            label="DB BlackBox\nSQL 실행",
+        impl_slot [
+            label="아직 선택되지 않음\n입출력 관리 없음",
+            style="rounded,dashed,filled",
             fillcolor="#ffffff",
             color="#cbd5e1"
         ];
     }
 
-    output [
-        label="외부 출력 없음\n사용자 접점 없음",
-        fillcolor="#f8fafc",
-        color="#cbd5e1"
+    subgraph cluster_core {
+        label="코어";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=14;
+
+        cmd_processor [
+            label="CmdProcessor\n요청 처리 정책",
+            fillcolor="#ffffff"
+        ];
+
+        db [
+            label="DB 실행\nBlackBox",
+            fillcolor="#ffffff",
+            color="#cbd5e1"
+        ];
+    }
+
+    cmd_contract [
+        label="CmdRequest / CmdResponse",
+        fillcolor="#dbeafe",
+        color="#60a5fa",
+        margin="0.08,0.04"
     ];
 
-    { rank=same; main_core; contract; }
-    { rank=same; db; output; }
-
-    placeholder -> main_core [style=dashed, label="DI slot"];
-    main_core -> contract -> db;
-    contract -> output [style=dashed, label="response"];
+    impl_slot -> cmd_contract [
+        style=dashed,
+        ltail=cluster_impl,
+        arrowhead=none,
+        minlen=2,
+        weight=10
+    ];
+    cmd_contract -> cmd_processor [
+        style=dashed,
+        lhead=cluster_core,
+        minlen=2,
+        weight=10
+    ];
+    cmd_processor -> db [label="DB 의존", fontsize=9, minlen=1];
 }
