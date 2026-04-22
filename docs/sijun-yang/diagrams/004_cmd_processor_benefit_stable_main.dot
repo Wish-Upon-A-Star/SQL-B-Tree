@@ -1,0 +1,94 @@
+digraph CmdProcessorBenefitStableMain {
+    graph [
+        rankdir=TB,
+        compound=true,
+        nodesep=0.55,
+        ranksep=0.7,
+        splines=line,
+        newrank=true,
+        pad=0.2,
+        bgcolor="transparent"
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fillcolor="white",
+        color="#64748b",
+        fontname="Pretendard",
+        fontsize=11,
+        margin="0.14,0.09"
+    ];
+
+    edge [
+        color="#475569",
+        fontname="Pretendard",
+        fontsize=10,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_variable {
+        label="바뀌는 영역: 선택된 진입점";
+        style="rounded,filled";
+        color="#cbd5e1";
+        fillcolor="#f8fafc";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        file_entry [label="파일 실행"];
+        repl_entry [label="REPL loop"];
+        tcp_entry [label="TCP adapter"];
+    }
+
+    subgraph cluster_stable {
+        label="유지되는 영역: main/request core";
+        style="rounded,filled";
+        color="#93c5fd";
+        fillcolor="#eff6ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        main_core [
+            label="공통 호출 코드\nrequest 생성\nsubmit 호출\nresponse 처리"
+        ];
+        contract [
+            label="CmdProcessor 계약\n동일한 호출 표면",
+            fillcolor="#dbeafe",
+            color="#60a5fa"
+        ];
+    }
+
+    subgraph cluster_processing {
+        label="교체 가능한 처리 뒤쪽";
+        style="rounded,filled";
+        color="#bae6fd";
+        fillcolor="#f0f9ff";
+        fontname="Pretendard";
+        fontsize=13;
+        margin=18;
+
+        processor [label="CmdProcessor 구현체"];
+        db [label="DB BlackBox"];
+    }
+
+    response [
+        label="선택된 진입점으로 응답 반환",
+        fillcolor="#f8fafc",
+        color="#cbd5e1"
+    ];
+
+    { rank=same; file_entry; repl_entry; tcp_entry; }
+    { rank=same; main_core; contract; }
+    { rank=same; processor; db; }
+
+    file_entry -> main_core;
+    repl_entry -> main_core;
+    tcp_entry -> main_core;
+
+    main_core -> contract;
+    contract -> processor [label="submit"];
+    processor -> db;
+    processor -> response [style=dashed, label="callback"];
+}
