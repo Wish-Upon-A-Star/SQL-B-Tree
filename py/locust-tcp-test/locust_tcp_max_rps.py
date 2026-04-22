@@ -2,6 +2,8 @@ import json
 import os
 import socket
 import time
+from ctypes import c_ulong, sizeof
+from itertools import count
 from pathlib import Path
 
 import gevent
@@ -35,6 +37,21 @@ def _percentile(values, percentile):
     return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
 
 
+def _hash_text_like_c_ulong(text):
+    mask = (1 << (sizeof(c_ulong) * 8)) - 1
+    value = 5381
+    for byte in text.encode("utf-8"):
+        value = (((value << 5) + value) + byte) & mask
+    return value
+
+
+def _inc_counter(mapping, key):
+    if key is None:
+        return
+    text_key = str(key)
+    mapping[text_key] = mapping.get(text_key, 0) + 1
+
+
 class ThroughputRecorder:
     def __init__(self):
         self.started_at = 0.0
@@ -49,6 +66,8 @@ class ThroughputRecorder:
         self.measure_failures = 0
         self.after_measure_success = 0
         self.after_measure_failures = 0
+        self.measure_success_by_expected_shard = {}
+        self.measure_failures_by_expected_shard = {}
 
     def start(self):
         self.warmup_seconds = _env_int("LOCUST_TCP_WARMUP_SECONDS", 30)
@@ -61,12 +80,17 @@ class ThroughputRecorder:
         self.measure_failures = 0
         self.after_measure_success = 0
         self.after_measure_failures = 0
+        self.measure_success_by_expected_shard = {}
+        self.measure_failures_by_expected_shard = {}
         self.started_at = time.monotonic()
         self.wall_started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    def record(self, exception):
+    def record(self, exception, context=None):
         elapsed = time.monotonic() - self.started_at
         is_success = exception is None
+        expected_shard = None
+        if context:
+            expected_shard = context.get("expected_shard")
 
         if elapsed < self.warmup_seconds:
             if is_success:
@@ -80,9 +104,11 @@ class ThroughputRecorder:
             if is_success:
                 self.success_by_second[second_index] += 1
                 self.measure_success += 1
+                _inc_counter(self.measure_success_by_expected_shard, expected_shard)
             else:
                 self.failure_by_second[second_index] += 1
                 self.measure_failures += 1
+                _inc_counter(self.measure_failures_by_expected_shard, expected_shard)
             return
 
         if is_success:
@@ -117,6 +143,8 @@ class ThroughputRecorder:
             "percentiles_rps": percentiles,
             "success_rps_by_second": self.success_by_second,
             "failure_rps_by_second": self.failure_by_second,
+            "measure_success_by_expected_shard": self.measure_success_by_expected_shard,
+            "measure_failures_by_expected_shard": self.measure_failures_by_expected_shard,
         }
 
     def write(self):
@@ -139,7 +167,10 @@ def on_test_start(environment, **kwargs):
 @events.request.add_listener
 def on_request(request_type, name, response_time, response_length, exception, **kwargs):
     if request_type == "TCP":
-        RECORDER.record(exception)
+        RECORDER.record(exception, kwargs.get("context"))
+
+
+USER_INDEX_COUNTER = count()
 
 
 @events.test_stop.add_listener
@@ -202,11 +233,21 @@ class TCPMaxRPSUser(User):
         self.pipeline_depth = _env_int("LOCUST_TCP_PIPELINE_DEPTH", 32)
         self.target_rps = _env_float("LOCUST_TCP_TARGET_RPS", 0.0)
         self.locust_users = _env_int("LOCUST_TCP_USERS", 1)
+        self.server_shards = _env_int("LOCUST_SERVER_SHARDS", 1)
+        self.process_index = _env_int("LOCUST_LOADGEN_PROCESS_INDEX", 1)
+        self.process_count = _env_int("LOCUST_LOADGEN_PROCESS_COUNT", 1)
         self.request_op = os.environ.get("LOCUST_TCP_OP", "sql")
         self.sql = os.environ.get(
             "LOCUST_TCP_SQL",
             "SELECT * FROM case_basic_users WHERE id = 2;",
         )
+        self.sql_template = os.environ.get("LOCUST_TCP_SQL_TEMPLATE", "")
+        self.sql_id_min = _env_int("LOCUST_TCP_SQL_ID_MIN", 1)
+        self.sql_id_max = _env_int("LOCUST_TCP_SQL_ID_MAX", self.sql_id_min)
+        self.sql_variant_count = _env_int("LOCUST_TCP_SQL_VARIANT_COUNT", 0)
+        if self.sql_id_max < self.sql_id_min:
+            self.sql_id_max = self.sql_id_min
+        self.socket_index = (self.process_index - 1) + next(USER_INDEX_COUNTER) * max(1, self.process_count)
         self.user_id = f"{id(self):x}"
         self.sequence = 0
         self.client = SQLTCPClient(self.host_name, self.port, self.timeout)
@@ -220,28 +261,71 @@ class TCPMaxRPSUser(User):
     def on_stop(self):
         self.client.close()
 
+    def _next_sql_values(self, request_sequence):
+        span = self.sql_id_max - self.sql_id_min + 1
+        sequence_index = self.socket_index + request_sequence * max(1, self.locust_users)
+        id_value = self.sql_id_min + (sequence_index % span)
+        variant_count = max(0, self.sql_variant_count)
+        variant = sequence_index % variant_count if variant_count > 0 else 0
+        pad = "\t" * (variant + 1) if variant_count > 0 else ""
+        return id_value, sequence_index, variant, pad
+
+    def _build_sql(self, request_sequence):
+        if not self.sql_template:
+            return self.sql
+        id_value, sequence_index, variant, pad = self._next_sql_values(request_sequence)
+        return self.sql_template.format(
+            id=id_value,
+            seq=sequence_index,
+            variant=variant,
+            pad=pad,
+        )
+
+    def _expected_shard(self, sql):
+        if self.server_shards <= 0:
+            return None
+        return _hash_text_like_c_ulong(sql) % self.server_shards
+
     def _build_payload(self):
         request_id = f"{self.user_id}-{self.sequence}"
+        request_sequence = self.sequence
         self.sequence += 1
         if self.request_op == "ping":
-            return {"id": request_id, "op": "ping"}
-        return {"id": request_id, "op": "sql", "sql": self.sql}
+            return {"id": request_id, "op": "ping", "expected_shard": None}
+        sql = self._build_sql(request_sequence)
+        return {
+            "id": request_id,
+            "op": "sql",
+            "sql": sql,
+            "expected_shard": self._expected_shard(sql),
+        }
 
     @task
     def send_pipelined_requests(self):
         batch_start = time.perf_counter()
         payloads = [self._build_payload() for _ in range(self.pipeline_depth)]
         sent_at = batch_start
-        pending = {payload["id"]: sent_at for payload in payloads}
+        pending = {
+            payload["id"]: {
+                "started_at": sent_at,
+                "expected_shard": payload.get("expected_shard"),
+            }
+            for payload in payloads
+        }
+        wire_payloads = [
+            {key: value for key, value in payload.items() if key != "expected_shard"}
+            for payload in payloads
+        ]
 
         try:
-            self.client.send_batch(payloads)
+            self.client.send_batch(wire_payloads)
             for _ in payloads:
                 response = self.client.read_response()
                 request_id = response.get("id")
                 if request_id not in pending:
                     raise RuntimeError(f"unexpected response id: {response!r}")
-                start = pending[request_id]
+                pending_item = pending[request_id]
+                start = pending_item["started_at"]
                 response_time_ms = (time.perf_counter() - start) * 1000.0
                 if not response.get("ok"):
                     raise RuntimeError(f"request failed: {response!r}")
@@ -252,17 +336,19 @@ class TCPMaxRPSUser(User):
                     response_time=response_time_ms,
                     response_length=0,
                     exception=None,
+                    context={"expected_shard": pending_item.get("expected_shard")},
                 )
         except Exception as exc:
             response_time_ms = (time.perf_counter() - sent_at) * 1000.0
-            failure_count = max(1, len(pending))
-            for _ in range(failure_count):
+            pending_items = list(pending.values()) or [{"expected_shard": None}]
+            for item in pending_items:
                 events.request.fire(
                     request_type="TCP",
                     name=self.request_op,
                     response_time=response_time_ms,
                     response_length=0,
                     exception=exc,
+                    context={"expected_shard": item.get("expected_shard")},
             )
             self.client.close()
         finally:

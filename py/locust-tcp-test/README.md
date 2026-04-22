@@ -37,6 +37,7 @@ artifacts/locust_tcp_worker_sweep/throughput_percentiles.png
 ```
 
 그래프는 x축이 server worker 수, y축이 요청/초, 선이 `p5/p15/p50/p75/p95` 초당 처리량이다.
+`report.md`에는 예상 shard 분포도 같이 기록된다. `active shards`가 `1/N`이고 `max shard %`가 `100%`에 가까우면 요청이 한 shard queue로 몰린 상태다.
 
 ## Options
 
@@ -68,6 +69,37 @@ uv run python run_locust_tcp_worker_sweep.py \
 ```
 
 이 경우 각 TCP socket은 평균 `50000 / 20 = 2500 req/s`를 목표로 pacing한다. 동시 in-flight 요청 상한은 대략 `--locust-users * --pipeline-depth`다. 결과의 `average_rps`, `success_rps_by_second`, `failure_rps_by_second`를 보면 목표 부하를 실제로 유지했는지 확인할 수 있다.
+
+## SQL Shard Distribution
+
+기본 `--sql`은 모든 요청에 같은 SQL 문자열을 보낸다. 서버의 READ routing은 SQL 문자열 hash를 기준으로 shard를 고르기 때문에, 같은 SQL만 보내면 worker/shard 수를 늘려도 한 shard queue로 몰릴 수 있다.
+
+요청마다 SQL을 바꾸려면 `--sql-template`을 쓴다. `{id}`는 `--sql-id-min/max` 범위에서 TCP socket별로 분산된다.
+
+```bash
+uv run python run_locust_tcp_worker_sweep.py \
+  --worker-counts 1,2,4,8 \
+  --loadgen-processes 4 \
+  --locust-users 20 \
+  --pipeline-depth 32 \
+  --target-rps 50000 \
+  --sql-template "SELECT * FROM case_basic_users WHERE id = {id};" \
+  --sql-id-min 1 \
+  --sql-id-max 1000000
+```
+
+로컬 데모처럼 row가 몇 개 없고 같은 row를 계속 조회하되 raw SQL hash만 분산하고 싶으면 `{pad}`를 쓴다. 아래 SQL은 의미상 `id = 2` 그대로지만 세미콜론 앞 tab whitespace 수를 바꿔 shard hash를 분산한다.
+
+```bash
+uv run python run_locust_tcp_worker_sweep.py \
+  --worker-counts 1,2,4,8 \
+  --loadgen-processes 4 \
+  --locust-users 20 \
+  --pipeline-depth 32 \
+  --target-rps 50000 \
+  --sql-template "SELECT * FROM case_basic_users WHERE id = 2{pad};" \
+  --sql-variant-count 128
+```
 
 ## Multi-Process Loadgen
 

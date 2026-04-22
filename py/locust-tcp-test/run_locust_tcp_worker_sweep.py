@@ -69,6 +69,24 @@ def split_int(total, parts):
     return [base + (1 if index < remainder else 0) for index in range(parts)]
 
 
+def merge_count_map(target, source):
+    if not source:
+        return
+    for key, value in source.items():
+        target[str(key)] = int(target.get(str(key), 0)) + int(value)
+
+
+def shard_summary(run):
+    counts = run.get("measure_success_by_expected_shard") or {}
+    total = sum(int(value) for value in counts.values())
+    active = sum(1 for value in counts.values() if int(value) > 0)
+    expected = int(run.get("server_shards") or run.get("expected_shard_count") or 0)
+    max_percent = 0.0
+    if total > 0 and counts:
+        max_percent = max(int(value) for value in counts.values()) * 100.0 / float(total)
+    return active, expected, max_percent
+
+
 def wait_for_server(host, port, timeout_seconds):
     deadline = time.time() + timeout_seconds
     payload = b'{"id":"ready","op":"ping"}\n'
@@ -151,6 +169,10 @@ def build_locust_env(args,
             "LOCUST_TCP_USERS": str(tcp_client_sockets),
             "LOCUST_TCP_OP": args.op,
             "LOCUST_TCP_SQL": args.sql,
+            "LOCUST_TCP_SQL_TEMPLATE": args.sql_template or "",
+            "LOCUST_TCP_SQL_ID_MIN": str(args.sql_id_min),
+            "LOCUST_TCP_SQL_ID_MAX": str(args.sql_id_max),
+            "LOCUST_TCP_SQL_VARIANT_COUNT": str(args.sql_variant_count),
             "LOCUST_TCP_RESULT_PATH": str(result_path),
             "LOCUST_SERVER_WORKERS": str(server_workers),
             "LOCUST_SERVER_SHARDS": str(shards),
@@ -257,6 +279,8 @@ def aggregate_locust_results(result_path, process_results):
         "measure_failures": 0,
         "after_measure_success": 0,
         "after_measure_failures": 0,
+        "measure_success_by_expected_shard": {},
+        "measure_failures_by_expected_shard": {},
     }
 
     for result in process_results:
@@ -268,6 +292,14 @@ def aggregate_locust_results(result_path, process_results):
         aggregate["measure_failures"] += int(result.get("measure_failures", 0))
         aggregate["after_measure_success"] += int(result.get("after_measure_success", 0))
         aggregate["after_measure_failures"] += int(result.get("after_measure_failures", 0))
+        merge_count_map(
+            aggregate["measure_success_by_expected_shard"],
+            result.get("measure_success_by_expected_shard"),
+        )
+        merge_count_map(
+            aggregate["measure_failures_by_expected_shard"],
+            result.get("measure_failures_by_expected_shard"),
+        )
         for index, value in enumerate(result.get("success_rps_by_second", [])):
             if index < measure_seconds:
                 success_by_second[index] += int(value)
@@ -531,6 +563,11 @@ def run_one_worker_count(args, repo_root, server_workers):
                 "target_achievement_ratio": target_achievement_ratio,
                 "op": args.op,
                 "sql": args.sql if args.op == "sql" else None,
+                "sql_template": args.sql_template if args.op == "sql" and args.sql_template else None,
+                "sql_id_min": args.sql_id_min if args.op == "sql" and args.sql_template else None,
+                "sql_id_max": args.sql_id_max if args.op == "sql" and args.sql_template else None,
+                "sql_variant_count": args.sql_variant_count if args.op == "sql" and args.sql_template else None,
+                "expected_shard_count": shards if args.op == "sql" else 0,
                 "cooldown_seconds": args.cooldown_seconds,
                 "wall_elapsed_seconds": time.time() - started,
                 "server_log": str(log_path),
@@ -556,8 +593,8 @@ def write_markdown_report(path, report):
     lines = [
         "# Locust TCP Worker Sweep",
         "",
-        "| workers | shards | tcp sockets | loadgen proc | avg rps | p5 | p15 | p50 | p75 | p95 | failures |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| workers | shards | active shards | max shard % | tcp sockets | loadgen proc | avg rps | p5 | p15 | p50 | p75 | p95 | failures |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     if report["config"].get("target_rps", 0.0) > 0.0:
         lines = [
@@ -565,15 +602,17 @@ def write_markdown_report(path, report):
             "",
             f"- target_rps: `{report['config']['target_rps']:.2f}`",
             "",
-            "| workers | shards | tcp sockets | loadgen proc | avg rps | target % | p5 | p15 | p50 | p75 | p95 | failures |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| workers | shards | active shards | max shard % | tcp sockets | loadgen proc | avg rps | target % | p5 | p15 | p50 | p75 | p95 | failures |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     for run in report["runs"]:
         p = run["percentiles_rps"]
+        active_shards, expected_shards, max_shard_percent = shard_summary(run)
         if report["config"].get("target_rps", 0.0) > 0.0:
             target_percent = (run.get("target_achievement_ratio") or 0.0) * 100.0
             lines.append(
                 f"| {run['server_workers']} | {run['server_shards']} | "
+                f"{active_shards}/{expected_shards} | {max_shard_percent:.2f}% | "
                 f"{run.get('tcp_client_sockets', run.get('locust_users', 0))} | "
                 f"{run.get('loadgen_processes', 1)} | {run['average_rps']:.2f} | {target_percent:.2f}% | "
                 f"{p['p5']:.2f} | {p['p15']:.2f} | {p['p50']:.2f} | "
@@ -582,6 +621,7 @@ def write_markdown_report(path, report):
         else:
             lines.append(
                 f"| {run['server_workers']} | {run['server_shards']} | "
+                f"{active_shards}/{expected_shards} | {max_shard_percent:.2f}% | "
                 f"{run.get('tcp_client_sockets', run.get('locust_users', 0))} | "
                 f"{run.get('loadgen_processes', 1)} | {run['average_rps']:.2f} | "
                 f"{p['p5']:.2f} | {p['p15']:.2f} | "
@@ -643,6 +683,22 @@ def parse_args():
     )
     parser.add_argument("--op", choices=["ping", "sql"], default="sql")
     parser.add_argument("--sql", default="SELECT * FROM case_basic_users WHERE id = 2;")
+    parser.add_argument(
+        "--sql-template",
+        default="",
+        help=(
+            "optional SQL format string for per-request SQL generation; "
+            "supports {id}, {seq}, {variant}, and {pad}"
+        ),
+    )
+    parser.add_argument("--sql-id-min", type=int, default=1)
+    parser.add_argument("--sql-id-max", type=int, default=1)
+    parser.add_argument(
+        "--sql-variant-count",
+        type=int,
+        default=0,
+        help="if >0, cycles {variant} and {pad} to vary raw SQL text without changing {id}",
+    )
     parser.add_argument("--warmup-seconds", type=int, default=30)
     parser.add_argument("--measure-seconds", type=int, default=60)
     parser.add_argument("--cooldown-seconds", type=int, default=30)
@@ -659,6 +715,15 @@ def main():
     repo_root = Path(__file__).resolve().parents[2]
     args.artifacts_dir = (repo_root / args.artifacts_dir).resolve()
     args.server_bin = (repo_root / args.server_bin).resolve()
+    if args.sql_id_max < args.sql_id_min:
+        raise RuntimeError("--sql-id-max must be >= --sql-id-min")
+    if args.sql_variant_count < 0:
+        raise RuntimeError("--sql-variant-count must be >= 0")
+    if args.sql_template:
+        try:
+            args.sql_template.format(id=args.sql_id_min, seq=0, variant=0, pad="")
+        except Exception as exc:
+            raise RuntimeError(f"invalid --sql-template: {exc}") from exc
     worker_counts = parse_worker_counts(args.worker_counts)
 
     if not args.skip_build:
@@ -670,16 +735,20 @@ def main():
             "host": args.host,
             "port": args.port,
             "queue_capacity": args.queue_capacity,
-                "planner_cache": args.planner_cache,
-                "locust_users": args.locust_users,
-                "tcp_client_sockets": args.locust_users,
-                "loadgen_processes": args.loadgen_processes,
-                "locust_master_port": args.locust_master_port,
-                "spawn_rate": args.spawn_rate,
+            "planner_cache": args.planner_cache,
+            "locust_users": args.locust_users,
+            "tcp_client_sockets": args.locust_users,
+            "loadgen_processes": args.loadgen_processes,
+            "locust_master_port": args.locust_master_port,
+            "spawn_rate": args.spawn_rate,
             "pipeline_depth": args.pipeline_depth,
             "target_rps": args.target_rps,
             "op": args.op,
             "sql": args.sql if args.op == "sql" else None,
+            "sql_template": args.sql_template if args.op == "sql" and args.sql_template else None,
+            "sql_id_min": args.sql_id_min if args.op == "sql" and args.sql_template else None,
+            "sql_id_max": args.sql_id_max if args.op == "sql" and args.sql_template else None,
+            "sql_variant_count": args.sql_variant_count if args.op == "sql" and args.sql_template else None,
             "warmup_seconds": args.warmup_seconds,
             "measure_seconds": args.measure_seconds,
             "cooldown_seconds": args.cooldown_seconds,
