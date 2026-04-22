@@ -62,15 +62,6 @@ static int processor_acquire_request(CmdProcessorContext *context, CmdRequest **
     return -1;
 }
 
-static int should_inline_execute(EngineCmdProcessorState *state) {
-    int inline_execute;
-
-    db_mutex_lock(&state->request_mutex);
-    inline_execute = (state->current_request_slots_in_use <= (unsigned long long)state->options.worker_count);
-    db_mutex_unlock(&state->request_mutex);
-    return inline_execute;
-}
-
 static void deliver_inline_response(EngineCmdProcessorState *state,
                                     CmdProcessor *processor,
                                     CmdRequest *request,
@@ -155,17 +146,7 @@ static int dispatch_sql_request(EngineCmdProcessorState *state,
                                 const RoutePlan *route_plan,
                                 const LockPlan *lock_plan,
                                 uint64_t start_us) {
-    if (should_inline_execute(state)) {
-        return submit_sql_inline(state,
-                                 processor,
-                                 request,
-                                 response_slot,
-                                 callback,
-                                 user_data,
-                                 lock_plan,
-                                 start_us);
-    }
-
+    (void)start_us;
     return enqueue_planned_job(state,
                                processor,
                                request,
@@ -342,10 +323,10 @@ static void processor_shutdown(CmdProcessorContext *context) {
     planner_cache_destroy(&state->planner_cache);
     lock_manager_destroy(&state->lock_manager);
     metrics_destroy(&state->metrics);
-    db_mutex_destroy(&state->engine_mutex);
     db_mutex_destroy(&state->response_mutex);
     db_mutex_destroy(&state->request_mutex);
     db_mutex_destroy(&state->state_mutex);
+    executor_runtime_shutdown();
     free(state);
 }
 
@@ -423,11 +404,11 @@ int engine_cmd_processor_create(const CmdProcessorContext *base_context,
     int state_mutex_ready = 0;
     int request_mutex_ready = 0;
     int response_mutex_ready = 0;
-    int engine_mutex_ready = 0;
     int job_pool_ready = 0;
     int planner_cache_ready = 0;
     int lock_manager_ready = 0;
     int metrics_ready = 0;
+    int executor_ready = 0;
     int queue_count = 0;
 
     if (out_processor) *out_processor = NULL;
@@ -445,18 +426,17 @@ int engine_cmd_processor_create(const CmdProcessorContext *base_context,
     state_mutex_ready = db_mutex_init(&state->state_mutex);
     request_mutex_ready = state_mutex_ready ? db_mutex_init(&state->request_mutex) : 0;
     response_mutex_ready = request_mutex_ready ? db_mutex_init(&state->response_mutex) : 0;
-    engine_mutex_ready = response_mutex_ready ? db_mutex_init(&state->engine_mutex) : 0;
-    job_pool_ready = engine_mutex_ready ? memory_pool_init(&state->job_pool, sizeof(CmdJob)) : 0;
+    job_pool_ready = response_mutex_ready ? memory_pool_init(&state->job_pool, sizeof(CmdJob)) : 0;
     planner_cache_ready = job_pool_ready ? planner_cache_init(&state->planner_cache, state->options.planner_cache_capacity) : 0;
     lock_manager_ready = planner_cache_ready ? lock_manager_init(&state->lock_manager) : 0;
     metrics_ready = lock_manager_ready ? metrics_init(&state->metrics) : 0;
+    executor_ready = metrics_ready ? executor_runtime_init() : 0;
 
-    if (!metrics_ready) {
+    if (!metrics_ready || !executor_ready) {
         if (metrics_ready) metrics_destroy(&state->metrics);
         if (lock_manager_ready) lock_manager_destroy(&state->lock_manager);
         if (planner_cache_ready) planner_cache_destroy(&state->planner_cache);
         if (job_pool_ready) memory_pool_destroy(&state->job_pool);
-        if (engine_mutex_ready) db_mutex_destroy(&state->engine_mutex);
         if (response_mutex_ready) db_mutex_destroy(&state->response_mutex);
         if (request_mutex_ready) db_mutex_destroy(&state->request_mutex);
         if (state_mutex_ready) db_mutex_destroy(&state->state_mutex);
@@ -538,10 +518,10 @@ fail:
     lock_manager_destroy(&state->lock_manager);
     planner_cache_destroy(&state->planner_cache);
     destroy_job_pool(&state->job_pool);
-    db_mutex_destroy(&state->engine_mutex);
     db_mutex_destroy(&state->response_mutex);
     db_mutex_destroy(&state->request_mutex);
     db_mutex_destroy(&state->state_mutex);
+    executor_runtime_shutdown();
     free(state);
     return -1;
 }
@@ -564,5 +544,8 @@ int engine_cmd_processor_snapshot_stats(CmdProcessor *processor,
     db_mutex_lock(&state->response_mutex);
     out_stats->peak_response_slots_in_use = state->peak_response_slots_in_use;
     db_mutex_unlock(&state->response_mutex);
+    db_mutex_lock(&state->state_mutex);
+    out_stats->max_concurrent_executions = state->max_concurrent_executions;
+    db_mutex_unlock(&state->state_mutex);
     return 0;
 }

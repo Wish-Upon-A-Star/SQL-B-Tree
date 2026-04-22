@@ -1,20 +1,20 @@
 # CmdProcessor 전체 아키텍처와 요청 흐름
 
-이 문서는 TCP 서버만 설명하지 않는다. `CmdProcessor`를 중심으로 외부 진입점, 요청 처리 구현체, DB 실행 계층이 어떻게 분리되는지 큰 그림으로 정리한다.
+이 문서는 TCP 서버만 설명하지 않는다. `CmdProcessor`를 중심으로 입출력 구현체, 공통 계약, 코어 요청 처리 흐름, DB 실행 계층이 어떻게 분리되는지 큰 그림으로 정리한다.
 
 다이어그램 이미지는 `docs/sijun-yang/diagrams/*.dot`을 원본으로 생성한다. 그림에서 DB BlackBox는 내부 구현을 펼치지 않고 역할만 표시한 영역이다.
 
 ## 1. 핵심 구조
 
-`CmdProcessor`는 TCP, CLI, 테스트 코드 같은 외부 진입점과 SQL 실행 계층 사이에 놓인 공통 요청 처리 계약이다.
+`CmdProcessor`는 TCP, REPL, 테스트 코드처럼 입력을 받고 출력 형식을 관리하는 구현체와 SQL 실행 계층 사이에 놓인 공통 요청 처리 계약이다.
 
 ```text
-외부 진입점
+입출력 구현체
         -> CmdProcessor 공통 계약
-        -> CmdProcessor 구현체
+        -> 코어 요청 처리 흐름
         -> DB 실행 계층
-        -> 응답 callback
-        -> 외부 응답 형식
+        -> CmdResponse callback
+        -> 입출력 구현체가 출력
 ```
 
 현재 코드의 주요 구성은 다음과 같다.
@@ -34,46 +34,48 @@
 
 DOT 원본: [`004_cmd_processor_overall_architecture.dot`](./diagrams/004_cmd_processor_overall_architecture.dot)
 
-`CmdProcessor`의 핵심은 외부 진입점이 실제 구현체의 내부 상태를 몰라도 된다는 점이다. TCP와 REPL은 같은 방식으로 요청을 만들고 제출하지만, 뒤쪽 구현체는 Engine, REPL, Mock 중 무엇이든 될 수 있다.
+`CmdProcessor`의 핵심은 입출력 구현체가 코어와 DB의 내부 상태를 몰라도 된다는 점이다. TCP와 REPL은 입력을 `CmdRequest`로 바꾸고 응답을 각자 출력 형식으로 돌려주지만, 계약 뒤쪽의 코어 처리 흐름은 같은 방식으로 연결된다.
 
 역할 경계는 다음처럼 나뉜다.
 
 | 영역 | 책임 |
 | --- | --- |
-| 외부 진입점 | 입력 형식을 읽고, 응답을 사용자에게 맞는 형식으로 돌려준다 |
+| 입출력 구현체 | 입력 형식을 읽고, 응답을 사용자에게 맞는 형식으로 출력한다 |
 | `CmdProcessor` 공통 계약 | request/response 객체의 생명주기와 callback 방식을 통일한다 |
-| 구현체 | 요청을 즉시 실행할지, 큐에 넣을지, 어떤 순서로 처리할지 결정한다 |
-| DB 실행 계층 | SQL 의미, 데이터 변경, 저장 구조를 책임진다 |
+| 코어 요청 처리 흐름 | 요청을 즉시 실행할지, 큐에 넣을지, 어떤 순서로 처리할지 결정한다 |
+| DB BlackBox | SQL 의미, 데이터 변경, 저장 구조를 책임진다 |
 
 `submit`이 성공했다는 뜻은 “요청 제출이 성공했다”는 뜻이다. SQL 파싱 실패나 실행 실패 같은 실제 처리 결과는 callback으로 돌아오는 response에 담긴다.
 
 ## 3. CmdProcessor를 둔 장점
 
-`CmdProcessor`를 중간 계약으로 두면 외부 입력 방식과 실제 요청 처리 방식을 분리할 수 있다. 파일 실행, REPL, TCP 같은 진입점은 서로 다르지만, 한 번 `CmdRequest`로 바뀐 뒤에는 같은 제출/응답 흐름을 사용할 수 있다.
+`CmdProcessor`를 중간 계약으로 두면 입출력을 관리하는 구현체와 코어 요청 처리 흐름을 분리할 수 있다. DI처럼 빌드 또는 실행 구성에서 TCP나 REPL 구현체를 선택하더라도, 선택된 구현체는 같은 `CmdProcessor` 계약을 통해 코어와 DB 실행 흐름에 연결된다.
 
-![CmdProcessor 진입점 선택 장점](./diagrams/004_cmd_processor_benefit_entrypoint_selection.svg)
+아래 그림에서는 `CmdProcessor` 계약을 별도 실행 단계가 아니라 구현체와 코어 사이를 오가는 `CmdRequest`/`CmdResponse` 전달 형식으로 표시한다. 코어 박스 안에는 요청 처리 정책을 담당하는 `CmdProcessor`와 그 뒤의 DB 실행 BlackBox를 함께 묶어, 구현체가 코어 내부 구조를 직접 알지 않아도 되는 경계를 보여준다.
 
-DOT 원본: [`004_cmd_processor_benefit_entrypoint_selection.dot`](./diagrams/004_cmd_processor_benefit_entrypoint_selection.dot)
+### 코어 구현체만 있는 상태
 
-빌드 또는 실행 설정에서 하나의 진입점을 선택하더라도 요청 처리 코어는 `CmdProcessor` 계약을 바라본다. 그래서 선택된 버전이 파일 실행인지, REPL인지, TCP 입력인지에 따라 바뀌는 부분은 입력을 읽고 `CmdRequest`로 바꾸는 adapter 쪽에 모인다.
+![CmdProcessor DI 코어만 있는 상태](./diagrams/004_cmd_processor_di_core_only.svg)
 
-![CmdProcessor와 DB 실행 경계](./diagrams/004_cmd_processor_benefit_db_boundary.svg)
+DOT 원본: [`004_cmd_processor_di_core_only.dot`](./diagrams/004_cmd_processor_di_core_only.dot)
 
-DOT 원본: [`004_cmd_processor_benefit_db_boundary.dot`](./diagrams/004_cmd_processor_benefit_db_boundary.dot)
+코어만 있으면 요청 처리 정책을 담당하는 `CmdProcessor`와 DB 실행 계층은 존재하지만 입출력을 관리할 구현체는 아직 정해지지 않았다. 이 상태에서는 TCP 연결로 응답할지, 콘솔에 출력할지 결정되지 않는다.
 
-앞쪽 진입점이 `CmdRequest`로 수렴하는 것처럼, 뒤쪽 실행 흐름은 DB 실행 호출 경계로 수렴한다. `CmdProcessor` 구현체는 queue/worker/lock/engine guard를 조정하고, DB 실행 계층은 SQL 의미와 저장 구조를 책임진다.
+### TCP 구현체로 빌드된 상태
 
-![CmdProcessor로 유지되는 main/request core](./diagrams/004_cmd_processor_benefit_stable_main.svg)
+![CmdProcessor DI TCP 구현체 선택](./diagrams/004_cmd_processor_di_tcp_build.svg)
 
-DOT 원본: [`004_cmd_processor_benefit_stable_main.dot`](./diagrams/004_cmd_processor_benefit_stable_main.dot)
+DOT 원본: [`004_cmd_processor_di_tcp_build.dot`](./diagrams/004_cmd_processor_di_tcp_build.dot)
 
-이 구조의 장점은 `main` 또는 request 처리 코어가 모든 입력 방식을 직접 알 필요가 없다는 점이다. 진입점 선택과 wiring은 바뀔 수 있지만, 요청 생성, 제출, 응답 처리의 중심 흐름은 유지된다.
+TCP 구현체를 선택한 빌드는 client connection에서 JSONL 요청을 읽고, 처리 결과를 같은 connection으로 돌려주는 책임을 가진다. 코어와 DB 쪽 흐름은 TCP를 직접 알지 않고 `CmdProcessor` 계약으로만 연결된다.
 
-![CmdProcessor 새 요청 추가 장점](./diagrams/004_cmd_processor_benefit_add_requests.svg)
+### REPL 구현체로 빌드된 상태
 
-DOT 원본: [`004_cmd_processor_benefit_add_requests.dot`](./diagrams/004_cmd_processor_benefit_add_requests.dot)
+![CmdProcessor DI REPL 구현체 선택](./diagrams/004_cmd_processor_di_repl_build.svg)
 
-새 요청을 추가할 때도 같은 원리가 적용된다. 새 `op`나 명령을 받아 `CmdRequest`로 매핑하고, 필요한 처리만 구현체 쪽에 추가하면 공통 제출/응답 흐름은 그대로 재사용할 수 있다. “main 코드가 절대 바뀌지 않는다”기보다는, 변경이 진입점 adapter나 요청 매핑, 구현체 내부로 제한된다는 것이 핵심이다.
+DOT 원본: [`004_cmd_processor_di_repl_build.dot`](./diagrams/004_cmd_processor_di_repl_build.dot)
+
+REPL 구현체를 선택한 빌드는 console에서 한 줄 SQL을 읽고, 처리 결과를 다시 console에 출력한다. TCP 빌드와 출력 위치만 다를 뿐, 계약 뒤쪽의 코어와 DB 흐름은 동일하게 유지된다.
 
 ## 4. 공통 요청 처리 계약
 
@@ -84,17 +86,17 @@ request 확보
         -> SQL 또는 ping 요청 채우기
         -> CmdProcessor에 제출
         -> callback으로 response 수신
-        -> 외부 응답 형식으로 변환
+        -> 구현체의 출력 형식으로 변환
         -> request/response 반환
 ```
 
 소유권 규칙은 단순하다.
 
-| 객체 | 소유자 | 외부 진입점의 책임 |
+| 객체 | 소유자 | 입출력 구현체의 책임 |
 | --- | --- | --- |
 | request | `CmdProcessor` 구현체 | 확보한 뒤 내용을 채우고, callback 이후 반환한다 |
 | response | `CmdProcessor` 구현체 | callback에서 읽고 반환한다 |
-| callback context | 외부 진입점 | 응답을 어느 connection이나 콘솔로 돌려줄지 기억한다 |
+| callback context | 입출력 구현체 | 응답을 어느 connection이나 콘솔로 돌려줄지 기억한다 |
 
 callback은 “처리가 끝났으니 응답을 가져가라”는 신호다. TCP에서는 이 callback context가 connection이고, REPL에서는 콘솔로 결과를 돌려주는 흐름에 해당한다.
 
@@ -220,7 +222,7 @@ TCP protocol은 JSONL 방식이다. request와 response는 각각 newline으로 
 
 DOT 원본: [`004_repl_cmd_processor_structure.dot`](./diagrams/004_repl_cmd_processor_structure.dot)
 
-`REPLCmdProcessor`는 TCP 서버가 아니라 `CmdProcessor` 구현체다. 콘솔 입출력은 REPL frontend 영역으로 묶고, `REPLCmdProcessor`는 그 입력을 받아 동기적으로 실행한 뒤 response를 돌려준다.
+`REPLCmdProcessor`는 TCP 서버가 아니라 `CmdProcessor` 구현체다. 콘솔 입출력은 REPL 구현체 영역으로 묶고, `REPLCmdProcessor`는 그 입력을 받아 동기적으로 실행한 뒤 response를 돌려준다.
 
 REPL 구조는 TCP보다 단순하다.
 

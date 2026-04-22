@@ -10,6 +10,7 @@ docs
 main
 sqlsprocessor
 sqlsprocessor_*
+!sqlsprocessor_bundle.h
 benchmark_runner
 bench_workload_generator
 bench_formula_test

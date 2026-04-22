@@ -26,6 +26,7 @@ typedef struct {
     unsigned long long peak_response_slots_in_use;
     unsigned long long peak_jobs_in_use;
     unsigned long long peak_jobs_allocated;
+    unsigned long long max_concurrent_executions;
 } EngineCmdProcessorStats;
 
 int engine_cmd_processor_create(const CmdProcessorContext *base_context,

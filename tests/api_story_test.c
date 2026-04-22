@@ -212,6 +212,17 @@ static int json_number_equals(cJSON *root, const char *name, int expected) {
     return cJSON_IsNumber(item) && item->valueint == expected;
 }
 
+static int json_number_absent_or_equals(cJSON *root, const char *name, int expected) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!item) return expected == 0;
+    return cJSON_IsNumber(item) && item->valueint == expected;
+}
+
+static int json_string_is_nonempty(cJSON *root, const char *name) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    return cJSON_IsString(item) && item->valuestring && item->valuestring[0] != '\0';
+}
+
 static int json_body_contains(cJSON *root, const char *needle) {
     cJSON *body = cJSON_GetObjectItemCaseSensitive(root, "body");
     return cJSON_IsString(body) && strstr(body->valuestring, needle) != NULL;
@@ -222,6 +233,14 @@ static int expect_response(cJSON *root, const char *id, const char *status, int 
     CHECK(json_string_equals(root, "id", id));
     CHECK(json_string_equals(root, "status", status));
     CHECK(json_bool_equals(root, "ok", ok));
+    return 0;
+}
+
+static int expect_select_response(cJSON *root, const char *id, int row_count) {
+    CHECK(expect_response(root, id, "OK", 1) == 0);
+    CHECK(json_string_equals(root, "body_format", "binary"));
+    CHECK(json_number_absent_or_equals(root, "row_count", row_count));
+    CHECK(json_string_is_nonempty(root, "body_hex"));
     return 0;
 }
 
@@ -286,6 +305,18 @@ static int send_sql_expect(int fd,
     CHECK(send_json_request(fd, id, "sql", sql, &response) == 0);
     CHECK(expect_response(response, id, status, ok) == 0);
     if (body_fragment) CHECK(json_body_contains(response, body_fragment));
+    cJSON_Delete(response);
+    return 0;
+}
+
+static int send_select_expect_count(int fd,
+                                    const char *id,
+                                    const char *sql,
+                                    int row_count) {
+    cJSON *response = NULL;
+
+    CHECK(send_json_request(fd, id, "sql", sql, &response) == 0);
+    CHECK(expect_select_response(response, id, row_count) == 0);
     cJSON_Delete(response);
     return 0;
 }
@@ -382,9 +413,7 @@ static int scenario_basic_crud(StoryServer *server) {
                             "sql",
                             "SELECT * FROM " STORY_TABLE " WHERE id = 1",
                             &response) == 0);
-    CHECK(expect_response(response, "find-1", "OK", 1) == 0);
-    CHECK(json_body_contains(response, "SELECT matched_rows=1"));
-    CHECK(json_number_equals(response, "row_count", 1));
+    CHECK(expect_select_response(response, "find-1", 1) == 0);
     cJSON_Delete(response);
 
     CHECK(send_sql_expect(fd,
@@ -399,12 +428,10 @@ static int scenario_basic_crud(StoryServer *server) {
                           "OK",
                           1,
                           "DELETE affected_rows=1") == 0);
-    CHECK(send_sql_expect(fd,
-                          "after-pickup-1",
-                          "SELECT * FROM " STORY_TABLE " WHERE pickup_code = 'PICKUP-STRAWBERRY-0001'",
-                          "OK",
-                          1,
-                          "SELECT matched_rows=0") == 0);
+    CHECK(send_select_expect_count(fd,
+                                   "after-pickup-1",
+                                   "SELECT * FROM " STORY_TABLE " WHERE pickup_code = 'PICKUP-STRAWBERRY-0001'",
+                                   0) == 0);
     close(fd);
     pass_line("INSERT -> SELECT -> UPDATE -> DELETE 전체 흐름이 API 요청으로 통과했습니다.");
     return 0;
@@ -430,12 +457,10 @@ static int scenario_duplicate_pickup_code(StoryServer *server) {
                           "PROCESSING_ERROR",
                           0,
                           NULL) == 0);
-    CHECK(send_sql_expect(fd,
-                          "limited-survivor",
-                          "SELECT * FROM " STORY_TABLE " WHERE pickup_code = 'LIMITED-PICKUP-777'",
-                          "OK",
-                          1,
-                          "SELECT matched_rows=1") == 0);
+    CHECK(send_select_expect_count(fd,
+                                   "limited-survivor",
+                                   "SELECT * FROM " STORY_TABLE " WHERE pickup_code = 'LIMITED-PICKUP-777'",
+                                   1) == 0);
     info_line("누텔라 두바이 모찌는 새 픽업번호로 재주문해 정상 접수되는지 확인합니다.");
     CHECK(send_sql_expect(fd,
                           "limited-retry-new-code",
@@ -726,12 +751,10 @@ static int scenario_stress_orders(StoryServer *server, int order_count) {
     {
         int fd = connect_client(server->port);
         CHECK(fd >= 0);
-        CHECK(send_sql_expect(fd,
-                              "stress-last-select",
-                              select_sql,
-                              "OK",
-                              1,
-                              "SELECT matched_rows=1") == 0);
+        CHECK(send_select_expect_count(fd,
+                                       "stress-last-select",
+                                       select_sql,
+                                       1) == 0);
         close(fd);
     }
     printf("[INFO] stress elapsed=%.2f sec throughput=%.1f orders/sec\n",

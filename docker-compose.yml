@@ -6,6 +6,15 @@ services:
     working_dir: /app
     command: ["sh", "-lc", "printf \"%s\\n\" \"SELECT * FROM case_basic_users WHERE id = 2;\" \"SELECT * FROM case_basic_users WHERE email = 'user1@test.com';\" > /tmp/docker_demo.sql && ./sqlsprocessor /tmp/docker_demo.sql"]
 
+  tcp-server:
+    build:
+      context: .
+    image: sqlprocessor:local
+    working_dir: /app
+    command: ["./tcp_sql_server", "--host", "0.0.0.0", "--port", "15432", "--workers", "4", "--shards", "4", "--queue-capacity", "128", "--planner-cache", "256"]
+    ports:
+      - "15432:15432"
+
   benchmark:
     build:
       context: .
@@ -25,3 +34,23 @@ services:
     tty: true
     profiles:
       - shell
+
+  test:
+    build:
+      context: .
+    image: sqlprocessor:local
+    working_dir: /app
+    command: ["sh", "/app/scripts/docker_run_all_tests.sh"]
+    profiles:
+      - test
+
+  test-scale:
+    build:
+      context: .
+    image: sqlprocessor:local
+    working_dir: /app
+    environment:
+      RUN_SCALE_SCORE: "1"
+    command: ["sh", "/app/scripts/docker_run_all_tests.sh"]
+    profiles:
+      - test

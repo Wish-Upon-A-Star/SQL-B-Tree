@@ -26,6 +26,30 @@ bench_formula_test
 docs/CMD_PROCESSOR_IMPLEMENTATION_HARNESS_KO.md
 docs/CMD_PROCESSOR_READABILITY_SCORE_HARNESS_KO.md
 docs/CMD_PROCESSOR_READABILITY_SCORE_SHEET.md
+scripts/__pycache__/
+*.idxb
+tcp_mix_*.csv
+tcp_mix_*.log
+tcp_sql_server
+parser_probe_tmp.c
+
+# Python/uv runtime output
+.venv/
+__pycache__/
+*.py[cod]
+.python-version
+
+# Locust TCP sweep output
+py/locust-tcp-test/.venv/
+py/locust-tcp-test/.pytest_cache/
+py/locust-tcp-test/.locust*
+py/locust-tcp-test/locust*.log
+py/locust-tcp-test/*.json
+py/locust-tcp-test/*.csv
+py/locust-tcp-test/*.png
+!py/locust-tcp-test/pyproject.toml
+!py/locust-tcp-test/uv.lock
+artifacts/locust_tcp_worker_sweep/
 
 # Created by https://www.toptal.com/developers/gitignore/api/jetbrains+all
 # Edit at https://www.toptal.com/developers/gitignore?templates=jetbrains+all

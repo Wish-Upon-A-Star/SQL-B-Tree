@@ -14,6 +14,11 @@ WORKDIR /app
 
 COPY . .
 
-RUN make clean && make build
+RUN find /app/scripts -type f -name "*.sh" -exec sed -i 's/\r$//' {} + \
+    && chmod +x /app/scripts/*.sh \
+    && make clean \
+    && make build tcp-server
+
+EXPOSE 15432
 
 CMD ["sh", "-lc", "printf \"%s\\n\" \"SELECT * FROM case_basic_users WHERE id = 2;\" \"SELECT * FROM case_basic_users WHERE email = 'user1@test.com';\" > /tmp/docker_demo.sql && ./sqlsprocessor /tmp/docker_demo.sql"]

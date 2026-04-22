@@ -1,0 +1,29 @@
+{
+  "title": "CmdProcessor 코드 스터디 보드 점수 v2",
+  "required_flags": {
+    "has_four_real_file_paths": true,
+    "has_eight_real_symbols": true,
+    "has_four_code_snippets": true,
+    "has_four_step_study_order": true,
+    "has_file_level_role_boundary": true,
+    "has_request_lifecycle_map": true
+  },
+  "categories": {
+    "study_startability": 15,
+    "code_traceability": 19,
+    "request_lifecycle_explanation": 14,
+    "data_structure_understanding": 14,
+    "role_boundary_clarity": 9,
+    "snippet_quality": 9,
+    "study_sequence_design": 10,
+    "layout_readability": 5
+  },
+  "penalties": {
+    "incorrect_code_claims": 0,
+    "wrong_role_explanation": 0,
+    "mixed_language_friction": 0,
+    "unreadable_snippets": 0,
+    "presentation_bias": 0,
+    "missing_line_level_grounding": 0
+  }
+}

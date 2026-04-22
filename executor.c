@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdint.h>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -11,6 +12,7 @@
 #include "executor.h"
 #include "bptree.h"
 #include "jungle_benchmark.h"
+#include "platform_threads.h"
 
 #define DELTA_LINE_SIZE (RECORD_SIZE + 128)
 #define TABLE_FILE_BUFFER_SIZE (1024 * 1024)
@@ -22,6 +24,8 @@ TableCache open_tables[MAX_TABLES];
 int open_table_count = 0;
 static unsigned long long g_table_access_seq = 0;
 static int g_executor_quiet = 0;
+static db_mutex_t g_table_registry_mutex;
+static int g_table_registry_mutex_ready = 0;
 
 #define INFO_PRINTF(...) do { if (!g_executor_quiet) printf(__VA_ARGS__); } while (0)
 
@@ -30,20 +34,41 @@ struct MutationLookupPlan {
     int where_idx;
     int uses_pk_lookup;
     int uses_uk_lookup;
+    int uses_aux_lookup;
 };
 
 void set_executor_quiet(int quiet) {
     g_executor_quiet = quiet ? 1 : 0;
 }
 
+int executor_runtime_init(void) {
+    if (g_table_registry_mutex_ready) return 1;
+    if (!db_mutex_init(&g_table_registry_mutex)) return 0;
+    g_table_registry_mutex_ready = 1;
+    return 1;
+}
+
+void executor_runtime_shutdown(void) {
+    if (!g_table_registry_mutex_ready) return;
+    db_mutex_destroy(&g_table_registry_mutex);
+    g_table_registry_mutex_ready = 0;
+}
+
 void parse_csv_row(const char *row, char *fields[MAX_COLS], char *buffer);
 static void normalize_value(const char *src, char *dest, size_t dest_size);
 static int rebuild_id_index(TableCache *tc);
 static int rebuild_uk_indexes(TableCache *tc);
+static int ensure_github_index(TableCache *tc);
+static int unique_index_insert(TableCache *tc, UniqueIndex *index, const char *key, int row_index);
 static int maybe_rebuild_indexes_for_order(TableCache *tc);
 static int index_record_uks(TableCache *tc, int row_index);
 static int index_record_uks_from_row(TableCache *tc, const char *row, int row_index);
 static int get_uk_slot(TableCache *tc, int col_idx);
+static int is_github_lookup_column(TableCache *tc, int col_idx);
+static int find_github_row(TableCache *tc, const char *value, int *row_index);
+static void github_index_on_insert(TableCache *tc, const char *row, int row_index);
+static void github_index_on_remove(TableCache *tc, const char *row);
+static void github_index_on_update(TableCache *tc, const char *old_row, int row_index, int set_idx);
 static int ensure_uk_indexes(TableCache *tc);
 static void rollback_updated_records(TableCache *tc, char **old_records);
 static int remove_record_indexes(TableCache *tc, const char *row);
@@ -58,6 +83,7 @@ static void clear_page_cache(TableCache *tc);
 static int evict_row_cache_if_needed(TableCache *tc);
 static int assign_slot_row(TableCache *tc, int slot_id, const char *row,
                            RowStoreType store_type, long offset, int cache_row);
+static int materialize_cached_csv_rows(TableCache *tc);
 static int table_file_has_value(TableCache *tc, int col_idx, const char *value);
 static void clear_tail_delta(TableCache *tc, long id_value);
 static int for_each_file_row_from(TableCache *tc, long start_offset,
@@ -78,7 +104,7 @@ static int finalize_indexes_and_recovery(TableCache *tc, const char *name, FILE 
 static int load_table_contents(TableCache *tc, const char *name, FILE *f);
 static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_idx,
                                      const WhereCondition *lookup_cond, int set_idx, const char *set_value, int uses_pk_lookup,
-                                     int uses_uk_lookup, int rebuild_uk_needed);
+                                     int uses_uk_lookup, int uses_aux_lookup, int rebuild_uk_needed);
 static int row_fields_match_statement(TableCache *tc, Statement *stmt, char *fields[MAX_COLS]);
 static int mark_selected_rows(TableCache *tc, Statement *stmt, int *match_flags, int *match_count);
 static int prepare_update_set(TableCache *tc, Statement *stmt, int *set_idx,
@@ -106,7 +132,8 @@ static int resolve_tail_pk_row(TableCache *tc, Statement *stmt, long pk_key, lon
                                char *base_row, size_t base_row_size, const char **current_row);
 static int persist_deleted_slot(TableCache *tc, int target_row, char *old_record, int emit_logs);
 static int execute_delete_single_row(TableCache *tc, Statement *stmt, int index_col,
-                                     const WhereCondition *lookup_cond, int uses_pk_lookup);
+                                     const WhereCondition *lookup_cond, int uses_pk_lookup,
+                                     int uses_aux_lookup);
 static int execute_delete_scan(TableCache *tc, Statement *stmt);
 static int scan_select_file_rows(TableCache *tc, long start_offset,
                                  const char *tail_trace, const char *full_trace,
@@ -115,9 +142,11 @@ static void build_mutation_lookup_plan(TableCache *tc, Statement *stmt, Mutation
 static int read_csv_row_at_offset(TableCache *tc, long offset, char *line, size_t line_size);
 static int read_snapshot_meta(TableCache *tc, FILE *f, SnapshotMeta *meta,
                               int allow_v1, int require_delta_absent);
+static int load_binary_parse_snapshot(TableCache *tc);
 static int read_snapshot_id_pairs(TableCache *tc, FILE *f, int active_count, BPlusPair **id_pairs_out);
 static int read_snapshot_uk_indexes(TableCache *tc, FILE *f, int active_count,
                                     UniqueIndex *new_indexes[MAX_UKS]);
+static int read_snapshot_github_index(TableCache *tc, FILE *f, int active_count);
 static void reset_deleted_flags(TableCache *tc, int *delete_flags, int old_count);
 static void release_deleted_slots(TableCache *tc, int *delete_flags, int old_count);
 static void clear_slot_storage(TableCache *tc, int slot_id);
@@ -125,6 +154,14 @@ int rewrite_file(TableCache *tc);
 static int execute_insert_internal(Statement *stmt, long *inserted_id);
 static int execute_update_internal(Statement *stmt, int *affected_rows);
 static int execute_delete_internal(Statement *stmt, int *affected_rows);
+
+static void table_io_lock(TableCache *tc) {
+    if (tc && tc->io_mutex_ready) db_mutex_lock(&tc->io_mutex);
+}
+
+static void table_io_unlock(TableCache *tc) {
+    if (tc && tc->io_mutex_ready) db_mutex_unlock(&tc->io_mutex);
+}
 
 static char *dup_string(const char *src) {
     size_t len = strlen(src) + 1;
@@ -211,6 +248,122 @@ static int find_pk_row(TableCache *tc, const char *value, int *row_index) {
     if (!slot_is_active(tc, found_row)) return 0;
     if (row_index) *row_index = found_row;
     return 1;
+}
+
+static void clear_github_index(TableCache *tc, int next_state) {
+    if (!tc) return;
+    unique_index_destroy(tc->github_index);
+    tc->github_index = NULL;
+    tc->github_index_state = next_state;
+}
+
+static int is_github_lookup_column(TableCache *tc, int col_idx) {
+    return tc && tc->github_idx >= 0 && col_idx == tc->github_idx;
+}
+
+static int ensure_github_index(TableCache *tc) {
+    UniqueIndex *index;
+    int row_index;
+
+    if (!tc || tc->cache_truncated || tc->github_idx < 0) return 0;
+    if (tc->github_index_state > 0 && tc->github_index) return 1;
+    if (tc->github_index_state < 0) return 0;
+    if (!materialize_cached_csv_rows(tc)) {
+        tc->github_index_state = -1;
+        return 0;
+    }
+
+    index = unique_index_create(tc->github_idx);
+    if (!index) {
+        tc->github_index_state = -1;
+        return 0;
+    }
+
+    for (row_index = 0; row_index < tc->record_count; row_index++) {
+        char row_buf[RECORD_SIZE];
+        char *fields[MAX_COLS] = {0};
+        char key[RECORD_SIZE];
+        char *row = slot_row(tc, row_index);
+        int existing_row;
+
+        if (!row) continue;
+        parse_csv_row(row, fields, row_buf);
+        normalize_value(fields[tc->github_idx], key, sizeof(key));
+        if (strlen(key) == 0 || strcmp(key, "none") == 0) continue;
+        if (bptree_string_search(index->tree, key, &existing_row) &&
+            existing_row != row_index && slot_is_active(tc, existing_row)) {
+            unique_index_destroy(index);
+            tc->github_index_state = -1;
+            return 0;
+        }
+        if (unique_index_insert(tc, index, key, row_index) != 1) {
+            unique_index_destroy(index);
+            tc->github_index_state = -1;
+            return 0;
+        }
+    }
+
+    tc->github_index = index;
+    tc->github_index_state = 1;
+    return 1;
+}
+
+static int find_github_row(TableCache *tc, const char *value, int *row_index) {
+    char key[RECORD_SIZE];
+
+    if (!ensure_github_index(tc) || !value) return 0;
+    normalize_value(value, key, sizeof(key));
+    if (strlen(key) == 0 || strcmp(key, "none") == 0) return 0;
+    return unique_index_find(tc, tc->github_index, key, row_index);
+}
+
+static void github_index_on_insert(TableCache *tc, const char *row, int row_index) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    char key[RECORD_SIZE];
+    int existing_row;
+
+    if (!tc || !row || tc->github_index_state <= 0 || !tc->github_index || tc->github_idx < 0) return;
+    parse_csv_row(row, fields, row_buf);
+    normalize_value(fields[tc->github_idx], key, sizeof(key));
+    if (strlen(key) == 0 || strcmp(key, "none") == 0) return;
+    if (unique_index_find(tc, tc->github_index, key, &existing_row) &&
+        existing_row != row_index && slot_is_active(tc, existing_row)) {
+        clear_github_index(tc, -1);
+        return;
+    }
+    if (unique_index_insert(tc, tc->github_index, key, row_index) != 1) {
+        clear_github_index(tc, 0);
+    }
+}
+
+static void github_index_on_remove(TableCache *tc, const char *row) {
+    char row_buf[RECORD_SIZE];
+    char *fields[MAX_COLS] = {0};
+    char key[RECORD_SIZE];
+
+    if (!tc || !row || tc->github_index_state <= 0 || !tc->github_index || tc->github_idx < 0) return;
+    parse_csv_row(row, fields, row_buf);
+    normalize_value(fields[tc->github_idx], key, sizeof(key));
+    if (strlen(key) == 0 || strcmp(key, "none") == 0) return;
+    if (!bptree_string_delete(tc->github_index->tree, key)) {
+        clear_github_index(tc, 0);
+    }
+}
+
+static void github_index_on_update(TableCache *tc, const char *old_row, int row_index, int set_idx) {
+    char *new_row;
+
+    if (!is_github_lookup_column(tc, set_idx)) return;
+    if (!tc || tc->github_index_state <= 0 || !tc->github_index) return;
+    github_index_on_remove(tc, old_row);
+    if (!tc->github_index || tc->github_index_state <= 0) return;
+    new_row = slot_row(tc, row_index);
+    if (!new_row) {
+        clear_github_index(tc, 0);
+        return;
+    }
+    github_index_on_insert(tc, new_row, row_index);
 }
 
 
@@ -759,25 +912,34 @@ static char *slot_row(TableCache *tc, int slot_id) {
     long offset;
 
     if (!slot_is_active(tc, slot_id)) return NULL;
-    if (tc->records[slot_id]) {
-        if (tc->row_store && tc->row_store[slot_id] != ROW_STORE_MEMORY) {
-            if (tc->row_cached) tc->row_cached[slot_id] = 1;
-            if (tc->row_cache_seq) tc->row_cache_seq[slot_id] = ++tc->row_cache_clock;
-        }
-        return tc->records[slot_id];
-    }
+    if (tc->records[slot_id]) return tc->records[slot_id];
     if (!tc->row_refs || tc->row_refs[slot_id].store != ROW_STORE_CSV ||
         tc->row_refs[slot_id].offset < 0 || !tc->file) {
         return NULL;
     }
-    if (!evict_row_cache_if_needed(tc)) return NULL;
+    table_io_lock(tc);
+    if (tc->records[slot_id]) {
+        table_io_unlock(tc);
+        return tc->records[slot_id];
+    }
+    if (!evict_row_cache_if_needed(tc)) {
+        table_io_unlock(tc);
+        return NULL;
+    }
     offset = tc->row_refs[slot_id].offset;
     tc->records[slot_id] = read_row_from_page_cache(tc, offset);
     if (!tc->records[slot_id]) {
-        if (fflush(tc->file) != 0) return NULL;
-        if (fseek(tc->file, offset, SEEK_SET) != 0) return NULL;
+        if (fflush(tc->file) != 0) {
+            table_io_unlock(tc);
+            return NULL;
+        }
+        if (fseek(tc->file, offset, SEEK_SET) != 0) {
+            table_io_unlock(tc);
+            return NULL;
+        }
         if (!fgets(line, sizeof(line), tc->file)) {
             fseek(tc->file, 0, SEEK_END);
+            table_io_unlock(tc);
             return NULL;
         }
         fseek(tc->file, 0, SEEK_END);
@@ -785,10 +947,14 @@ static char *slot_row(TableCache *tc, int slot_id) {
         if (nl) *nl = '\0';
         tc->records[slot_id] = dup_string(line);
     }
-    if (!tc->records[slot_id]) return NULL;
+    if (!tc->records[slot_id]) {
+        table_io_unlock(tc);
+        return NULL;
+    }
     if (tc->row_cached) tc->row_cached[slot_id] = 1;
     if (tc->row_cache_seq) tc->row_cache_seq[slot_id] = ++tc->row_cache_clock;
     tc->cached_record_count++;
+    table_io_unlock(tc);
     return tc->records[slot_id];
 }
 
@@ -806,13 +972,21 @@ static char *slot_row_scan(TableCache *tc, int slot_id, int *owned) {
         return NULL;
     }
 
+    table_io_lock(tc);
     offset = tc->row_refs[slot_id].offset;
     row = read_row_from_page_cache(tc, offset);
     if (!row) {
-        if (fflush(tc->file) != 0) return NULL;
-        if (fseek(tc->file, offset, SEEK_SET) != 0) return NULL;
+        if (fflush(tc->file) != 0) {
+            table_io_unlock(tc);
+            return NULL;
+        }
+        if (fseek(tc->file, offset, SEEK_SET) != 0) {
+            table_io_unlock(tc);
+            return NULL;
+        }
         if (!fgets(line, sizeof(line), tc->file)) {
             fseek(tc->file, 0, SEEK_END);
+            table_io_unlock(tc);
             return NULL;
         }
         fseek(tc->file, 0, SEEK_END);
@@ -820,6 +994,7 @@ static char *slot_row_scan(TableCache *tc, int slot_id, int *owned) {
         if (nl) *nl = '\0';
         row = dup_string(line);
     }
+    table_io_unlock(tc);
     if (owned && row) *owned = 1;
     return row;
 }
@@ -1048,6 +1223,10 @@ static void free_table_storage(TableCache *tc) {
         fclose(tc->delta_file);
         tc->delta_file = NULL;
     }
+    if (tc->io_mutex_ready) {
+        db_mutex_destroy(&tc->io_mutex);
+        tc->io_mutex_ready = 0;
+    }
     tc->delta_batch_open = 0;
     tc->delta_ops_since_compact_check = 0;
     tc->delta_bytes_since_compact = 0;
@@ -1102,6 +1281,10 @@ static void free_table_storage(TableCache *tc) {
         unique_index_destroy(tc->uk_indexes[i]);
         tc->uk_indexes[i] = NULL;
     }
+    unique_index_destroy(tc->github_index);
+    tc->github_index = NULL;
+    tc->github_idx = -1;
+    tc->github_index_state = 0;
     tc->uk_count = 0;
 }
 
@@ -1110,6 +1293,9 @@ static void reset_table_cache(TableCache *tc) {
     tc->file = NULL;
     tc->delta_file = NULL;
     tc->pk_idx = -1;
+    tc->github_idx = -1;
+    tc->github_index = NULL;
+    tc->github_index_state = 0;
     tc->next_auto_id = 1;
     tc->next_row_id = 1;
     tc->append_offset = -1;
@@ -2067,8 +2253,19 @@ static int materialize_cached_csv_rows(TableCache *tc) {
 
     if (!tc || tc->rows_materialized || tc->cache_truncated) return 1;
     if (!tc->file) return 0;
-    if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_SET) != 0) return 0;
-    if (!fgets(line, sizeof(line), tc->file)) return 0;
+    table_io_lock(tc);
+    if (tc->rows_materialized) {
+        table_io_unlock(tc);
+        return 1;
+    }
+    if (fflush(tc->file) != 0 || fseek(tc->file, 0, SEEK_SET) != 0) {
+        table_io_unlock(tc);
+        return 0;
+    }
+    if (!fgets(line, sizeof(line), tc->file)) {
+        table_io_unlock(tc);
+        return 0;
+    }
 
     while (slot_id < tc->record_count && fgets(line, sizeof(line), tc->file)) {
         char *nl = strpbrk(line, "\r\n");
@@ -2077,7 +2274,10 @@ static int materialize_cached_csv_rows(TableCache *tc) {
 
         if (tc->record_active[slot_id] && tc->row_store[slot_id] == ROW_STORE_CSV && !tc->records[slot_id]) {
             tc->records[slot_id] = dup_string(line);
-            if (!tc->records[slot_id]) return 0;
+            if (!tc->records[slot_id]) {
+                table_io_unlock(tc);
+                return 0;
+            }
             tc->row_store[slot_id] = ROW_STORE_MEMORY;
             tc->row_offsets[slot_id] = -1;
             tc->row_cached[slot_id] = 0;
@@ -2091,6 +2291,7 @@ static int materialize_cached_csv_rows(TableCache *tc) {
     }
     if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
     tc->rows_materialized = 1;
+    table_io_unlock(tc);
     return 1;
 }
 
@@ -2114,18 +2315,20 @@ static int remove_record_indexes(TableCache *tc, const char *row) {
         }
         if (!bptree_delete(tc->id_index, id_value)) return 0;
     }
-    if (tc->uk_count == 0) return 1;
-    if (!ensure_uk_indexes(tc)) return 0;
-    for (i = 0; i < tc->uk_count; i++) {
-        char key[RECORD_SIZE];
-        int col_idx = tc->uk_indices[i];
-        int uk_slot = get_uk_slot(tc, col_idx);
+    if (tc->uk_count > 0) {
+        if (!ensure_uk_indexes(tc)) return 0;
+        for (i = 0; i < tc->uk_count; i++) {
+            char key[RECORD_SIZE];
+            int col_idx = tc->uk_indices[i];
+            int uk_slot = get_uk_slot(tc, col_idx);
 
-        if (uk_slot == -1) return 0;
-        normalize_value(fields[col_idx], key, sizeof(key));
-        if (strlen(key) == 0) continue;
-        if (!bptree_string_delete(tc->uk_indexes[uk_slot]->tree, key)) return 0;
+            if (uk_slot == -1) return 0;
+            normalize_value(fields[col_idx], key, sizeof(key));
+            if (strlen(key) == 0) continue;
+            if (!bptree_string_delete(tc->uk_indexes[uk_slot]->tree, key)) return 0;
+        }
     }
+    github_index_on_remove(tc, row);
     return 1;
 }
 
@@ -2137,7 +2340,9 @@ static int restore_record_indexes(TableCache *tc, int slot_id) {
     row = slot_row(tc, slot_id);
     if (!get_row_index_key(tc, row, slot_id, &id_value)) return 0;
     if (bptree_insert(tc->id_index, id_value, slot_id) != 1) return 0;
-    return index_record_uks(tc, slot_id);
+    if (!index_record_uks(tc, slot_id)) return 0;
+    github_index_on_insert(tc, row, slot_id);
+    return 1;
 }
 
 static int rebuild_uk_indexes(TableCache *tc) {
@@ -2268,12 +2473,19 @@ static void get_index_filename(TableCache *tc, char *filename, size_t filename_s
     snprintf(filename, filename_size, "%s.idx", tc->table_name);
 }
 
+static void get_binary_index_filename(TableCache *tc, char *filename, size_t filename_size) {
+    snprintf(filename, filename_size, "%s.idxb", tc->table_name);
+}
+
 static void remove_index_snapshot(TableCache *tc) {
     char filename[300];
+    char binary_filename[300];
 
     if (!tc) return;
     get_index_filename(tc, filename, sizeof(filename));
+    get_binary_index_filename(tc, binary_filename, sizeof(binary_filename));
     remove(filename);
+    remove(binary_filename);
     tc->snapshot_loaded = 0;
     tc->snapshot_dirty = 1;
 }
@@ -2281,7 +2493,10 @@ static void remove_index_snapshot(TableCache *tc) {
 static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
     BPlusPair *id_pairs = NULL;
     BPlusStringPair *uk_pairs[MAX_UKS] = {0};
+    BPlusStringPair *github_pairs = NULL;
     int uk_counts[MAX_UKS] = {0};
+    int github_count = 0;
+    int github_snapshot_count = -1;
     int id_count = 0;
     int i;
     int row_index;
@@ -2292,6 +2507,10 @@ static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
         for (i = 0; i < tc->uk_count; i++) {
             uk_pairs[i] = (BPlusStringPair *)calloc((size_t)tc->active_count, sizeof(BPlusStringPair));
             if (!uk_pairs[i]) goto fail;
+        }
+        if (tc->github_idx >= 0) {
+            github_pairs = (BPlusStringPair *)calloc((size_t)tc->active_count, sizeof(BPlusStringPair));
+            if (!github_pairs) goto fail;
         }
     }
 
@@ -2319,6 +2538,17 @@ static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
             uk_pairs[i][uk_counts[i]].row_index = row_index;
             uk_counts[i]++;
         }
+        if (tc->github_idx >= 0) {
+            char key[RECORD_SIZE];
+
+            normalize_value(fields[tc->github_idx], key, sizeof(key));
+            if (strlen(key) > 0 && strcmp(key, "none") != 0) {
+                github_pairs[github_count].key = dup_string(key);
+                if (!github_pairs[github_count].key) goto fail;
+                github_pairs[github_count].row_index = row_index;
+                github_count++;
+            }
+        }
     }
 
     if (id_count > 1) qsort(id_pairs, (size_t)id_count, sizeof(BPlusPair), compare_bplus_pair);
@@ -2340,12 +2570,36 @@ static int write_index_snapshot_pairs(FILE *out, TableCache *tc) {
             if (fprintf(out, "%d\t%s\n", uk_pairs[i][j].row_index, uk_pairs[i][j].key) < 0) goto fail;
         }
     }
+    if (tc->github_idx >= 0) {
+        int j;
+
+        github_snapshot_count = github_count;
+        if (github_count > 1) {
+            qsort(github_pairs, (size_t)github_count, sizeof(BPlusStringPair), compare_bplus_string_pair);
+            for (j = 1; j < github_count; j++) {
+                if (strcmp(github_pairs[j - 1].key, github_pairs[j].key) == 0) {
+                    github_snapshot_count = -1;
+                    break;
+                }
+            }
+        }
+        if (fprintf(out, "AUXGITHUB %d %d\n", tc->github_idx, github_snapshot_count) < 0) goto fail;
+        if (github_snapshot_count > 0) {
+            for (j = 0; j < github_count; j++) {
+                if (fprintf(out, "%d\t%s\n", github_pairs[j].row_index, github_pairs[j].key) < 0) goto fail;
+            }
+        }
+    }
 
     free(id_pairs);
     for (i = 0; i < tc->uk_count; i++) {
         int j;
         for (j = 0; j < uk_counts[i]; j++) free(uk_pairs[i][j].key);
         free(uk_pairs[i]);
+    }
+    if (github_pairs) {
+        for (i = 0; i < github_count; i++) free(github_pairs[i].key);
+        free(github_pairs);
     }
     return 1;
 
@@ -2357,6 +2611,10 @@ fail:
             for (j = 0; j < uk_counts[i]; j++) free(uk_pairs[i][j].key);
             free(uk_pairs[i]);
         }
+    }
+    if (github_pairs) {
+        for (i = 0; i < github_count; i++) free(github_pairs[i].key);
+        free(github_pairs);
     }
     return 0;
 }
@@ -2616,6 +2874,82 @@ static int read_snapshot_uk_indexes(TableCache *tc, FILE *f, int active_count,
         free(pairs);
     }
 
+    return 1;
+}
+
+static int read_snapshot_github_index(TableCache *tc, FILE *f, int active_count) {
+    char line[DELTA_LINE_SIZE];
+    int col_idx;
+    int count;
+
+    if (!tc || !f) return 0;
+    clear_github_index(tc, 0);
+
+    if (!read_expected_line(f, line, sizeof(line))) return 0;
+    if (strcmp(line, "END") == 0) return 1;
+    if (sscanf(line, "AUXGITHUB %d %d", &col_idx, &count) != 2) return 0;
+
+    if (col_idx != tc->github_idx || col_idx < 0 || count <= 0) {
+        tc->github_index_state = (col_idx == tc->github_idx && count < 0) ? -1 : 0;
+    } else {
+        BPlusStringPair *pairs = NULL;
+        UniqueIndex *index = NULL;
+        int i;
+
+        if (count > active_count) return 0;
+        index = unique_index_create(col_idx);
+        if (!index) return 0;
+        pairs = (BPlusStringPair *)calloc((size_t)count, sizeof(BPlusStringPair));
+        if (!pairs) {
+            unique_index_destroy(index);
+            return 0;
+        }
+        for (i = 0; i < count; i++) {
+            char *tab;
+            int row_index;
+
+            if (!read_expected_line(f, line, sizeof(line))) {
+                for (i = 0; i < count; i++) free(pairs[i].key);
+                free(pairs);
+                unique_index_destroy(index);
+                return 0;
+            }
+            tab = strchr(line, '\t');
+            if (!tab) {
+                for (i = 0; i < count; i++) free(pairs[i].key);
+                free(pairs);
+                unique_index_destroy(index);
+                return 0;
+            }
+            *tab++ = '\0';
+            row_index = atoi(line);
+            if (!slot_is_active(tc, row_index)) {
+                for (i = 0; i < count; i++) free(pairs[i].key);
+                free(pairs);
+                unique_index_destroy(index);
+                return 0;
+            }
+            pairs[i].row_index = row_index;
+            pairs[i].key = dup_string(tab);
+            if (!pairs[i].key) {
+                for (i = 0; i < count; i++) free(pairs[i].key);
+                free(pairs);
+                unique_index_destroy(index);
+                return 0;
+            }
+        }
+        if (!bptree_string_build_from_sorted(index->tree, pairs, count)) {
+            for (i = 0; i < count; i++) free(pairs[i].key);
+            free(pairs);
+            unique_index_destroy(index);
+            return 0;
+        }
+        for (i = 0; i < count; i++) free(pairs[i].key);
+        free(pairs);
+        tc->github_index = index;
+        tc->github_index_state = 1;
+    }
+
     return read_expected_line(f, line, sizeof(line)) && strcmp(line, "END") == 0;
 }
 
@@ -2655,6 +2989,7 @@ static int load_index_snapshot(TableCache *tc) {
     id_count = read_snapshot_id_pairs(tc, f, tc->active_count, &id_pairs);
     if (id_count < 0) goto fail;
     if (!read_snapshot_uk_indexes(tc, f, tc->active_count, new_indexes)) goto fail;
+    if (!read_snapshot_github_index(tc, f, tc->active_count)) goto fail;
 
     if (!bptree_build_from_sorted(tc->id_index, id_pairs, id_count)) goto fail;
     if (tc->pk_idx == -1) {
@@ -2680,6 +3015,262 @@ fail:
     free(id_pairs);
     for (i = 0; i < MAX_UKS; i++) unique_index_destroy(new_indexes[i]);
     fclose(f);
+    return 0;
+}
+
+static int read_binary_exact(FILE *f, void *buffer, size_t bytes) {
+    return f && buffer && bytes > 0 && fread(buffer, 1, bytes, f) == bytes;
+}
+
+static int read_binary_u8(FILE *f, uint8_t *out) {
+    return read_binary_exact(f, out, sizeof(*out));
+}
+
+static int read_binary_u16(FILE *f, uint16_t *out) {
+    uint8_t buf[2];
+    if (!read_binary_exact(f, buf, sizeof(buf))) return 0;
+    *out = (uint16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
+    return 1;
+}
+
+static int read_binary_i32(FILE *f, int *out) {
+    uint8_t buf[4];
+    if (!read_binary_exact(f, buf, sizeof(buf))) return 0;
+    *out = (int)((uint32_t)buf[0] |
+                 ((uint32_t)buf[1] << 8) |
+                 ((uint32_t)buf[2] << 16) |
+                 ((uint32_t)buf[3] << 24));
+    return 1;
+}
+
+static int read_binary_i64(FILE *f, long *out) {
+    uint8_t buf[8];
+    uint64_t value;
+    if (!read_binary_exact(f, buf, sizeof(buf))) return 0;
+    value = (uint64_t)buf[0] |
+            ((uint64_t)buf[1] << 8) |
+            ((uint64_t)buf[2] << 16) |
+            ((uint64_t)buf[3] << 24) |
+            ((uint64_t)buf[4] << 32) |
+            ((uint64_t)buf[5] << 40) |
+            ((uint64_t)buf[6] << 48) |
+            ((uint64_t)buf[7] << 56);
+    *out = (long)value;
+    return 1;
+}
+
+static int load_binary_parse_snapshot(TableCache *tc) {
+    char filename[300];
+    FILE *f = NULL;
+    char magic[8];
+    int col_count;
+    int pk_idx;
+    int uk_count;
+    int i;
+    int record_count;
+    int active_count;
+    int cache_truncated;
+    int tail_count;
+    long next_auto_id;
+    long next_row_id;
+    int github_idx;
+    int github_state;
+    int slot_count;
+    BPlusPair *id_pairs = NULL;
+    UniqueIndex *new_indexes[MAX_UKS] = {0};
+    UniqueIndex *github_index = NULL;
+    int id_count;
+
+    if (!tc || strlen(tc->table_name) == 0) return 0;
+    get_binary_index_filename(tc, filename, sizeof(filename));
+    f = fopen(filename, "rb");
+    if (!f) return 0;
+
+    if (!read_binary_exact(f, magic, sizeof(magic)) || memcmp(magic, "SQLIDXB1", 8) != 0) goto fail;
+    if (!read_binary_i32(f, &col_count) || !read_binary_i32(f, &pk_idx) || !read_binary_i32(f, &uk_count)) goto fail;
+    if (col_count != tc->col_count || pk_idx != tc->pk_idx || uk_count != tc->uk_count) goto fail;
+    for (i = 0; i < MAX_UKS; i++) {
+        int uk_index = -1;
+        if (!read_binary_i32(f, &uk_index)) goto fail;
+        if (i < tc->uk_count && uk_index != tc->uk_indices[i]) goto fail;
+    }
+    if (!read_binary_i32(f, &record_count) ||
+        !read_binary_i32(f, &active_count) ||
+        !read_binary_i32(f, &cache_truncated) ||
+        !read_binary_i32(f, &tail_count) ||
+        !read_binary_i64(f, &next_auto_id) ||
+        !read_binary_i64(f, &next_row_id) ||
+        !read_binary_i32(f, &github_idx) ||
+        !read_binary_i32(f, &github_state)) {
+        goto fail;
+    }
+    if (record_count < 0 || record_count > MAX_RECORDS ||
+        active_count < 0 || cache_truncated || tail_count != 0 ||
+        github_idx != tc->github_idx) {
+        goto fail;
+    }
+    if (!ensure_record_capacity(tc, record_count)) goto fail;
+    tc->record_count = record_count;
+    tc->active_count = 0;
+    tc->cache_truncated = 0;
+    tc->tail_count = 0;
+
+    if (!read_binary_i32(f, &slot_count) || slot_count != record_count) goto fail;
+    for (i = 0; i < slot_count; i++) {
+        uint8_t active = 0;
+        uint8_t store = 0;
+        uint16_t reserved = 0;
+        long row_id = 0;
+        long offset = 0;
+
+        (void)reserved;
+        if (!read_binary_u8(f, &active) ||
+            !read_binary_u8(f, &store) ||
+            !read_binary_u16(f, &reserved) ||
+            !read_binary_i64(f, &row_id) ||
+            !read_binary_i64(f, &offset)) {
+            goto fail;
+        }
+        tc->records[i] = NULL;
+        tc->row_ids[i] = row_id;
+        tc->record_active[i] = active ? 1 : 0;
+        tc->row_store[i] = active ? (unsigned char)store : ROW_STORE_NONE;
+        tc->row_offsets[i] = active ? offset : 0;
+        tc->row_cached[i] = 0;
+        tc->row_cache_seq[i] = 0;
+        tc->row_refs[i].store = active ? (RowStoreType)store : ROW_STORE_NONE;
+        tc->row_refs[i].offset = active ? offset : 0;
+        if (active) tc->active_count++;
+        else if (!push_free_slot(tc, i)) goto fail;
+    }
+    if (tc->active_count != active_count) goto fail;
+
+    if (!read_binary_i32(f, &id_count)) goto fail;
+    if (id_count != active_count) goto fail;
+    if (id_count > 0) {
+        id_pairs = (BPlusPair *)calloc((size_t)id_count, sizeof(BPlusPair));
+        if (!id_pairs) goto fail;
+    }
+    for (i = 0; i < id_count; i++) {
+        long key;
+        int row_index;
+        if (!read_binary_i64(f, &key) || !read_binary_i32(f, &row_index) || !slot_is_active(tc, row_index)) goto fail;
+        id_pairs[i].key = key;
+        id_pairs[i].row_index = row_index;
+    }
+    if (!bptree_build_from_sorted(tc->id_index, id_pairs, id_count)) goto fail;
+
+    for (i = 0; i < tc->uk_count; i++) {
+        int col_idx;
+        int count;
+        int j;
+        BPlusStringPair *pairs = NULL;
+
+        if (!read_binary_i32(f, &col_idx) || !read_binary_i32(f, &count) ||
+            col_idx != tc->uk_indices[i] || count < 0 || count > active_count) {
+            goto fail;
+        }
+        new_indexes[i] = unique_index_create(col_idx);
+        if (!new_indexes[i]) goto fail;
+        if (count > 0) {
+            pairs = (BPlusStringPair *)calloc((size_t)count, sizeof(BPlusStringPair));
+            if (!pairs) goto fail;
+        }
+        for (j = 0; j < count; j++) {
+            int row_index;
+            uint16_t key_len;
+            char *key;
+            if (!read_binary_i32(f, &row_index) || !read_binary_u16(f, &key_len) || !slot_is_active(tc, row_index)) {
+                free(pairs);
+                goto fail;
+            }
+            key = (char *)calloc((size_t)key_len + 1, 1);
+            if (!key || !read_binary_exact(f, key, key_len)) {
+                free(key);
+                free(pairs);
+                goto fail;
+            }
+            pairs[j].row_index = row_index;
+            pairs[j].key = key;
+        }
+        if (!bptree_string_build_from_sorted(new_indexes[i]->tree, pairs, count)) {
+            for (j = 0; j < count; j++) free(pairs[j].key);
+            free(pairs);
+            goto fail;
+        }
+        for (j = 0; j < count; j++) free(pairs[j].key);
+        free(pairs);
+    }
+
+    if (!read_binary_i32(f, &github_idx) || !read_binary_i32(f, &github_state) ||
+        github_idx != tc->github_idx) {
+        goto fail;
+    }
+    clear_github_index(tc, 0);
+    if (github_state > 0) {
+        int count;
+        int j;
+        BPlusStringPair *pairs = NULL;
+        if (!read_binary_i32(f, &count) || count < 0 || count > active_count) goto fail;
+        github_index = unique_index_create(github_idx);
+        if (!github_index) goto fail;
+        if (count > 0) {
+            pairs = (BPlusStringPair *)calloc((size_t)count, sizeof(BPlusStringPair));
+            if (!pairs) goto fail;
+        }
+        for (j = 0; j < count; j++) {
+            int row_index;
+            uint16_t key_len;
+            char *key;
+            if (!read_binary_i32(f, &row_index) || !read_binary_u16(f, &key_len) || !slot_is_active(tc, row_index)) {
+                free(pairs);
+                goto fail;
+            }
+            key = (char *)calloc((size_t)key_len + 1, 1);
+            if (!key || !read_binary_exact(f, key, key_len)) {
+                free(key);
+                free(pairs);
+                goto fail;
+            }
+            pairs[j].row_index = row_index;
+            pairs[j].key = key;
+        }
+        if (!bptree_string_build_from_sorted(github_index->tree, pairs, count)) {
+            for (j = 0; j < count; j++) free(pairs[j].key);
+            free(pairs);
+            goto fail;
+        }
+        for (j = 0; j < count; j++) free(pairs[j].key);
+        free(pairs);
+        tc->github_index = github_index;
+        tc->github_index_state = 1;
+        github_index = NULL;
+    } else {
+        tc->github_index_state = github_state;
+    }
+
+    for (i = 0; i < tc->uk_count; i++) {
+        unique_index_destroy(tc->uk_indexes[i]);
+        tc->uk_indexes[i] = new_indexes[i];
+        new_indexes[i] = NULL;
+    }
+    tc->next_auto_id = next_auto_id;
+    tc->next_row_id = next_row_id;
+    free(id_pairs);
+    fclose(f);
+    f = NULL;
+    if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
+    if (tc->record_count >= 200000 && !materialize_cached_csv_rows(tc)) goto fail;
+    INFO_PRINTF("[index] loaded binary parse/index snapshot for table '%s'.\n", tc->table_name);
+    tc->snapshot_loaded = 1;
+    tc->snapshot_dirty = 0;
+    return 1;
+
+fail:
+    free(id_pairs);
+    unique_index_destroy(github_index);
+    for (i = 0; i < MAX_UKS; i++) unique_index_destroy(new_indexes[i]);
+    if (f) fclose(f);
     return 0;
 }
 
@@ -2748,6 +3339,7 @@ static int load_table_parse_snapshot(TableCache *tc) {
     if (!bptree_build_from_sorted(tc->id_index, id_pairs, id_count)) goto fail;
 
     if (!read_snapshot_uk_indexes(tc, f, active_seen, new_indexes)) goto fail;
+    if (!read_snapshot_github_index(tc, f, active_seen)) goto fail;
 
     for (i = 0; i < tc->uk_count; i++) {
         unique_index_destroy(tc->uk_indexes[i]);
@@ -2758,7 +3350,9 @@ static int load_table_parse_snapshot(TableCache *tc) {
     tc->next_row_id = meta.next_row_id;
     free(id_pairs);
     fclose(f);
+    f = NULL;
     if (fseek(tc->file, 0, SEEK_END) == 0) tc->append_offset = ftell(tc->file);
+    if (tc->record_count >= 200000 && !materialize_cached_csv_rows(tc)) goto fail;
     INFO_PRINTF("[index] loaded CSV parse/index snapshot for table '%s'.\n", tc->table_name);
     tc->snapshot_loaded = 1;
     tc->snapshot_dirty = 0;
@@ -2809,6 +3403,7 @@ static int parse_table_header(TableCache *tc, FILE *f) {
                 tc->cols[idx].name[sizeof(tc->cols[idx].name) - 1] = '\0';
                 tc->cols[idx].type = COL_NORMAL;
             }
+            if (strcmp(tc->cols[idx].name, "github") == 0) tc->github_idx = idx;
             token = strtok(NULL, ",\r\n");
             idx++;
         }
@@ -2933,6 +3528,8 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
     int has_delta_log;
 
     reset_table_cache(tc);
+    if (!db_mutex_init(&tc->io_mutex)) return 0;
+    tc->io_mutex_ready = 1;
     if (!tc->id_index) return 0;
     strncpy(tc->table_name, name, sizeof(tc->table_name) - 1);
     tc->file = f;
@@ -2940,6 +3537,7 @@ static int load_table_contents(TableCache *tc, const char *name, FILE *f) {
     has_delta_log = delta_log_exists(tc);
 
     if (!parse_table_header(tc, f)) return 0;
+    if (!has_delta_log && load_binary_parse_snapshot(tc)) return 1;
     if (load_table_parse_snapshot(tc)) return 1;
     if (!load_rows_into_cache(tc, name, f, has_delta_log, &file_next_auto_id)) return 0;
     return finalize_indexes_and_recovery(tc, name, f, has_delta_log, file_next_auto_id);
@@ -2951,9 +3549,13 @@ TableCache *get_table(const char *name) {
     TableCache *tc;
     int i;
 
+    if (!executor_runtime_init()) return NULL;
+    db_mutex_lock(&g_table_registry_mutex);
+
     for (i = 0; i < open_table_count; i++) {
         if (strcmp(open_tables[i].table_name, name) == 0) {
             touch_table(&open_tables[i]);
+            db_mutex_unlock(&g_table_registry_mutex);
             return &open_tables[i];
         }
     }
@@ -2962,6 +3564,7 @@ TableCache *get_table(const char *name) {
     f = fopen(filename, "r+b");
     if (!f) {
         printf("[notice] '%s.csv' does not exist.\n", name);
+        db_mutex_unlock(&g_table_registry_mutex);
         return NULL;
     }
     setvbuf(f, NULL, _IOFBF, TABLE_FILE_BUFFER_SIZE);
@@ -2977,8 +3580,10 @@ TableCache *get_table(const char *name) {
     if (!load_table_contents(tc, name, f)) {
         free_table_storage(tc);
         if (tc == &open_tables[open_table_count - 1]) open_table_count--;
+        db_mutex_unlock(&g_table_registry_mutex);
         return NULL;
     }
+    db_mutex_unlock(&g_table_registry_mutex);
     return tc;
 }
 
@@ -3162,7 +3767,7 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
             printf("[error] INSERT failed: could not update B+ tree index or RowRef store.\n");
             return 0;
         }
-        if (!append_record_file(tc, new_line, flush_now)) {
+    if (!append_record_file(tc, new_line, flush_now)) {
             if (inserted_slot < 0 || !deactivate_slot(tc, inserted_slot, 1) ||
                 !rebuild_id_index(tc) || !rebuild_uk_indexes(tc)) {
                 printf("[error] INSERT rollback failed: indexes may be stale.\n");
@@ -3173,6 +3778,7 @@ static int insert_row_data(TableCache *tc, const char *row_data, int flush_now, 
         if (!maybe_rebuild_indexes_for_order(tc)) {
             printf("[warning] INSERT completed, but dynamic B+ tree order rebuild failed.\n");
         }
+        if (inserted_slot >= 0) github_index_on_insert(tc, new_line, inserted_slot);
     } else {
         long append_offset;
         int replacing_deleted_tail = 0;
@@ -3259,6 +3865,8 @@ typedef struct {
     int emit_results;
     int emit_traces;
     int matched_rows;
+    ExecutorResult *result;
+    int collect_failed;
 } SelectExecContext;
 
 typedef struct {
@@ -3299,6 +3907,42 @@ static void execute_select_file_string_range_scan(TableCache *tc, long start_off
                                                   int where_idx, SelectExecContext *exec,
                                                   const char *start_key, const char *end_key);
 
+void executor_result_init(ExecutorResult *result) {
+    if (!result) return;
+    memset(result, 0, sizeof(*result));
+}
+
+void executor_result_free(ExecutorResult *result) {
+    int i;
+
+    if (!result) return;
+    if (result->select_rows) {
+        for (i = 0; i < result->select_row_count; i++) free(result->select_rows[i]);
+        free(result->select_rows);
+    }
+    memset(result, 0, sizeof(*result));
+}
+
+static int executor_result_append_row(ExecutorResult *result, const char *row) {
+    char **new_rows;
+    int new_capacity;
+    char *copy;
+
+    if (!result || !row) return 0;
+    if (result->select_row_count >= result->select_row_capacity) {
+        new_capacity = result->select_row_capacity > 0 ? result->select_row_capacity * 2 : 8;
+        new_rows = (char **)realloc(result->select_rows, (size_t)new_capacity * sizeof(*new_rows));
+        if (!new_rows) return 0;
+        result->select_rows = new_rows;
+        result->select_row_capacity = new_capacity;
+    }
+    copy = (char *)calloc(strlen(row) + 1, 1);
+    if (!copy) return 0;
+    memcpy(copy, row, strlen(row) + 1);
+    result->select_rows[result->select_row_count++] = copy;
+    return 1;
+}
+
 static void emit_selected_row(const char *row, SelectExecContext *exec) {
     char row_buf[RECORD_SIZE];
     char *fields[MAX_COLS] = {0};
@@ -3306,6 +3950,10 @@ static void emit_selected_row(const char *row, SelectExecContext *exec) {
 
     if (!row || !exec) return;
     exec->matched_rows++;
+    if (exec->result && !executor_result_append_row(exec->result, row)) {
+        exec->collect_failed = 1;
+        return;
+    }
     if (!exec->emit_results) return;
 
     if (exec->select_all) {
@@ -3427,6 +4075,7 @@ static int choose_index_condition(TableCache *tc, Statement *stmt, int allow_ran
         if (col_idx == -1) continue;
         if (cond->type == WHERE_EQ && col_idx == tc->pk_idx) score = 100;
         else if (cond->type == WHERE_EQ && get_uk_slot(tc, col_idx) != -1) score = 90;
+        else if (!tc->cache_truncated && cond->type == WHERE_EQ && is_github_lookup_column(tc, col_idx)) score = 85;
         else if (allow_range && cond->type == WHERE_BETWEEN && col_idx == tc->pk_idx) score = 80;
         else if (allow_range && cond->type == WHERE_BETWEEN && get_uk_slot(tc, col_idx) != -1) score = 70;
 
@@ -3462,6 +4111,11 @@ static void build_mutation_lookup_plan(TableCache *tc, Statement *stmt, Mutation
                             !plan->uses_pk_lookup &&
                             get_uk_slot(tc, index_col) != -1 &&
                             stmt->where_conditions[index_cond].type == WHERE_EQ);
+    plan->uses_aux_lookup = (index_cond != -1 &&
+                             !plan->uses_pk_lookup &&
+                             !plan->uses_uk_lookup &&
+                             is_github_lookup_column(tc, index_col) &&
+                             stmt->where_conditions[index_cond].type == WHERE_EQ);
 }
 
 static int print_range_row_visitor(long key, int row_index, void *ctx) {
@@ -3669,6 +4323,7 @@ static int persist_updated_row(TableCache *tc, int target_row, char *old_record,
         return -1;
     }
 
+    github_index_on_update(tc, old_record, target_row, set_idx);
     free(old_record);
     tc->snapshot_dirty = 1;
     if (emit_logs) INFO_PRINTF("[ok] UPDATE completed. rows=1\n");
@@ -3895,13 +4550,17 @@ static int scan_truncated_update_targets(TableCache *tc, Statement *stmt, int se
 }
 
 static int execute_delete_single_row(TableCache *tc, Statement *stmt, int index_col,
-                                     const WhereCondition *lookup_cond, int uses_pk_lookup) {
+                                     const WhereCondition *lookup_cond, int uses_pk_lookup,
+                                     int uses_aux_lookup) {
     int target_row = -1;
     char *old_record;
 
     if (uses_pk_lookup) {
         INFO_PRINTF("[index] B+ tree id lookup for DELETE\n");
         if (!find_pk_row(tc, lookup_cond->val, &target_row)) return 0;
+    } else if (uses_aux_lookup) {
+        INFO_PRINTF("[index] auxiliary exact lookup for DELETE on column '%s'\n", lookup_cond->col);
+        if (!find_github_row(tc, lookup_cond->val, &target_row)) return 0;
     } else {
         INFO_PRINTF("[index] UK B+ tree lookup for DELETE on column '%s'\n", lookup_cond->col);
         if (!find_uk_row(tc, index_col, lookup_cond->val, &target_row)) return 0;
@@ -4043,15 +4702,26 @@ static int scan_select_file_rows(TableCache *tc, long start_offset,
     char line[RECORD_SIZE];
 
     if (!tc || !tc->file || !visitor) return 0;
-    if (fflush(tc->file) != 0) return 0;
+    table_io_lock(tc);
+    if (fflush(tc->file) != 0) {
+        table_io_unlock(tc);
+        return 0;
+    }
 
     if (start_offset > 0) {
-        if (fseek(tc->file, start_offset, SEEK_SET) != 0) return 0;
+        if (fseek(tc->file, start_offset, SEEK_SET) != 0) {
+            table_io_unlock(tc);
+            return 0;
+        }
         if (tail_trace) printf(tail_trace, start_offset);
     } else {
-        if (fseek(tc->file, 0, SEEK_SET) != 0) return 0;
+        if (fseek(tc->file, 0, SEEK_SET) != 0) {
+            table_io_unlock(tc);
+            return 0;
+        }
         if (!fgets(line, sizeof(line), tc->file)) {
             fseek(tc->file, 0, SEEK_END);
+            table_io_unlock(tc);
             return 1;
         }
         if (full_trace) printf("%s", full_trace);
@@ -4067,6 +4737,7 @@ static int scan_select_file_rows(TableCache *tc, long start_offset,
             printf("[error] row too long while scanning '%s' (max %d bytes).\n",
                    tc->table_name, RECORD_SIZE - 1);
             fseek(tc->file, 0, SEEK_END);
+            table_io_unlock(tc);
             return 0;
         }
         if (nl) *nl = '\0';
@@ -4076,11 +4747,13 @@ static int scan_select_file_rows(TableCache *tc, long start_offset,
         if (skip || !effective) continue;
         if (!visitor(tc, effective, ctx)) {
             fseek(tc->file, 0, SEEK_END);
+            table_io_unlock(tc);
             return 0;
         }
     }
 
     fseek(tc->file, 0, SEEK_END);
+    table_io_unlock(tc);
     return 1;
 }
 
@@ -4110,7 +4783,7 @@ static void set_select_match_count(int *matched_rows, SelectExecContext *exec) {
 }
 
 static int select_can_short_circuit(Statement *stmt, SelectExecContext *exec, int *matched_rows) {
-    if (exec->emit_results || stmt->where_count != 1) return 0;
+    if (exec->emit_results || exec->result || stmt->where_count != 1) return 0;
     if (matched_rows) *matched_rows = 1;
     return 1;
 }
@@ -4247,6 +4920,21 @@ static int execute_select_uk_eq(TableCache *tc, Statement *stmt, int index_col, 
     return 1;
 }
 
+static int execute_select_aux_eq(TableCache *tc, Statement *stmt, int index_col, WhereCondition *cond,
+                                 SelectExecContext *exec, int *matched_rows) {
+    int row_index;
+
+    (void)index_col;
+    if (exec->emit_traces) INFO_PRINTF("[index] auxiliary exact lookup on column '%s'\n", cond->col);
+    if (find_github_row(tc, cond->val, &row_index)) {
+        if (select_can_short_circuit(stmt, exec, matched_rows)) return 1;
+        emit_indexed_row_if_needed(tc, stmt, exec, row_index);
+    }
+
+    set_select_match_count(matched_rows, exec);
+    return 1;
+}
+
 static void execute_select_linear_scan(TableCache *tc, Statement *stmt, SelectExecContext *exec) {
     int i;
 
@@ -4254,6 +4942,14 @@ static void execute_select_linear_scan(TableCache *tc, Statement *stmt, SelectEx
         printf("[scan] linear scan on column '%s'\n", stmt->where_conditions[0].col);
     } else if (stmt->where_count > 1 && exec->emit_traces) {
         printf("[scan] linear scan with %d WHERE condition(s)\n", stmt->where_count);
+    }
+
+    /*
+     * For large cached tables, one-time row materialization is cheaper than
+     * repeatedly re-reading rows through the shared CSV/page-cache path.
+     */
+    if (tc && !tc->cache_truncated && tc->record_count >= 50000) {
+        materialize_cached_csv_rows(tc);
     }
 
     for (i = 0; i < tc->record_count; i++) {
@@ -4438,9 +5134,119 @@ static int execute_select_internal(Statement *stmt, int emit_results, int emit_t
                                     &exec, matched_rows);
     }
 
+    if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_EQ &&
+        index_col != -1 && is_github_lookup_column(tc, index_col) &&
+        ensure_github_index(tc)) {
+        return execute_select_aux_eq(tc, stmt, index_col, &stmt->where_conditions[index_cond],
+                                     &exec, matched_rows);
+    }
+
     execute_select_linear_scan(tc, stmt, &exec);
     set_select_match_count(matched_rows, &exec);
     return 1;
+}
+
+static int execute_select_internal_with_result(Statement *stmt,
+                                               int emit_results,
+                                               int emit_traces,
+                                               int *matched_rows,
+                                               ExecutorResult *result) {
+    TableCache *tc = get_table(stmt->table_name);
+    int index_cond = -1;
+    int index_col = -1;
+    SelectExecContext exec;
+    int i;
+
+    if (matched_rows) *matched_rows = 0;
+    if (!tc) return 0;
+    if (!validate_where_columns(tc, stmt, "SELECT")) return 0;
+    memset(&exec, 0, sizeof(exec));
+    exec.select_all = stmt->select_all;
+    exec.emit_results = emit_results;
+    exec.emit_traces = emit_traces;
+    exec.result = result;
+
+    if (result) {
+        executor_result_init(result);
+        if (stmt->select_all) {
+            result->select_column_count = tc->col_count;
+            for (i = 0; i < tc->col_count && i < MAX_COLS; i++) {
+                result->select_column_indices[i] = i;
+                strncpy(result->select_columns[i], tc->cols[i].name, sizeof(result->select_columns[i]) - 1);
+                result->select_columns[i][sizeof(result->select_columns[i]) - 1] = '\0';
+            }
+        }
+    }
+
+    if (!stmt->select_all) {
+        for (i = 0; i < stmt->select_col_count; i++) {
+            int idx = get_col_idx(tc, stmt->select_cols[i]);
+            if (idx == -1) {
+                printf("[error] SELECT failed: unknown column '%s'.\n", stmt->select_cols[i]);
+                if (result) executor_result_free(result);
+                return 0;
+            }
+            exec.select_idx[i] = idx;
+            if (result) {
+                result->select_column_indices[i] = idx;
+                strncpy(result->select_columns[i], stmt->select_cols[i], sizeof(result->select_columns[i]) - 1);
+                result->select_columns[i][sizeof(result->select_columns[i]) - 1] = '\0';
+            }
+        }
+        exec.select_count = stmt->select_col_count;
+        if (result) result->select_column_count = stmt->select_col_count;
+    }
+
+    if (exec.emit_results) printf("\n--- [SELECT RESULT] table=%s ---\n", tc->table_name);
+    choose_index_condition(tc, stmt, 1, &index_cond, &index_col);
+
+    if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_BETWEEN) {
+        WhereCondition *cond = &stmt->where_conditions[index_cond];
+        if (index_col == tc->pk_idx) {
+            if (!execute_select_pk_range(tc, stmt, cond, index_col, &exec, matched_rows)) goto fail;
+            goto done;
+        }
+        if (get_uk_slot(tc, index_col) != -1) {
+            if (!execute_select_uk_range(tc, stmt, cond, index_col, &exec, matched_rows)) goto fail;
+            goto done;
+        }
+        printf("[error] SELECT failed: BETWEEN uses PK or UK B+ tree indexes only.\n");
+        goto fail;
+    }
+
+    if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_EQ &&
+        index_col == tc->pk_idx && index_col != -1) {
+        if (!execute_select_pk_eq(tc, stmt, &stmt->where_conditions[index_cond], &exec, matched_rows)) goto fail;
+        goto done;
+    }
+
+    if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_EQ &&
+        index_col != -1 && get_uk_slot(tc, index_col) != -1) {
+        if (!execute_select_uk_eq(tc, stmt, index_col, &stmt->where_conditions[index_cond], &exec, matched_rows)) goto fail;
+        goto done;
+    }
+
+    if (index_cond != -1 && stmt->where_conditions[index_cond].type == WHERE_EQ &&
+        index_col != -1 && is_github_lookup_column(tc, index_col) &&
+        ensure_github_index(tc)) {
+        if (!execute_select_aux_eq(tc, stmt, index_col, &stmt->where_conditions[index_cond], &exec, matched_rows)) goto fail;
+        goto done;
+    }
+
+    execute_select_linear_scan(tc, stmt, &exec);
+    set_select_match_count(matched_rows, &exec);
+
+done:
+    if (result) result->matched_rows = exec.matched_rows;
+    if (exec.collect_failed) {
+        printf("[error] SELECT failed: unable to collect rows for response.\n");
+        goto fail;
+    }
+    return 1;
+
+fail:
+    if (result) executor_result_free(result);
+    return 0;
 }
 
 void execute_select(Statement *stmt) {
@@ -4552,19 +5358,26 @@ static int read_csv_row_at_offset(TableCache *tc, long offset, char *line, size_
     size_t line_len;
 
     if (!tc || !tc->file || !line || line_size == 0 || offset < 0) return 0;
-    if (fflush(tc->file) != 0 || fseek(tc->file, offset, SEEK_SET) != 0) return 0;
+    table_io_lock(tc);
+    if (fflush(tc->file) != 0 || fseek(tc->file, offset, SEEK_SET) != 0) {
+        table_io_unlock(tc);
+        return 0;
+    }
     if (!fgets(line, (int)line_size, tc->file)) {
         fseek(tc->file, 0, SEEK_END);
+        table_io_unlock(tc);
         return 0;
     }
     nl = strpbrk(line, "\r\n");
     line_len = strlen(line);
     if (!nl && line_len == line_size - 1 && !feof(tc->file)) {
         fseek(tc->file, 0, SEEK_END);
+        table_io_unlock(tc);
         return 0;
     }
     if (nl) *nl = '\0';
     fseek(tc->file, 0, SEEK_END);
+    table_io_unlock(tc);
     return strlen(line) > 0;
 }
 
@@ -4624,7 +5437,7 @@ static int execute_delete_tail_pk_row(TableCache *tc, Statement *stmt, long pk_k
 
 static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_idx,
                                      const WhereCondition *lookup_cond, int set_idx, const char *set_value, int uses_pk_lookup,
-                                     int uses_uk_lookup, int rebuild_uk_needed) {
+                                     int uses_uk_lookup, int uses_aux_lookup, int rebuild_uk_needed) {
     int target_row = -1;
     char *old_record;
 
@@ -4634,6 +5447,9 @@ static int execute_update_single_row(TableCache *tc, Statement *stmt, int where_
     } else if (uses_uk_lookup) {
         INFO_PRINTF("[index] UK B+ tree lookup for UPDATE on column '%s'\n", lookup_cond->col);
         if (!find_uk_row(tc, where_idx, lookup_cond->val, &target_row)) return 0;
+    } else if (uses_aux_lookup) {
+        INFO_PRINTF("[index] auxiliary exact lookup for UPDATE on column '%s'\n", lookup_cond->col);
+        if (!find_github_row(tc, lookup_cond->val, &target_row)) return 0;
     } else {
         return -1;
     }
@@ -4688,7 +5504,9 @@ static int execute_update_internal(Statement *stmt, int *affected_rows) {
             {
                 int result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
                                                        set_idx, set_value,
-                                                       lookup.uses_pk_lookup, lookup.uses_uk_lookup, rebuild_uk_needed);
+                                                       lookup.uses_pk_lookup, lookup.uses_uk_lookup,
+                                                       lookup.uses_aux_lookup && ensure_github_index(tc),
+                                                       rebuild_uk_needed);
                 if (result > 0 && affected_rows) *affected_rows = result;
                 return result >= 0;
             }
@@ -4704,10 +5522,13 @@ static int execute_update_internal(Statement *stmt, int *affected_rows) {
         return 1;
     }
 
-    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup) {
+    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup ||
+        (lookup.uses_aux_lookup && ensure_github_index(tc))) {
         result = execute_update_single_row(tc, stmt, lookup.where_idx, &stmt->where_conditions[lookup.condition_index],
                                            set_idx, set_value,
-                                           lookup.uses_pk_lookup, lookup.uses_uk_lookup, rebuild_uk_needed);
+                                           lookup.uses_pk_lookup, lookup.uses_uk_lookup,
+                                           lookup.uses_aux_lookup && ensure_github_index(tc),
+                                           rebuild_uk_needed);
         if (result > 0 && affected_rows) *affected_rows = result;
         return result >= 0;
     }
@@ -4784,9 +5605,12 @@ static int execute_delete_internal(Statement *stmt, int *affected_rows) {
             return 1;
         }
     }
-    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup) {
+    if (lookup.uses_pk_lookup || lookup.uses_uk_lookup ||
+        (lookup.uses_aux_lookup && ensure_github_index(tc))) {
         result = execute_delete_single_row(tc, stmt, lookup.where_idx,
-                                           &stmt->where_conditions[lookup.condition_index], lookup.uses_pk_lookup);
+                                           &stmt->where_conditions[lookup.condition_index],
+                                           lookup.uses_pk_lookup,
+                                           lookup.uses_aux_lookup && ensure_github_index(tc));
         if (result > 0 && affected_rows) *affected_rows = result;
         return result >= 0;
     }
@@ -4824,26 +5648,42 @@ int execute_delete_id_fast(const char *table_name, const char *id_value) {
     return 1;
 }
 
-int executor_execute_statement(Statement *stmt, int *matched_rows, int *affected_rows, long *generated_id) {
-    if (matched_rows) *matched_rows = 0;
-    if (affected_rows) *affected_rows = 0;
-    if (generated_id) *generated_id = 0;
+int executor_execute_statement_with_result(Statement *stmt, ExecutorResult *result) {
     if (!stmt) return 0;
+    if (result) executor_result_init(result);
 
     switch (stmt->type) {
         case STMT_INSERT:
-            if (!execute_insert_internal(stmt, generated_id)) return 0;
-            if (affected_rows) *affected_rows = 1;
+            if (!execute_insert_internal(stmt, result ? &result->generated_id : NULL)) return 0;
+            if (result) result->affected_rows = 1;
             return 1;
         case STMT_SELECT:
-            return execute_select_internal(stmt, 0, 0, matched_rows);
+            return execute_select_internal_with_result(stmt, 0, 0, result ? &result->matched_rows : NULL, result);
         case STMT_UPDATE:
-            return execute_update_internal(stmt, affected_rows);
+            return execute_update_internal(stmt, result ? &result->affected_rows : NULL);
         case STMT_DELETE:
-            return execute_delete_internal(stmt, affected_rows);
+            return execute_delete_internal(stmt, result ? &result->affected_rows : NULL);
         default:
             return 0;
     }
+}
+
+int executor_execute_statement(Statement *stmt, int *matched_rows, int *affected_rows, long *generated_id) {
+    ExecutorResult result;
+    int ok;
+
+    if (matched_rows) *matched_rows = 0;
+    if (affected_rows) *affected_rows = 0;
+    if (generated_id) *generated_id = 0;
+    executor_result_init(&result);
+    ok = executor_execute_statement_with_result(stmt, &result);
+    if (ok) {
+        if (matched_rows) *matched_rows = result.matched_rows;
+        if (affected_rows) *affected_rows = result.affected_rows;
+        if (generated_id) *generated_id = result.generated_id;
+    }
+    executor_result_free(&result);
+    return ok;
 }
 
 static double current_seconds(void) {
@@ -5333,6 +6173,8 @@ void run_bplus_benchmark(int record_count) {
 
 void close_all_tables(void) {
     int i;
+    if (!g_table_registry_mutex_ready) return;
+    db_mutex_lock(&g_table_registry_mutex);
     for (i = 0; i < open_table_count; i++) {
         TableCache *tc = &open_tables[i];
 
@@ -5345,4 +6187,5 @@ void close_all_tables(void) {
         free_table_storage(tc);
     }
     open_table_count = 0;
+    db_mutex_unlock(&g_table_registry_mutex);
 }
