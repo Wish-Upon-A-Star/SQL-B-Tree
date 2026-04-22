@@ -23,6 +23,56 @@ flowchart LR
 
 **핵심은 동시 요청을 두 단계로 나눠 처리한 것이다. API는 요청을 추적하고, DB는 공유 데이터의 일관성을 보장한다.**
 
+## 발표용 최소 시연
+
+발표에서 우리 담당 범위(DB + worker 중심)만 짧게 보여주려면 아래 순서가 가장 안전하다.
+
+### 0. pull 직후 한 번만 빌드
+
+```powershell
+gcc -O2 -fdiagnostics-color=always -g main.c -o sqlsprocessor
+gcc -O2 -fdiagnostics-color=always -g -Icmd_processor pre_worker_local_bench.c cmd_processor\cmd_processor.c cmd_processor\mock_cmd_processor.c -o pre_worker_local_bench -pthread
+gcc -O2 -fdiagnostics-color=always -g -Icmd_processor cmd_processor\engine_cmd_processor_test.c cmd_processor\cmd_processor.c cmd_processor\engine_cmd_processor_bundle.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c -o engine_cmd_processor_test -pthread
+```
+
+위 3줄이면 발표에 필요한 실행 파일을 다른 컴퓨터에서도 바로 준비할 수 있다.
+
+### 1. 로컬 DB 실행 경로
+
+```powershell
+.\sqlsprocessor generated_sql\workload_score.sql > $null
+```
+
+- 로컬 SQL 실행 경로 기준 성능을 보여준다.
+- parser -> executor -> index/delta 경로가 실제로 돈다.
+
+### 2. DB worker 이전 경계 속도
+
+```powershell
+.\pre_worker_local_bench 1000000
+```
+
+- `CmdProcessor acquire/set/submit/release`만 측정한다.
+- planner/worker/executor 이전 경계는 매우 빠르고, 실제 병목은 그 뒤라는 점을 설명하기 좋다.
+
+### 3. worker 병렬성 회귀 확인
+
+```powershell
+.\engine_cmd_processor_test
+```
+
+- hot shard read에서도 여러 worker가 실제로 일하도록 바뀐 상태를 보여준다.
+- same-table read/read 병렬성과 duplicate/read-write correctness 회귀를 함께 확인할 수 있다.
+
+### 4. 외부 TCP는 보조 시연
+
+외부 TCP 시연이 필요하면 아래 문서와 스크립트를 사용한다.
+
+- [docs/K6_TCP_BINARY_BENCH_KO.md](docs/K6_TCP_BINARY_BENCH_KO.md)
+- [scripts/run_k6_tcp_binary_bench.ps1](scripts/run_k6_tcp_binary_bench.ps1)
+
+발표에서는 DB/worker가 주역이면, 외부 TCP는 "별도 벤치 경로 준비됨" 정도로만 짚는 편이 깔끔하다.
+
 ## 2. API
 
 TCP 서버는 SQL을 직접 실행하지 않는다. 외부 요청을 수신해 DB 처리 계층으로 넘기는 경계 역할을 한다.

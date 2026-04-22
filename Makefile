@@ -11,6 +11,7 @@ ENGINE_CMD_PROCESSOR_TEST ?= engine_cmd_processor_test
 TCP_CMD_PROCESSOR_TEST ?= tcp_cmd_processor_test
 REPL_CMD_PROCESSOR_TEST ?= repl_cmd_processor_test
 CMD_PROCESSOR_SCALE_SCORE_TEST ?= cmd_processor_engine_scale_score_test
+PRE_WORKER_BENCH ?= pre_worker_local_bench
 CMD_PROCESSOR_DIR = cmd_processor
 CJSON_DIR = thirdparty/cjson
 SRC = main.c
@@ -35,6 +36,9 @@ REPL_CMD_PROCESSOR_TEST_RUN = $(if $(filter /%,$(REPL_CMD_PROCESSOR_TEST)),$(REP
 CMD_PROCESSOR_SCALE_SCORE_TEST_SRC = $(CMD_PROCESSOR_DIR)/engine_cmd_processor_scale_score_test.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_bundle.c lexer.c parser.c bptree.c jungle_benchmark.c executor.c
 CMD_PROCESSOR_SCALE_SCORE_TEST_DEPS = $(CMD_PROCESSOR_SCALE_SCORE_TEST_SRC) $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_internal.h $(CMD_PROCESSOR_DIR)/engine_cmd_processor_support.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_planner.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_runtime.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor.c $(CMD_PROCESSOR_DIR)/engine_cmd_processor_test_support.h executor.h parser.h types.h platform_threads.h
 CMD_PROCESSOR_SCALE_SCORE_TEST_RUN = $(if $(filter /%,$(CMD_PROCESSOR_SCALE_SCORE_TEST)),$(CMD_PROCESSOR_SCALE_SCORE_TEST),./$(CMD_PROCESSOR_SCALE_SCORE_TEST))
+PRE_WORKER_BENCH_SRC = pre_worker_local_bench.c $(CMD_PROCESSOR_DIR)/cmd_processor.c $(CMD_PROCESSOR_DIR)/mock_cmd_processor.c
+PRE_WORKER_BENCH_DEPS = $(PRE_WORKER_BENCH_SRC) $(CMD_PROCESSOR_DIR)/cmd_processor.h $(CMD_PROCESSOR_DIR)/mock_cmd_processor.h
+PRE_WORKER_BENCH_RUN = $(if $(filter /%,$(PRE_WORKER_BENCH)),$(PRE_WORKER_BENCH),./$(PRE_WORKER_BENCH))
 SQL ?= demo_bptree.sql
 PYTHON ?= python
 JUNGLE_DATASET ?= jungle_benchmark_users.csv
@@ -44,7 +48,7 @@ BENCH_SCORE_DELETE_ROWS ?= 1000000
 BENCH_SCORE_IN_TMP ?= 1
 BENCH_EXEC_SPEC ?= bench_score_exec.conf
 
-.PHONY: all build tcp-server stress-tools bench-tools bench-test test-cmd-processor test-engine-cmd-processor test-tcp-cmd-processor test-repl-cmd-processor test-cmd-processor-scale-score docker-build docker-test docker-test-scale run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
+.PHONY: all build tcp-server stress-tools bench-tools bench-test test-cmd-processor test-engine-cmd-processor test-tcp-cmd-processor test-repl-cmd-processor test-cmd-processor-scale-score pre-worker-bench docker-build docker-test docker-test-scale run demo-bptree demo-jungle scenario-jungle-regression scenario-jungle-range-and-replay scenario-jungle-update-constraints generate-jungle generate-jungle-sql benchmark benchmark-jungle bench-smoke bench-score bench-report bench-clean clean
 
 all: build
 
@@ -106,6 +110,12 @@ $(CMD_PROCESSOR_SCALE_SCORE_TEST): $(CMD_PROCESSOR_SCALE_SCORE_TEST_DEPS)
 
 test-cmd-processor-scale-score: $(CMD_PROCESSOR_SCALE_SCORE_TEST)
 	$(CMD_PROCESSOR_SCALE_SCORE_TEST_RUN)
+
+$(PRE_WORKER_BENCH): $(PRE_WORKER_BENCH_DEPS)
+	$(CC) $(CFLAGS) -I$(CMD_PROCESSOR_DIR) $(PRE_WORKER_BENCH_SRC) -o $(PRE_WORKER_BENCH) -pthread
+
+pre-worker-bench: $(PRE_WORKER_BENCH)
+	$(PRE_WORKER_BENCH_RUN) 1000000
 
 docker-build:
 	docker compose build sqlprocessor
